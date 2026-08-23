@@ -77,6 +77,7 @@
 #include <ShapeAnalysis_FreeBounds.hxx>
 #include <TopTools_HSequenceOfShape.hxx>
 #include <BRepTools_WireExplorer.hxx>
+#include <BRepTools.hxx>
 #include <ShapeUpgrade_UnifySameDomain.hxx>
 #include <BRepTools_History.hxx>
 
@@ -2131,6 +2132,32 @@ std::unique_ptr<std::vector<TopoDS_Edge>> face_edges(const TopoDS_Face& face) {
     return out;
 }
 
+std::unique_ptr<std::vector<TopoDS_Edge>> face_boundary_wires(
+    const TopoDS_Face& face)
+{
+    auto out = std::make_unique<std::vector<TopoDS_Edge>>();
+    try {
+        const TopoDS_Wire outer = BRepTools::OuterWire(face);
+        auto append_wire = [&](const TopoDS_Wire& wire) {
+            if (!out->empty()) out->push_back(TopoDS_Edge());
+            for (BRepTools_WireExplorer explorer(wire, face); explorer.More();
+                 explorer.Next()) {
+                out->push_back(explorer.Current());
+            }
+        };
+        if (!outer.IsNull()) append_wire(outer);
+        for (TopExp_Explorer explorer(face, TopAbs_WIRE); explorer.More();
+             explorer.Next()) {
+            const TopoDS_Wire wire = TopoDS::Wire(explorer.Current());
+            if (outer.IsNull() || !wire.IsSame(outer)) append_wire(wire);
+        }
+    } catch (const Standard_Failure& failure) {
+        record_standard_failure(__func__, "native", 7, failure);
+        out->clear();
+    }
+    return out;
+}
+
 std::unique_ptr<TopoDS_Shape> clone_shape_handle(const TopoDS_Shape& shape) {
     return std::make_unique<TopoDS_Shape>(shape);
 }
@@ -2674,6 +2701,10 @@ void edge_vec_push_null(std::vector<TopoDS_Edge>& v) {
     v.push_back(TopoDS_Edge());
 }
 
+bool edge_is_null(const TopoDS_Edge& edge) {
+    return edge.IsNull();
+}
+
 std::unique_ptr<std::vector<TopoDS_Face>> face_vec_new() {
     return std::make_unique<std::vector<TopoDS_Face>>();
 }
@@ -2943,8 +2974,7 @@ std::unique_ptr<TopoDS_Shape> builder_chamfer(
     }
 }
 
-// Extrude a closed profile wire into a solid via BRepPrimAPI_MakePrism.
-// Edges → Wire → Face → Prism (solid).
+// Extrude closed profile wires into a solid via BRepPrimAPI_MakePrism.
 std::unique_ptr<TopoDS_Shape> make_extrude(
     const std::vector<TopoDS_Edge>& profile_edges,
     double dx, double dy, double dz,
@@ -2953,10 +2983,30 @@ std::unique_ptr<TopoDS_Shape> make_extrude(
 {
     try {
         if (profile_edges.empty() || rust_progress_cancelled(progress)) return nullptr;
+        std::vector<TopoDS_Wire> profile_wires;
         BRepBuilderAPI_MakeWire wire_maker;
-        for (const auto& e : profile_edges) wire_maker.Add(e);
-        if (!wire_maker.IsDone()) return nullptr;
-        BRepBuilderAPI_MakeFace face_maker(wire_maker.Wire());
+        bool has_edges = false;
+        auto flush_wire = [&]() -> bool {
+            if (!has_edges || !wire_maker.IsDone()) return false;
+            profile_wires.push_back(wire_maker.Wire());
+            wire_maker = BRepBuilderAPI_MakeWire();
+            has_edges = false;
+            return true;
+        };
+        for (const auto& edge : profile_edges) {
+            if (edge.IsNull()) {
+                if (!flush_wire()) return nullptr;
+            } else {
+                wire_maker.Add(edge);
+                has_edges = true;
+            }
+        }
+        if (!flush_wire() || profile_wires.empty()) return nullptr;
+
+        BRepBuilderAPI_MakeFace face_maker(profile_wires.front());
+        for (size_t index = 1; index < profile_wires.size(); ++index) {
+            face_maker.Add(profile_wires[index]);
+        }
         if (!face_maker.IsDone()) return nullptr;
         gp_Vec dir(dx, dy, dz);
         BRepPrimAPI_MakePrism prism(face_maker.Face(), dir);
@@ -2966,9 +3016,19 @@ std::unique_ptr<TopoDS_Shape> make_extrude(
         if (!prism.IsDone()) return nullptr;
         auto result = std::make_unique<TopoDS_Shape>(prism.Shape());
         const HistoryMaps result_maps(*result);
-        append_builder_topology_history(prism, wire_maker.Wire(), 0,
+        TopoDS_Shape profile_shape = profile_wires.front();
+        if (profile_wires.size() > 1) {
+            BRep_Builder builder;
+            TopoDS_Compound profile_compound;
+            builder.MakeCompound(profile_compound);
+            for (const auto& wire : profile_wires) {
+                builder.Add(profile_compound, wire);
+            }
+            profile_shape = profile_compound;
+        }
+        append_builder_topology_history(prism, profile_shape, 0,
             result_maps, out_topology_history);
-        const HistoryMaps profile_maps(wire_maker.Wire());
+        const HistoryMaps profile_maps(profile_shape);
         const TopoDS_Shape first = prism.FirstShape();
         const TopoDS_Shape last = prism.LastShape();
         for (int index = 1; index <= profile_maps.edges.Extent(); ++index) {

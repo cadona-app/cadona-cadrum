@@ -285,6 +285,9 @@ rust::Vec<uint32_t> shared_face_indices(
 // One-shot enumeration of the boundary edges of a single face. Edges shared
 // between this face's wires are deduplicated so each edge appears once.
 std::unique_ptr<std::vector<TopoDS_Edge>> face_edges(const TopoDS_Face& face);
+// Ordered face wires with the outer wire first and null-edge separators.
+std::unique_ptr<std::vector<TopoDS_Edge>> face_boundary_wires(
+    const TopoDS_Face& face);
 bool face_planar_frame(const TopoDS_Face& face,
     double& px, double& py, double& pz,
     double& nx, double& ny, double& nz);
@@ -398,8 +401,8 @@ std::unique_ptr<TopoDS_Edge> mirror_edge(
     double ox, double oy, double oz,
     double nx, double ny, double nz);
 
-// Extrude a closed profile wire into a solid using BRepPrimAPI_MakePrism.
-// Internally builds Wire → Face → Prism.
+// Extrude closed profile wires into a solid using BRepPrimAPI_MakePrism.
+// Null-edge sentinels separate the outer wire from optional inner wires.
 std::unique_ptr<TopoDS_Shape> make_extrude(
     const std::vector<TopoDS_Edge>& profile_edges,
     double dx, double dy, double dz,
@@ -432,6 +435,7 @@ std::unique_ptr<TopoDS_Shape> make_pipe_shell(
 std::unique_ptr<std::vector<TopoDS_Edge>> edge_vec_new();
 void edge_vec_push(std::vector<TopoDS_Edge>& v, const TopoDS_Edge& e);
 void edge_vec_push_null(std::vector<TopoDS_Edge>& v);
+bool edge_is_null(const TopoDS_Edge& edge);
 
 // Helpers for the Rust side to construct a std::vector<TopoDS_Face>.
 std::unique_ptr<std::vector<TopoDS_Face>> face_vec_new();

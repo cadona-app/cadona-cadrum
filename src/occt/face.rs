@@ -21,6 +21,27 @@ impl Face {
 	pub(crate) fn new(inner: cxx::UniquePtr<ffi::TopoDS_Face>) -> Self {
 		Face { inner, edges: OnceLock::new() }
 	}
+
+	pub(crate) fn boundary_wires(&self) -> Result<Vec<Vec<Edge>>, Error> {
+		let mut wires = Vec::new();
+		let mut wire = Vec::new();
+		for edge in ffi::face_boundary_wires(&self.inner).iter() {
+			if ffi::edge_is_null(edge) {
+				if !wire.is_empty() {
+					wires.push(std::mem::take(&mut wire));
+				}
+				continue;
+			}
+			wire.push(Edge::try_from_ffi(ffi::clone_edge_handle(edge), "face boundary wire contained a null edge".into())?);
+		}
+		if !wire.is_empty() {
+			wires.push(wire);
+		}
+		if wires.is_empty() {
+			return Err(Error::InvalidEdge("a face edit needs a bounded source face".into()));
+		}
+		Ok(wires)
+	}
 }
 
 impl FaceStruct for Face {

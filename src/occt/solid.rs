@@ -112,6 +112,7 @@ pub struct FaceEditSession {
 	source: Solid,
 	face_index: u32,
 	boundary: Vec<Edge>,
+	boundary_wires: Vec<Vec<Edge>>,
 }
 
 /// Prepared source topology for repeated shell-thickness updates.
@@ -668,12 +669,34 @@ impl Solid {
 	}
 
 	pub fn extrude_cancelable<'a>(profile: impl IntoIterator<Item = &'a Edge>, direction: DVec3, progress: &ffi::CancellationToken) -> Result<Self, Error> {
+		Self::extrude_wires_cancelable(std::iter::once(profile), direction, progress)
+	}
+
+	pub fn extrude_wires_cancelable<'a, W>(profile_wires: impl IntoIterator<Item = W>, direction: DVec3, progress: &ffi::CancellationToken) -> Result<Self, Error>
+	where
+		W: IntoIterator<Item = &'a Edge>,
+		Edge: 'a,
+	{
 		if !direction.is_finite() || direction == DVec3::ZERO {
 			return Err(Error::InvalidInput("extrusion direction must be finite and nonzero".into()));
 		}
 		let mut profile_vec = ffi::edge_vec_new();
-		for edge in profile {
-			ffi::edge_vec_push(profile_vec.pin_mut(), &edge.inner);
+		let mut wire_count = 0usize;
+		for wire in profile_wires {
+			let edges = wire.into_iter().collect::<Vec<_>>();
+			if edges.is_empty() {
+				return Err(Error::InvalidEdge("an extrusion profile wire cannot be empty".into()));
+			}
+			if wire_count > 0 {
+				ffi::edge_vec_push_null(profile_vec.pin_mut());
+			}
+			for edge in edges {
+				ffi::edge_vec_push(profile_vec.pin_mut(), &edge.inner);
+			}
+			wire_count += 1;
+		}
+		if wire_count == 0 {
+			return Err(Error::InvalidEdge("an extrusion needs at least one profile wire".into()));
 		}
 		let mut topology_history = empty_ffi_history();
 		ffi::begin_operation();
@@ -893,13 +916,11 @@ impl Solid {
 	pub fn prepare_face_edit(&self, face_index: u32) -> Result<FaceEditSession, Error> {
 		let face = self.iter_face().nth(face_index as usize).ok_or_else(|| Error::InvalidEdge("a face edit index is outside the source topology".into()))?;
 		let boundary = face.iter_edge().map(Edge::shared_copy).collect::<Vec<_>>();
-		if boundary.is_empty() {
-			return Err(Error::InvalidEdge("a face edit needs a bounded source face".into()));
-		}
+		let boundary_wires = face.boundary_wires()?;
 		let source = self.shared_copy();
 		source.iter_face().count();
 		source.iter_edge().count();
-		Ok(FaceEditSession { source, face_index, boundary })
+		Ok(FaceEditSession { source, face_index, boundary, boundary_wires })
 	}
 
 	pub fn prepare_shell(&self, open_face_indices: &[u32]) -> Result<ShellSession, Error> {
@@ -1048,6 +1069,10 @@ impl FaceEditSession {
 
 	pub fn face(&self) -> Result<&Face, Error> {
 		self.source.iter_face().nth(self.face_index as usize).ok_or(Error::TopologyQueryFailed)
+	}
+
+	pub fn boundary_wires(&self) -> &[Vec<Edge>] {
+		&self.boundary_wires
 	}
 
 	pub fn boundary(&self) -> &[Edge] {

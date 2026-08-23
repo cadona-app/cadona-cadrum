@@ -257,6 +257,7 @@ mod ffi_bridge {
 		fn edge_tshape_id(edge: &TopoDS_Edge) -> u64;
 
 		fn face_planar_frame(face: &TopoDS_Face, px: &mut f64, py: &mut f64, pz: &mut f64, nx: &mut f64, ny: &mut f64, nz: &mut f64) -> bool;
+		fn face_boundary_wires(face: &TopoDS_Face) -> UniquePtr<CxxVector<TopoDS_Edge>>;
 		fn face_project_point(face: &TopoDS_Face, px: f64, py: f64, pz: f64, cpx: &mut f64, cpy: &mut f64, cpz: &mut f64, nx: &mut f64, ny: &mut f64, nz: &mut f64) -> bool;
 
 		// ==================== Edge Methods ====================
@@ -293,6 +294,7 @@ mod ffi_bridge {
 		fn edge_vec_new() -> UniquePtr<CxxVector<TopoDS_Edge>>;
 		fn edge_vec_push(v: Pin<&mut CxxVector<TopoDS_Edge>>, e: &TopoDS_Edge);
 		fn edge_vec_push_null(v: Pin<&mut CxxVector<TopoDS_Edge>>);
+		fn edge_is_null(edge: &TopoDS_Edge) -> bool;
 
 		fn face_vec_new() -> UniquePtr<CxxVector<TopoDS_Face>>;
 		fn face_vec_push(v: Pin<&mut CxxVector<TopoDS_Face>>, f: &TopoDS_Face);

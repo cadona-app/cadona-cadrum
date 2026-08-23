@@ -84,6 +84,17 @@ fn planar_face_frames_use_the_bounded_faces_area_center() {
 }
 
 #[test]
+fn extrusion_preserves_inner_profile_wires() {
+	let outer = cadrum::Edge::polygon(&[DVec3::ZERO, DVec3::X * 10.0, DVec3::new(10.0, 10.0, 0.0), DVec3::Y * 10.0]).expect("outer profile");
+	let inner = cadrum::Edge::polygon(&[DVec3::new(3.0, 3.0, 0.0), DVec3::new(3.0, 7.0, 0.0), DVec3::new(7.0, 7.0, 0.0), DVec3::new(7.0, 3.0, 0.0)]).expect("inner profile");
+
+	let solid = Solid::extrude_wires_cancelable([outer.iter(), inner.iter()], DVec3::Z * 2.0, &cadrum::CancellationToken::new()).expect("extrude a profile with an inner wire");
+
+	assert!((solid.volume() - 168.0).abs() < 1.0e-8);
+	assert!(solid.validate().expect("validate extrusion").valid);
+}
+
+#[test]
 fn exact_planar_frames_reject_curved_surfaces() {
 	let cube = Solid::cube(DVec3::ZERO, DVec3::splat(10.0));
 	assert!(cube.iter_face().all(|face| face.planar_frame().is_some()));
