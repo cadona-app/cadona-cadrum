@@ -256,6 +256,7 @@ mod ffi_bridge {
 		fn shape_tshape_id(shape: &TopoDS_Shape) -> u64;
 		fn edge_tshape_id(edge: &TopoDS_Edge) -> u64;
 
+		fn face_planar_frame(face: &TopoDS_Face, px: &mut f64, py: &mut f64, pz: &mut f64, nx: &mut f64, ny: &mut f64, nz: &mut f64) -> bool;
 		fn face_project_point(face: &TopoDS_Face, px: f64, py: f64, pz: f64, cpx: &mut f64, cpy: &mut f64, cpz: &mut f64, nx: &mut f64, ny: &mut f64, nz: &mut f64) -> bool;
 
 		// ==================== Edge Methods ====================

@@ -40,6 +40,12 @@ impl FaceStruct for Face {
 		Ok((DVec3::new(cpx, cpy, cpz), DVec3::new(nx, ny, nz)))
 	}
 
+	fn planar_frame(&self) -> Option<(DVec3, DVec3)> {
+		let (mut px, mut py, mut pz) = (0.0_f64, 0.0_f64, 0.0_f64);
+		let (mut nx, mut ny, mut nz) = (0.0_f64, 0.0_f64, 0.0_f64);
+		ffi::face_planar_frame(&self.inner, &mut px, &mut py, &mut pz, &mut nx, &mut ny, &mut nz).then(|| (DVec3::new(px, py, pz), DVec3::new(nx, ny, nz)))
+	}
+
 	fn iter_edge(&self) -> impl Iterator<Item = &Edge> + '_ {
 		self.edges
 			.get_or_init(|| {

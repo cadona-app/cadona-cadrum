@@ -139,6 +139,9 @@ impl Face {
 	pub fn project(&self, p: DVec3) -> Result<(DVec3, DVec3), Error> {
 		<Self as crate::traits::FaceStruct>::project(self, p)
 	}
+	pub fn planar_frame(&self) -> Option<(DVec3, DVec3)> {
+		<Self as crate::traits::FaceStruct>::planar_frame(self)
+	}
 	pub fn iter_edge(&self) -> impl Iterator<Item = &Edge> + '_ {
 		<Self as crate::traits::FaceStruct>::iter_edge(self)
 	}
@@ -178,14 +181,14 @@ impl Solid {
 	pub fn plane_section(&self, origin: DVec3, normal: DVec3, x_axis: DVec3, deflection: f64) -> Result<Vec<(Vec<DVec2>, bool)>, Error> {
 		<Self as crate::traits::SolidStruct>::plane_section(self, origin, normal, x_axis, deflection)
 	}
-	pub fn face_boundary_projection(&self, face_index: u32, origin: DVec3, normal: DVec3, x_axis: DVec3, deflection: f64) -> Result<Vec<(Vec<DVec2>, bool)>, Error> {
-		<Self as crate::traits::SolidStruct>::face_boundary_projection(self, face_index, origin, normal, x_axis, deflection)
-	}
 	pub fn project_to_plane(&self, origin: DVec3, normal: DVec3) -> Result<Vec<Edge>, Error> {
 		<Self as crate::traits::SolidStruct>::project_to_plane(self, origin, normal)
 	}
 	pub fn split_with_projected_edges(&self, tool_edges: &[Edge], direction: DVec3) -> Result<Vec<crate::Solid>, Error> {
 		<Self as crate::traits::SolidStruct>::split_with_projected_edges(self, tool_edges, direction)
+	}
+	pub fn face_boundary_projection(&self, face_index: u32, origin: DVec3, normal: DVec3, x_axis: DVec3, deflection: f64) -> Result<Vec<(Vec<DVec2>, bool)>, Error> {
+		<Self as crate::traits::SolidStruct>::face_boundary_projection(self, face_index, origin, normal, x_axis, deflection)
 	}
 	pub fn volume(&self) -> f64 {
 		<Self as crate::traits::SolidStruct>::volume(self)

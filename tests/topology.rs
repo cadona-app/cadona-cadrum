@@ -84,6 +84,17 @@ fn planar_face_frames_use_the_bounded_faces_area_center() {
 }
 
 #[test]
+fn exact_planar_frames_reject_curved_surfaces() {
+	let cube = Solid::cube(DVec3::ZERO, DVec3::splat(10.0));
+	assert!(cube.iter_face().all(|face| face.planar_frame().is_some()));
+
+	let cylinder = Solid::cylinder(4.0, DVec3::Z * 10.0);
+	let topology = cylinder.topology_snapshot_with_options(TopologyQueryOptions::INTERACTION).expect("query cylinder faces");
+	let curved = (0..topology.face_ids().len() as u32).find(|face| topology.face_facts(*face).is_some_and(|facts| facts.geometry == Some(SurfaceGeometryKind::Cylinder))).expect("cylinder wall");
+	assert!(cylinder.iter_face().nth(curved as usize).expect("cylinder wall face").planar_frame().is_none());
+}
+
+#[test]
 fn semantic_identity_topology_omits_expensive_edge_directions() {
 	let cube = Solid::cube(DVec3::ZERO, DVec3::splat(10.0));
 	let topology = cube.topology_snapshot_with_options(TopologyQueryOptions::SEMANTIC_IDENTITY).expect("query semantic identity facts");

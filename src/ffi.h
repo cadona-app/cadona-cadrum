@@ -285,6 +285,9 @@ rust::Vec<uint32_t> shared_face_indices(
 // One-shot enumeration of the boundary edges of a single face. Edges shared
 // between this face's wires are deduplicated so each edge appears once.
 std::unique_ptr<std::vector<TopoDS_Edge>> face_edges(const TopoDS_Face& face);
+bool face_planar_frame(const TopoDS_Face& face,
+    double& px, double& py, double& pz,
+    double& nx, double& ny, double& nz);
 
 // Shallow handle clone — C++ copy-ctor shares the underlying TShape via
 // OCCT's ref count. Needed when Rust materializes owned `Shape` / `Edge` /

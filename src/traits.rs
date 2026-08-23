@@ -448,6 +448,9 @@ pub trait FaceStruct: Sized {
 	/// point); callers can detect this case via `normal.length() == 0`.
 	fn project(&self, p: DVec3) -> Result<(DVec3, DVec3), Error>;
 
+	/// Return the bounded face's area center and outward normal when its exact surface is planar.
+	fn planar_frame(&self) -> Option<(DVec3, DVec3)>;
+
 	/// Iterate this face's boundary edges (outer wire and any inner wires).
 	/// Each edge appears once even when shared between wires. Backends may
 	/// cache the result internally; re-calls are expected to be cheap.

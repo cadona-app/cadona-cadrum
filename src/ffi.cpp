@@ -32,6 +32,7 @@
 #include <gp_Pln.hxx>
 #include <gp_Trsf.hxx>
 #include <Geom_CylindricalSurface.hxx>
+#include <GeomLib_IsPlanarSurface.hxx>
 #include <Geom2d_Line.hxx>
 #include <GC_MakeArcOfCircle.hxx>
 
@@ -2154,6 +2155,33 @@ uint64_t shape_tshape_id(const TopoDS_Shape& shape) {
 
 uint64_t edge_tshape_id(const TopoDS_Edge& edge) {
     return reinterpret_cast<uint64_t>(edge.TShape().get());
+}
+
+bool face_planar_frame(const TopoDS_Face& face,
+    double& px, double& py, double& pz,
+    double& nx, double& ny, double& nz)
+{
+    try {
+        const Handle(Geom_Surface) surface = BRep_Tool::Surface(face);
+        if (surface.IsNull()) return false;
+        const double tolerance = std::max(BRep_Tool::Tolerance(face), Precision::Confusion());
+        const GeomLib_IsPlanarSurface planar(surface, tolerance);
+        if (!planar.IsPlanar()) return false;
+
+        GProp_GProps properties;
+        BRepGProp::SurfaceProperties(face, properties);
+        const gp_Pnt center = properties.CentreOfMass();
+        gp_Dir normal = planar.Plan().Axis().Direction();
+        if (face.Orientation() == TopAbs_REVERSED) normal.Reverse();
+        if (!std::isfinite(center.X()) || !std::isfinite(center.Y())
+            || !std::isfinite(center.Z())) return false;
+        px = center.X(); py = center.Y(); pz = center.Z();
+        nx = normal.X(); ny = normal.Y(); nz = normal.Z();
+        return true;
+    } catch (const Standard_Failure& failure) {
+        record_standard_failure(__func__, "native", 7, failure);
+        return false;
+    }
 }
 
 bool face_project_point(const TopoDS_Face& face,
