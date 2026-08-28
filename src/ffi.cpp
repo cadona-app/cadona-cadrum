@@ -1615,8 +1615,14 @@ static void append_face_mesh(
     TopLoc_Location location;
     Handle(Poly_Triangulation) triangulation =
         BRep_Tool::Triangulation(face, location);
+    if (triangulation.IsNull()) {
+        result.face_vertex_offsets.push_back(global_vertex_offset);
+        result.face_index_offsets.push_back(
+            static_cast<uint32_t>(result.indices.size()));
+        return;
+    }
     BRepLib_ToolTriangulatedShape::ComputeNormals(face, triangulation);
-    if (triangulation.IsNull() || !triangulation->HasNormals()) {
+    if (!triangulation->HasNormals()) {
         result.face_vertex_offsets.push_back(global_vertex_offset);
         result.face_index_offsets.push_back(
             static_cast<uint32_t>(result.indices.size()));
@@ -1663,6 +1669,12 @@ static IMeshTools_Parameters mesh_parameters(
     IMeshTools_Parameters parameters;
     parameters.Deflection = linear;
     parameters.Angle = angular;
+    // OCCT normally permits twice the boundary angle in face interiors. That
+    // leaves smooth, anisotropic surfaces with long sliver triangles: the
+    // tightly curved direction is sampled while a nearly straight direction
+    // spans most of the face. A modestly tighter interior angle preserves the
+    // chord-error contract while producing stable surface normals and shading.
+    parameters.AngleInterior = angular * 0.65;
     parameters.Relative = relative;
     parameters.InParallel = parallel;
     return parameters;
