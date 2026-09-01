@@ -115,14 +115,23 @@ use glam::{DMat3, DQuat, DVec2, DVec3};
 /// `Tessellation { deflection_linear: 0.1, relative_linear: false, ..Default::default() }`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Tessellation {
-	/// Linear (chord) deflection: max distance between the facet/segment and the
-	/// true surface/curve. When `relative_linear` is true this is a fraction of
-	/// a characteristic length rather than an absolute distance. Solid meshes
-	/// use a rigid-transform-invariant scale derived from exact surface area;
+	/// Requested sampled chord-deflection target for facets and curve segments.
+	///
+	/// Solid-mesh refinement and validation probe deterministic triangle centers
+	/// and edge midpoints with a small numeric allowance. This is not a certified
+	/// maximum over every point of an arbitrary rational surface. When
+	/// `relative_linear` is true this is a fraction of a characteristic length
+	/// rather than an absolute distance. Solid meshes use a
+	/// rigid-transform-invariant scale derived from exact surface area;
 	/// standalone edge approximations use the edge bounds.
 	pub deflection_linear: f64,
-	/// Angular deflection in radians: max angle between adjacent facet/segment
-	/// directions. Controls smoothness of curves independently of scale.
+	/// Requested sampled facet-to-surface normal and curve-turn refinement target,
+	/// in radians.
+	///
+	/// The solid-mesh audit measures facet normals against exact surface normals;
+	/// it does not bound the angle between adjacent facets. Its distribution
+	/// policy accepts a 5% numeric allowance and bounded isolated boundary or
+	/// singular-chart outliers up to 3.15 times the requested value.
 	pub deflection_angular: f64,
 	/// Interpret `deflection_linear` relative to the tessellated geometry's
 	/// characteristic length instead of as an absolute distance.
