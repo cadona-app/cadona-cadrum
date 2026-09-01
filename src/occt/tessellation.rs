@@ -1344,14 +1344,18 @@ fn mesh_satisfies_tolerances(face: &TrimmedFace, mesh: &MeshedFace, linear: f64,
 		// for the regular surface interior where the differential is meaningful.
 		let boundary_layer = uvs.iter().filter(|uv| near_parametric_boundary(face, **uv)).count() >= 2;
 		let has_subdeflection_cusp = subdeflection_cusp(face, uvs, positions, usable_linear);
-		let angular_exempt = positions.iter().any(|position| boundary_vertex_keys.contains(&point_key(*position))) || triangle.iter().any(|index| mesh.quality_exempt_vertices.contains(index)) || uvs.iter().any(|uv| collapsed_parameter_axis(face, *uv).is_some()) || face.surface.triangle_crosses_nonsmooth_knot(uvs) || has_subdeflection_cusp || boundary_layer;
+		let touches_exact_boundary = positions.iter().any(|position| boundary_vertex_keys.contains(&point_key(*position)));
+		let angular_exempt = touches_exact_boundary || triangle.iter().any(|index| mesh.quality_exempt_vertices.contains(index)) || uvs.iter().any(|uv| collapsed_parameter_axis(face, *uv).is_some()) || face.surface.triangle_crosses_nonsmooth_knot(uvs) || has_subdeflection_cusp || boundary_layer;
 		let has_microscopic_exact_boundary_edge = (0..3).any(|edge| {
 			let next = (edge + 1) % 3;
 			boundary_vertex_keys.contains(&point_key(positions[edge])) && boundary_vertex_keys.contains(&point_key(positions[next])) && positions[edge].distance(positions[next]) <= usable_linear * 0.10
 		});
 		let physical_edges = [positions[0].distance(positions[1]), positions[1].distance(positions[2]), positions[2].distance(positions[0])];
 		let has_subdeflection_microscopic_edge = physical_edges.into_iter().fold(f64::INFINITY, f64::min) <= usable_linear * 0.10 && physical_edges.into_iter().fold(0.0, f64::max) <= usable_linear * 2.0;
-		let hard_aspect_exempt = uvs.iter().any(|uv| collapsed_parameter_axis(face, *uv).is_some()) || has_microscopic_exact_boundary_edge || has_subdeflection_cusp || has_subdeflection_microscopic_edge;
+		// Resource-bounded anisotropic patches require elongated exact-boundary transition cells.
+		// Exempt only those cells from the aspect ceiling; linear and topology audits still apply.
+		let resource_bounded_boundary_transition = resource_bounded_aspect > 0.0 && touches_exact_boundary;
+		let hard_aspect_exempt = uvs.iter().any(|uv| collapsed_parameter_axis(face, *uv).is_some()) || has_microscopic_exact_boundary_edge || has_subdeflection_cusp || has_subdeflection_microscopic_edge || resource_bounded_boundary_transition;
 		let distribution_aspect_exempt = angular_exempt || has_subdeflection_microscopic_edge;
 		let expected_normal = oriented_surface_normal(face, center_uv).ok_or(Error::TriangulationFailed)?;
 		let angle = geometric_normal.dot(expected_normal).clamp(-1.0, 1.0).acos();
