@@ -1301,20 +1301,31 @@ fn mesh_column_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], u
 		for (v_index, v) in column_coordinates.iter().copied().enumerate() {
 			let u = u_coordinates[u_index];
 			// Opposite canonical boundaries can differ by a few chart ULPs even
-			// when their physical samples correspond one-for-one.  The tensor
-			// interior uses their averaged coordinate, but a boundary vertex must
-			// retain the exact UV owned by that occurrence.  Otherwise the mesh
-			// silently loses its typed boundary-segment identity and a discarded
-			// collinear chart cell appears as an incidence-one interior edge.
-			let uv = if v_index == 0 && !lower_collapsed {
-				lower.get(u_index).map(|vertex| vertex.uv).unwrap_or(DVec2::new(u, v))
-			} else if v_index + 1 == column_coordinates.len() && !upper_collapsed {
-				upper.get(u_index).map(|vertex| vertex.uv).unwrap_or(DVec2::new(u, v))
-			} else {
-				DVec2::new(u, v)
-			};
+			// when their physical samples correspond one-for-one. The tensor
+			// interior uses averaged coordinates, but every unrefined boundary
+			// vertex must retain its exact UV-position pair. Mixing a canonical
+			// position from one side with an averaged coordinate silently loses
+			// the typed segment's bit-identical identity.
+			let canonical_boundary = boundary_column.filter(|_| self_seam_edge.is_none()).and_then(|column| column.get(v_index).copied()).or_else(|| {
+				if v_index == 0 && !lower_collapsed {
+					lower.get(u_index).copied()
+				} else if v_index + 1 == column_coordinates.len() && !upper_collapsed {
+					upper.get(u_index).copied()
+				} else {
+					None
+				}
+			});
+			let uv = canonical_boundary.map_or_else(
+				|| {
+					let boundary_u = boundary_column.and_then(|column| column.first()).map_or(u, |vertex| vertex.uv.x);
+					DVec2::new(boundary_u, v)
+				},
+				|vertex| vertex.uv,
+			);
 			let sample = face.surface.evaluate(uv).ok_or(Error::TriangulationFailed)?;
-			let position = if let Some(column) = boundary_column {
+			let position = if let Some(vertex) = canonical_boundary {
+				vertex.position
+			} else if let Some(column) = boundary_column {
 				if let Some(points) = refined_seam_points.as_ref() {
 					points[v_index]
 				} else {
