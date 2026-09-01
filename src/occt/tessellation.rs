@@ -6,17 +6,31 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Mutex;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::OnceLock;
 
 use glam::{DVec2, DVec3};
 use spade::{ConstrainedDelaunayTriangulation, HasPosition, Point2, PositionInTriangulation, Triangulation};
 
 use super::ffi;
-use crate::{Error, Tessellation};
+use crate::{Error, FailureCategory, OperationFailure, Tessellation};
 
 // Indices are u32 throughout the Rust and renderer boundaries. Keep a finite
 // resource ceiling without imposing the obsolete u16-sized limit that made a
 // valid high-resolution face impossible to export.
 const MAXIMUM_FACE_VERTICES: usize = 1_048_576;
+const MAXIMUM_FACE_TRIM_VERTICES: usize = 262_144;
+const MAXIMUM_FACE_TRIM_LOOPS: usize = 16_384;
+const MAXIMUM_CDT_FACE_VERTICES: usize = 524_288;
+const MAXIMUM_REQUEST_VERTICES: usize = 4_194_304;
+const MAXIMUM_REQUEST_TRIANGLES: usize = 8_388_608;
+const MAXIMUM_REQUEST_INDICES: usize = 25_165_824;
+const MAXIMUM_REQUEST_PAYLOAD_BYTES: usize = 512 * 1024 * 1024;
+const MAXIMUM_PARALLEL_FACES: usize = 2;
+const MAXIMUM_STRUCTURED_SEED_INSERTIONS: usize = 65_536;
+const MAXIMUM_BOUNDARY_COLLAR_INSERTIONS: usize = 32_768;
+const MAXIMUM_LATTICE_INSERTIONS: usize = 32_768;
 const MAXIMUM_REQUIRED_REFINEMENT_PASSES: usize = 32;
 const MAXIMUM_QUALITY_REFINEMENT_PASSES: usize = 8;
 const MAXIMUM_REQUIRED_INSERTIONS_PER_PASS: usize = 2_048;
@@ -31,6 +45,44 @@ const TARGET_PHYSICAL_ASPECT: f64 = 6.0;
 const MAXIMUM_PHYSICAL_ASPECT: f64 = 12.0;
 const MAXIMUM_HARD_PHYSICAL_ASPECT: f64 = 50.0;
 const MAXIMUM_BALANCED_AXIS_INTERVALS: usize = 128;
+
+fn resource_limit(message: impl Into<String>) -> Error {
+	Error::OperationFailed(OperationFailure { operation: "tessellate B-rep".into(), stage: "resource_limit".into(), exception_type: None, message: message.into(), category: FailureCategory::ResourceLimit, status: None })
+}
+
+fn checked_add_resource(first: usize, second: usize, message: &'static str) -> Result<usize, Error> {
+	first.checked_add(second).ok_or_else(|| resource_limit(message))
+}
+
+fn checked_mul_resource(first: usize, second: usize, message: &'static str) -> Result<usize, Error> {
+	first.checked_mul(second).ok_or_else(|| resource_limit(message))
+}
+
+fn reserve_exact<T>(values: &mut Vec<T>, additional: usize, message: &'static str) -> Result<(), Error> {
+	values.try_reserve_exact(additional).map_err(|_| resource_limit(message))
+}
+
+fn validate_request_payload_bytes(vertex_count: usize, triangle_count: usize, face_count: usize, edge_point_count: usize, edge_count: usize) -> Result<usize, Error> {
+	let face_offset_count = checked_add_resource(face_count, 1, "tessellation face-offset count overflowed")?;
+	let edge_offset_count = checked_add_resource(edge_count, 1, "tessellation edge-offset count overflowed")?;
+	let mut payload_bytes = checked_mul_resource(vertex_count, 48, "tessellation request payload size overflowed")?;
+	payload_bytes = checked_add_resource(payload_bytes, checked_mul_resource(triangle_count, 20, "tessellation request payload size overflowed")?, "tessellation request payload size overflowed")?;
+	payload_bytes = checked_add_resource(payload_bytes, checked_mul_resource(face_count, 12, "tessellation request payload size overflowed")?, "tessellation request payload size overflowed")?;
+	payload_bytes = checked_add_resource(payload_bytes, checked_mul_resource(face_offset_count, 8, "tessellation request payload size overflowed")?, "tessellation request payload size overflowed")?;
+	payload_bytes = checked_add_resource(payload_bytes, checked_mul_resource(edge_point_count, 24, "tessellation request payload size overflowed")?, "tessellation request payload size overflowed")?;
+	payload_bytes = checked_add_resource(payload_bytes, checked_mul_resource(edge_count, 4, "tessellation request payload size overflowed")?, "tessellation request payload size overflowed")?;
+	payload_bytes = checked_add_resource(payload_bytes, checked_mul_resource(edge_offset_count, 4, "tessellation request payload size overflowed")?, "tessellation request payload size overflowed")?;
+	if payload_bytes > MAXIMUM_REQUEST_PAYLOAD_BYTES {
+		return Err(resource_limit("tessellation request exceeded the output payload limit"));
+	}
+	Ok(payload_bytes)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn bounded_face_pool() -> Result<&'static rayon::ThreadPool, Error> {
+	static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+	POOL.get_or_init(|| rayon::ThreadPoolBuilder::new().num_threads(MAXIMUM_PARALLEL_FACES).thread_name(|index| format!("cadrum-tessellation-{index}")).build().ok()).as_ref().ok_or_else(|| resource_limit("tessellation could not create its bounded worker pool"))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EdgeOccurrenceDirection {
@@ -573,6 +625,47 @@ struct MeshedFace {
 	quality_exempt_vertices: BTreeSet<u32>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RequestMeshTotals {
+	vertices: usize,
+	triangles: usize,
+	indices: usize,
+	payload_bytes: usize,
+}
+
+#[derive(Default)]
+struct RequestMeshBudget {
+	totals: Mutex<RequestMeshTotals>,
+}
+
+impl RequestMeshBudget {
+	fn admit(&self, face: &MeshedFace) -> Result<(), Error> {
+		let triangles = face.indices.len() / 3;
+		let vertex_bytes = checked_mul_resource(face.vertices.len(), 48, "tessellation request payload size overflowed")?;
+		let triangle_bytes = checked_mul_resource(triangles, 20, "tessellation request payload size overflowed")?;
+		let face_bytes = checked_add_resource(vertex_bytes, triangle_bytes, "tessellation request payload size overflowed")?;
+		self.admit_counts(face.vertices.len(), triangles, face.indices.len(), face_bytes)
+	}
+
+	fn admit_counts(&self, face_vertices: usize, face_triangles: usize, face_indices: usize, face_payload_bytes: usize) -> Result<(), Error> {
+		let mut totals = self.totals.lock().map_err(|_| resource_limit("tessellation request resource accounting failed"))?;
+		let vertices = checked_add_resource(totals.vertices, face_vertices, "tessellation request vertex count overflowed")?;
+		let triangles = checked_add_resource(totals.triangles, face_triangles, "tessellation request triangle count overflowed")?;
+		let indices = checked_add_resource(totals.indices, face_indices, "tessellation request index count overflowed")?;
+		let payload_bytes = checked_add_resource(totals.payload_bytes, face_payload_bytes, "tessellation request payload size overflowed")?;
+		if vertices > MAXIMUM_REQUEST_VERTICES || triangles > MAXIMUM_REQUEST_TRIANGLES || indices > MAXIMUM_REQUEST_INDICES || payload_bytes > MAXIMUM_REQUEST_PAYLOAD_BYTES {
+			return Err(resource_limit("tessellation request exceeded aggregate mesh resource limits"));
+		}
+		*totals = RequestMeshTotals { vertices, triangles, indices, payload_bytes };
+		Ok(())
+	}
+
+	#[cfg(feature = "test-support")]
+	fn snapshot(&self) -> Result<RequestMeshTotals, Error> {
+		self.totals.lock().map(|totals| *totals).map_err(|_| resource_limit("tessellation request resource accounting failed"))
+	}
+}
+
 impl FaceBoundaryContract {
 	fn from_face(face: &TrimmedFace, refinements: &[BoundaryOccurrenceRefinement]) -> Result<Self, Error> {
 		let mut segments = BTreeMap::new();
@@ -814,12 +907,18 @@ pub(super) fn mesh_brep_source(data: ffi::BrepMeshSourceData, options: Tessellat
 }
 
 fn mesh_faces(faces: &[TrimmedFace], linear: f64, angular: f64, parallel: bool, progress: &ffi::CancellationToken) -> Result<Vec<MeshedFace>, Error> {
+	let budget = RequestMeshBudget::default();
+	let mesh_and_admit = |face: &TrimmedFace| {
+		let mesh = mesh_face(face, linear, angular, progress)?;
+		budget.admit(&mesh)?;
+		Ok(mesh)
+	};
 	#[cfg(not(target_arch = "wasm32"))]
 	if parallel && faces.len() > 1 {
 		use rayon::prelude::*;
-		return faces.par_iter().map(|face| mesh_face(face, linear, angular, progress)).collect();
+		return bounded_face_pool()?.install(|| faces.par_iter().map(mesh_and_admit).collect());
 	}
-	faces.iter().map(|face| mesh_face(face, linear, angular, progress)).collect()
+	faces.iter().map(mesh_and_admit).collect()
 }
 
 fn mesh_face(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::CancellationToken) -> Result<MeshedFace, Error> {
@@ -865,11 +964,10 @@ fn mesh_face(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::Canc
 			let handle = if let Some(existing) = triangulation.locate_vertex(metric_position) {
 				let existing = existing.fix();
 				for occurrence in boundary_occurrences.into_iter().flatten() {
-					triangulation.vertex_data_mut(existing).add_boundary_occurrence(occurrence).map_err(|error| {
+					triangulation.vertex_data_mut(existing).add_boundary_occurrence(occurrence).inspect_err(|_| {
 						if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
 							eprintln!("custom tessellation face {} boundary vertex {index} of loop {loop_index} exceeded occurrence capacity at metric position {metric_position:?}", face.index);
 						}
-						error
 					})?;
 				}
 				existing
@@ -908,9 +1006,9 @@ fn mesh_face(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::Canc
 	if face.surface.is_planar() {
 		triangulation = seed_best_planar_lattice(face, chart, linear, &insertion_domain, triangulation)?;
 	} else {
-		seed_structured_patch(face, chart, &insertion_domain, &mut triangulation);
-		seed_boundary_collar(face, chart, &insertion_domain, &mut triangulation);
-		seed_metric_lattice(face, chart, linear, &insertion_domain, &mut triangulation);
+		seed_structured_patch(face, chart, &insertion_domain, &mut triangulation)?;
+		seed_boundary_collar(face, chart, &insertion_domain, &mut triangulation)?;
+		seed_metric_lattice(face, chart, linear, &insertion_domain, &mut triangulation)?;
 	}
 
 	// Seed broad trimmed regions before exact-error refinement. A boundary-only
@@ -921,6 +1019,9 @@ fn mesh_face(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::Canc
 		let outer = &face.loops[0].vertices;
 		let center = outer.iter().map(|vertex| vertex.uv).sum::<DVec2>() / outer.len() as f64;
 		if point_in_trim(center, &face.loops) {
+			if triangulation.num_vertices() >= MAXIMUM_CDT_FACE_VERTICES {
+				return Err(resource_limit("tessellation face exceeded the CDT vertex limit"));
+			}
 			insert_interior_vertex(face, &mut triangulation, center, chart, &insertion_domain);
 		}
 	}
@@ -943,8 +1044,11 @@ fn mesh_face(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::Canc
 		if face.surface.is_planar() {
 			candidates.retain(|candidate| candidate.required);
 		}
-		if candidates.is_empty() || triangulation.num_vertices() >= MAXIMUM_FACE_VERTICES {
+		if candidates.is_empty() {
 			break;
+		}
+		if triangulation.num_vertices() >= MAXIMUM_CDT_FACE_VERTICES {
+			return Err(resource_limit("tessellation face exceeded the CDT vertex limit"));
 		}
 		let refining_required_error = candidates.iter().any(|candidate| candidate.required);
 		candidates.retain(|candidate| candidate.required == refining_required_error);
@@ -955,7 +1059,7 @@ fn mesh_face(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::Canc
 		}
 		*passes += 1;
 		let before = triangulation.num_vertices();
-		let room = MAXIMUM_FACE_VERTICES - before;
+		let room = MAXIMUM_CDT_FACE_VERTICES - before;
 		let maximum_insertions = maximum_per_pass.min(maximum_total - *insertion_count);
 		let mut seen_candidates = BTreeSet::new();
 		for (index, candidate) in candidates.into_iter().filter(|candidate| seen_candidates.insert((candidate.uv.x.to_bits(), candidate.uv.y.to_bits()))).take(maximum_insertions.min(room)).enumerate() {
@@ -1214,6 +1318,14 @@ fn point_key(point: DVec3) -> PointKey {
 	PointKey(coordinate_key(point.x), coordinate_key(point.y), coordinate_key(point.z))
 }
 
+#[derive(Clone, Copy)]
+struct StructuredBoundarySides<'a> {
+	lower: &'a [&'a BoundaryVertex],
+	upper: &'a [&'a BoundaryVertex],
+	left: &'a [&'a BoundaryVertex],
+	right: &'a [&'a BoundaryVertex],
+}
+
 /// Tessellates an untrimmed four-sided surface chart as a coherent tensor
 /// grid. This covers the regular charts used by most analytic and swept CAD
 /// faces, including periodic seams and collapsed sphere/cone poles.
@@ -1295,7 +1407,8 @@ fn mesh_structured_patch(face: &TrimmedFace, linear: f64, angular: f64) -> Resul
 		}
 	}
 	if has_collapsed_horizontal_boundary || lower.len() == upper.len() && lower.iter().zip(upper).all(|(first, second)| (first.uv.x - second.uv.x).abs() <= u_tolerance) {
-		if let Some(mesh) = mesh_column_structured_patch(face, lower, upper, left, right, v_tolerance, linear, angular)? {
+		let boundaries = StructuredBoundarySides { lower, upper, left, right };
+		if let Some(mesh) = mesh_column_structured_patch(face, boundaries, v_tolerance, linear, angular)? {
 			if mesh_satisfies_tolerances(face, &mesh, linear, angular)? {
 				return Ok(Some(mesh));
 			}
@@ -1341,7 +1454,7 @@ fn mesh_singular_row_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVert
 		return Ok(None);
 	}
 	let [u_min, u_max, _, _] = face.surface.uv_bounds;
-	let mut reference_u = adaptive_axis_coordinates(face, ParametricAxis::U, lower, upper, f64::INFINITY, linear * 0.5, angular * 0.5, u_tolerance)?;
+	let mut reference_u = adaptive_axis_coordinates(face, ParametricAxis::U, [lower, upper], AxisSampling { target_length: f64::INFINITY, linear: linear * 0.5, angular: angular * 0.5, coordinate_tolerance: u_tolerance })?;
 	reference_u.sort_by(f64::total_cmp);
 	reference_u.dedup_by(|first, second| (*first - *second).abs() <= u_tolerance);
 	if reference_u.len() < 4 {
@@ -1358,7 +1471,7 @@ fn mesh_singular_row_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVert
 	// shared by both occurrences of this self-seam.
 	let canonical_seam = if left.len() >= right.len() { left } else { right };
 	let seam_edge_index = dominant_boundary_edge_index(canonical_seam).ok_or(Error::TriangulationFailed)?;
-	let mut v_coordinates = adaptive_axis_coordinates(face, ParametricAxis::V, canonical_seam, canonical_seam, f64::INFINITY, linear * 0.5, angular * 0.5, v_tolerance)?;
+	let mut v_coordinates = adaptive_axis_coordinates(face, ParametricAxis::V, [canonical_seam, canonical_seam], AxisSampling { target_length: f64::INFINITY, linear: linear * 0.5, angular: angular * 0.5, coordinate_tolerance: v_tolerance })?;
 	v_coordinates.sort_by(f64::total_cmp);
 	v_coordinates.dedup_by(|first, second| (*first - *second).abs() <= v_tolerance);
 	if !refine_compact_patch_v_coordinates(face, &reference_u, &mut v_coordinates, v_tolerance, linear * 0.5)? || !strictly_increasing(&v_coordinates) {
@@ -1375,9 +1488,42 @@ fn mesh_singular_row_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVert
 	}
 	let boundary_intervals = reference_u.len().saturating_sub(1).clamp(3, 512);
 	const MAXIMUM_SINGULAR_RING_INTERVALS: usize = 512;
+	let mut planned_row_sizes = Vec::with_capacity(v_coordinates.len());
+	let mut planned_vertex_count = 0usize;
+	for (v_index, _) in v_coordinates.iter().enumerate() {
+		let is_lower = v_index == 0;
+		let is_upper = v_index + 1 == v_coordinates.len();
+		let row_size = if is_lower && lower_collapsed || is_upper && upper_collapsed {
+			1
+		} else if is_lower || is_upper {
+			if is_lower {
+				lower.len()
+			} else {
+				upper.len()
+			}
+		} else {
+			let center_u = (u_min + u_max) * 0.5;
+			let previous_v = v_coordinates[v_index - 1];
+			let next_v = v_coordinates[v_index + 1];
+			let previous_step = face.surface.evaluate(DVec2::new(center_u, previous_v)).zip(face.surface.evaluate(DVec2::new(center_u, v_coordinates[v_index]))).map(|(first, second)| first.position.distance(second.position)).unwrap_or(0.0);
+			let next_step = face.surface.evaluate(DVec2::new(center_u, v_coordinates[v_index])).zip(face.surface.evaluate(DVec2::new(center_u, next_v))).map(|(first, second)| first.position.distance(second.position)).unwrap_or(0.0);
+			let radial_step = previous_step.max(next_step).max(1.0e-12);
+			let accuracy_intervals = (boundary_intervals as f64 * (ring_lengths[v_index] / maximum_ring_length).sqrt()).ceil() as usize;
+			let aspect_intervals = (ring_lengths[v_index] / (radial_step * TARGET_PHYSICAL_ASPECT)).ceil() as usize;
+			accuracy_intervals.max(aspect_intervals).clamp(3, MAXIMUM_SINGULAR_RING_INTERVALS) + 1
+		};
+		planned_vertex_count = checked_add_resource(planned_vertex_count, row_size, "tessellation singular structured vertex count overflowed")?;
+		planned_row_sizes.push(row_size);
+	}
+	if planned_vertex_count > MAXIMUM_FACE_VERTICES {
+		return Err(resource_limit("tessellation singular structured face exceeded the vertex limit"));
+	}
 	let mut vertices = Vec::new();
 	let mut uvs = Vec::new();
 	let mut normals = Vec::new();
+	reserve_exact(&mut vertices, planned_vertex_count, "tessellation singular structured vertex allocation failed")?;
+	reserve_exact(&mut uvs, planned_vertex_count, "tessellation singular structured parameter allocation failed")?;
+	reserve_exact(&mut normals, planned_vertex_count, "tessellation singular structured normal allocation failed")?;
 	let mut rows = Vec::<Vec<(f64, usize)>>::with_capacity(v_coordinates.len());
 	let mut refined_seam_points = Vec::with_capacity(v_coordinates.len());
 
@@ -1406,19 +1552,11 @@ fn mesh_singular_row_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVert
 			continue;
 		}
 
-		let center_u = (u_min + u_max) * 0.5;
-		let previous_v = v_coordinates[v_index.saturating_sub(1)];
-		let next_v = v_coordinates[(v_index + 1).min(v_coordinates.len() - 1)];
-		let previous_step = face.surface.evaluate(DVec2::new(center_u, previous_v)).zip(face.surface.evaluate(DVec2::new(center_u, v))).map(|(first, second)| first.position.distance(second.position)).unwrap_or(0.0);
-		let next_step = face.surface.evaluate(DVec2::new(center_u, v)).zip(face.surface.evaluate(DVec2::new(center_u, next_v))).map(|(first, second)| first.position.distance(second.position)).unwrap_or(0.0);
-		let radial_step = previous_step.max(next_step).max(1.0e-12);
 		// Circular chord error is proportional to radius / intervals².  Reduce
 		// the circumferential density with the square root of physical ring
 		// length so every latitude retains the same sagitta budget instead of
 		// collapsing too aggressively near the pole.
-		let accuracy_intervals = (boundary_intervals as f64 * (ring_lengths[v_index] / maximum_ring_length).sqrt()).ceil() as usize;
-		let aspect_intervals = (ring_lengths[v_index] / (radial_step * TARGET_PHYSICAL_ASPECT)).ceil() as usize;
-		let intervals = accuracy_intervals.max(aspect_intervals).clamp(3, MAXIMUM_SINGULAR_RING_INTERVALS);
+		let intervals = planned_row_sizes[v_index] - 1;
 		let seam_position = boundary_position_at_coordinate(canonical_seam, v, false, false, v_tolerance).or_else(|| face.surface.evaluate(DVec2::new(u_min, v)).map(|sample| sample.position)).ok_or(Error::TriangulationFailed)?;
 		refined_seam_points.push(seam_position);
 		let mut row = Vec::with_capacity(intervals + 1);
@@ -1431,11 +1569,11 @@ fn mesh_singular_row_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVert
 		}
 		rows.push(row);
 	}
-	if vertices.len() > MAXIMUM_FACE_VERTICES {
-		return Err(Error::TriangulationFailed);
-	}
+	debug_assert_eq!(vertices.len(), planned_vertex_count);
 
+	let planned_index_count = checked_mul_resource(planned_vertex_count, 6, "tessellation singular structured index count overflowed")?;
 	let mut indices = Vec::new();
+	reserve_exact(&mut indices, planned_index_count, "tessellation singular structured index allocation failed")?;
 	for pair in rows.windows(2) {
 		match (pair[0].as_slice(), pair[1].as_slice()) {
 			([(_, pole)], ring) => push_pole_fan(*pole, ring, &vertices, &normals, &mut indices)?,
@@ -1479,7 +1617,8 @@ fn push_pole_fan(pole: usize, ring: &[(f64, usize)], vertices: &[DVec3], normals
 	Ok(())
 }
 
-fn mesh_column_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], upper: &[&BoundaryVertex], left: &[&BoundaryVertex], right: &[&BoundaryVertex], v_tolerance: f64, linear: f64, angular: f64) -> Result<Option<MeshedFace>, Error> {
+fn mesh_column_structured_patch(face: &TrimmedFace, boundaries: StructuredBoundarySides<'_>, v_tolerance: f64, linear: f64, angular: f64) -> Result<Option<MeshedFace>, Error> {
+	let StructuredBoundarySides { lower, upper, left, right } = boundaries;
 	let lower_collapsed = boundary_vertices_collapsed(lower);
 	let upper_collapsed = boundary_vertices_collapsed(upper);
 	let has_collapsed_horizontal_boundary = lower_collapsed || upper_collapsed;
@@ -1493,11 +1632,11 @@ fn mesh_column_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], u
 	// would create four independently triangulated corner regions which can
 	// overlap at the collapsed boundary.  Instead, adapt the non-collapsed
 	// parameter direction while retaining every exact edge sample.
-	let mut v_coordinates = if has_collapsed_horizontal_boundary { adaptive_axis_coordinates(face, ParametricAxis::V, left, right, f64::INFINITY, linear * 0.5, angular * 0.5, v_tolerance)? } else { left.iter().chain(right.iter()).map(|vertex| vertex.uv.y).collect::<Vec<_>>() };
+	let mut v_coordinates = if has_collapsed_horizontal_boundary { adaptive_axis_coordinates(face, ParametricAxis::V, [left, right], AxisSampling { target_length: f64::INFINITY, linear: linear * 0.5, angular: angular * 0.5, coordinate_tolerance: v_tolerance })? } else { left.iter().chain(right.iter()).map(|vertex| vertex.uv.y).collect::<Vec<_>>() };
 	v_coordinates.sort_by(f64::total_cmp);
 	v_coordinates.dedup_by(|first, second| (*first - *second).abs() <= v_tolerance);
 	let u_coordinates = if both_horizontal_boundaries_collapsed {
-		let adaptive_u = adaptive_axis_coordinates(face, ParametricAxis::U, lower, upper, f64::INFINITY, linear, angular, (u_max - u_min).abs().max(1.0) * 1.0e-7)?;
+		let adaptive_u = adaptive_axis_coordinates(face, ParametricAxis::U, [lower, upper], AxisSampling { target_length: f64::INFINITY, linear, angular, coordinate_tolerance: (u_max - u_min).abs().max(1.0) * 1.0e-7 })?;
 		let metric = MetricMap::from_face(face);
 		let [_, _, v_min, v_max] = face.surface.uv_bounds;
 		let metric_u = metric_distance(metric.map(DVec2::new(u_min, (v_min + v_max) * 0.5)), metric.map(DVec2::new(u_max, (v_min + v_max) * 0.5)));
@@ -1552,20 +1691,25 @@ fn mesh_column_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], u
 		let maximum_u_step = u_coordinates.windows(2).map(|pair| pair[1] - pair[0]).fold(0.0, f64::max);
 		eprintln!("custom tessellation face {} compact structured grid: {}x{} points, maximum u step {maximum_u_step:.12e}", face.index, u_count, v_coordinates.len());
 	}
-	let estimated_vertices = left.len().saturating_add(right.len()).saturating_add(u_count.saturating_sub(2).saturating_mul(v_coordinates.len()));
+	let boundary_vertices = if self_seam_edge.is_some() { checked_mul_resource(2, v_coordinates.len(), "tessellation compact structured vertex count overflowed")? } else { checked_add_resource(left.len(), right.len(), "tessellation compact structured vertex count overflowed")? };
+	let interior_vertices = checked_mul_resource(u_count.saturating_sub(2), v_coordinates.len(), "tessellation compact structured vertex count overflowed")?;
+	let estimated_vertices = checked_add_resource(boundary_vertices, interior_vertices, "tessellation compact structured vertex count overflowed")?;
 	if estimated_vertices > MAXIMUM_FACE_VERTICES {
 		if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
 			eprintln!("custom tessellation face {} compact structured rejected resource estimate {estimated_vertices} > {MAXIMUM_FACE_VERTICES}", face.index);
 		}
-		return Ok(None);
+		return Err(resource_limit("tessellation compact structured face exceeded the vertex limit"));
 	}
 
-	let mut vertices = Vec::with_capacity(estimated_vertices);
-	let mut uvs = Vec::with_capacity(estimated_vertices);
-	let mut normals = Vec::with_capacity(estimated_vertices);
+	let mut vertices = Vec::new();
+	let mut uvs = Vec::new();
+	let mut normals = Vec::new();
+	reserve_exact(&mut vertices, estimated_vertices, "tessellation compact structured vertex allocation failed")?;
+	reserve_exact(&mut uvs, estimated_vertices, "tessellation compact structured parameter allocation failed")?;
+	reserve_exact(&mut normals, estimated_vertices, "tessellation compact structured normal allocation failed")?;
 	let refined_seam_points = if self_seam_edge.is_some() { Some(v_coordinates.iter().copied().map(|v| boundary_position_at_coordinate(left, v, false, false, v_tolerance).or_else(|| face.surface.evaluate(DVec2::new(u_min, v)).map(|sample| sample.position)).ok_or(Error::TriangulationFailed)).collect::<Result<Vec<_>, _>>()?) } else { None };
 	let mut columns = Vec::<Vec<(f64, usize)>>::with_capacity(u_count);
-	for u_index in 0..u_count {
+	for (u_index, u) in u_coordinates.iter().copied().enumerate() {
 		let boundary_column = if u_index == 0 {
 			Some(left)
 		} else if u_index + 1 == u_count {
@@ -1577,7 +1721,6 @@ fn mesh_column_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], u
 		let column_coordinates = owned_boundary_coordinates.as_deref().unwrap_or(v_coordinates.as_slice());
 		let mut column_indices = Vec::with_capacity(column_coordinates.len());
 		for (v_index, v) in column_coordinates.iter().copied().enumerate() {
-			let u = u_coordinates[u_index];
 			// Opposite canonical boundaries can differ by a few chart ULPs even
 			// when their physical samples correspond one-for-one. The tensor
 			// interior uses averaged coordinates, but every unrefined boundary
@@ -1626,7 +1769,9 @@ fn mesh_column_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], u
 		columns.push(column_indices);
 	}
 
-	let mut indices = Vec::with_capacity(estimated_vertices.saturating_mul(6));
+	let estimated_indices = checked_mul_resource(estimated_vertices, 6, "tessellation compact structured index count overflowed")?;
+	let mut indices = Vec::new();
+	reserve_exact(&mut indices, estimated_indices, "tessellation compact structured index allocation failed")?;
 	for pair in columns.windows(2) {
 		triangulate_monotone_strip(face, pair[0].as_slice(), pair[1].as_slice(), &vertices, &uvs, &normals, v_tolerance, linear, angular, &mut indices)?;
 	}
@@ -1799,8 +1944,8 @@ fn mesh_inset_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], up
 	// A tensor-cell diagonal combines error from both parametric directions.
 	// Refine each one-dimensional axis to half the requested tolerance so the
 	// two contributions remain bounded when the grid is triangulated.
-	let mut u_axis = adaptive_axis_coordinates(face, ParametricAxis::U, lower, upper, target_length, linear * 0.4, angular * 0.4, u_tolerance)?;
-	let mut v_axis = adaptive_axis_coordinates(face, ParametricAxis::V, left, right, target_length, linear * 0.4, angular * 0.4, v_tolerance)?;
+	let mut u_axis = adaptive_axis_coordinates(face, ParametricAxis::U, [lower, upper], AxisSampling { target_length, linear: linear * 0.4, angular: angular * 0.4, coordinate_tolerance: u_tolerance })?;
+	let mut v_axis = adaptive_axis_coordinates(face, ParametricAxis::V, [left, right], AxisSampling { target_length, linear: linear * 0.4, angular: angular * 0.4, coordinate_tolerance: v_tolerance })?;
 	ensure_axis_interior(&mut u_axis, u_min, u_max);
 	ensure_axis_interior(&mut v_axis, v_min, v_max);
 	// Opposite trims can contribute almost-coincident parameters even though
@@ -1869,10 +2014,17 @@ fn mesh_inset_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], up
 		return Ok(None);
 	}
 
-	let estimated_vertices = boundary_vertex_count.saturating_mul(2).saturating_add(u_coordinates.len().saturating_mul(v_coordinates.len()));
-	let mut vertices = Vec::with_capacity(estimated_vertices);
-	let mut uvs = Vec::with_capacity(estimated_vertices);
-	let mut normals = Vec::with_capacity(estimated_vertices);
+	let core_vertex_count = checked_mul_resource(u_coordinates.len(), v_coordinates.len(), "tessellation inset structured vertex count overflowed")?;
+	let base_vertex_count = checked_add_resource(boundary_vertex_count, core_vertex_count, "tessellation inset structured vertex count overflowed")?;
+	if base_vertex_count > MAXIMUM_FACE_VERTICES {
+		return Err(resource_limit("tessellation inset structured face exceeded the vertex limit"));
+	}
+	let mut vertices = Vec::new();
+	let mut uvs = Vec::new();
+	let mut normals = Vec::new();
+	reserve_exact(&mut vertices, base_vertex_count, "tessellation inset structured vertex allocation failed")?;
+	reserve_exact(&mut uvs, base_vertex_count, "tessellation inset structured parameter allocation failed")?;
+	reserve_exact(&mut normals, base_vertex_count, "tessellation inset structured normal allocation failed")?;
 	let mut lower_indices = append_boundary_side(face, lower, true, &mut vertices, &mut uvs, &mut normals)?;
 	let mut upper_indices = append_boundary_side(face, upper, true, &mut vertices, &mut uvs, &mut normals)?;
 	let mut left_indices = append_boundary_side(face, left, false, &mut vertices, &mut uvs, &mut normals)?;
@@ -1895,17 +2047,25 @@ fn mesh_inset_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], up
 	upper_indices = augment_collapsed_boundary(face, &upper_indices, &top_inner, PatchSide::Upper, &mut vertices, &mut uvs, &mut normals)?;
 	left_indices = augment_collapsed_boundary(face, &left_indices, &left_inner, PatchSide::Left, &mut vertices, &mut uvs, &mut normals)?;
 	right_indices = augment_collapsed_boundary(face, &right_indices, &right_inner, PatchSide::Right, &mut vertices, &mut uvs, &mut normals)?;
+	let transition_vertex_count = checked_add_resource(checked_add_resource(transition_stage_vertex_count(lower_indices.len(), bottom_inner.len(), transition_ring_count)?, transition_stage_vertex_count(upper_indices.len(), top_inner.len(), transition_ring_count)?, "tessellation transition-ring vertex count overflowed")?, checked_add_resource(transition_stage_vertex_count(left_indices.len(), left_inner.len(), transition_ring_count)?, transition_stage_vertex_count(right_indices.len(), right_inner.len(), transition_ring_count)?, "tessellation transition-ring vertex count overflowed")?, "tessellation transition-ring vertex count overflowed")?;
+	let planned_vertex_count = checked_add_resource(vertices.len(), transition_vertex_count, "tessellation inset structured vertex count overflowed")?;
+	if planned_vertex_count > MAXIMUM_FACE_VERTICES {
+		return Err(resource_limit("tessellation inset structured transition rings exceeded the vertex limit"));
+	}
+	reserve_exact(&mut vertices, transition_vertex_count, "tessellation inset structured transition allocation failed")?;
+	reserve_exact(&mut uvs, transition_vertex_count, "tessellation inset structured transition allocation failed")?;
+	reserve_exact(&mut normals, transition_vertex_count, "tessellation inset structured transition allocation failed")?;
 	let mut lower_rings = append_transition_rings(face, &lower_indices, &bottom_inner, PatchSide::Lower, u_coordinates[0], u_coordinates[u_coordinates.len() - 1], v_coordinates[0], v_coordinates[v_coordinates.len() - 1], transition_ring_count, &mut vertices, &mut uvs, &mut normals)?;
 	let mut upper_rings = append_transition_rings(face, &upper_indices, &top_inner, PatchSide::Upper, u_coordinates[0], u_coordinates[u_coordinates.len() - 1], v_coordinates[0], v_coordinates[v_coordinates.len() - 1], transition_ring_count, &mut vertices, &mut uvs, &mut normals)?;
 	let mut left_rings = append_transition_rings(face, &left_indices, &left_inner, PatchSide::Left, u_coordinates[0], u_coordinates[u_coordinates.len() - 1], v_coordinates[0], v_coordinates[v_coordinates.len() - 1], transition_ring_count, &mut vertices, &mut uvs, &mut normals)?;
 	let mut right_rings = append_transition_rings(face, &right_indices, &right_inner, PatchSide::Right, u_coordinates[0], u_coordinates[u_coordinates.len() - 1], v_coordinates[0], v_coordinates[v_coordinates.len() - 1], transition_ring_count, &mut vertices, &mut uvs, &mut normals)?;
 	share_transition_ring_corners(&mut lower_rings, &mut upper_rings, &mut left_rings, &mut right_rings)?;
 	let quality_exempt_vertices = lower_indices.iter().chain(&upper_indices).chain(&left_indices).chain(&right_indices).map(|(_, index)| *index).chain([&lower_rings, &upper_rings, &left_rings, &right_rings].into_iter().flat_map(|rings| rings.iter().flatten().map(|(_, index)| *index))).map(|index| u32::try_from(index).map_err(|_| Error::TriangulationFailed)).collect::<Result<BTreeSet<_>, _>>()?;
-	if vertices.len() > MAXIMUM_FACE_VERTICES {
-		return Err(Error::TriangulationFailed);
-	}
+	debug_assert_eq!(vertices.len(), planned_vertex_count);
 
-	let mut indices = Vec::with_capacity(estimated_vertices.saturating_mul(6));
+	let planned_index_count = checked_mul_resource(planned_vertex_count, 6, "tessellation inset structured index count overflowed")?;
+	let mut indices = Vec::new();
+	reserve_exact(&mut indices, planned_index_count, "tessellation inset structured index allocation failed")?;
 	for pair in columns.windows(2) {
 		triangulate_monotone_strip(face, &pair[0], &pair[1], &vertices, &uvs, &normals, 1.0e-10, linear, angular, &mut indices)?;
 	}
@@ -1998,7 +2158,16 @@ fn mean_boundary_segment_length(side: &[&BoundaryVertex]) -> Option<f64> {
 	(count > 0).then_some(length / count as f64)
 }
 
-fn adaptive_axis_coordinates(face: &TrimmedFace, axis: ParametricAxis, first_boundary: &[&BoundaryVertex], second_boundary: &[&BoundaryVertex], target_length: f64, linear: f64, angular: f64, tolerance: f64) -> Result<Vec<f64>, Error> {
+#[derive(Clone, Copy)]
+struct AxisSampling {
+	target_length: f64,
+	linear: f64,
+	angular: f64,
+	coordinate_tolerance: f64,
+}
+
+fn adaptive_axis_coordinates(face: &TrimmedFace, axis: ParametricAxis, boundaries: [&[&BoundaryVertex]; 2], sampling: AxisSampling) -> Result<Vec<f64>, Error> {
+	let [first_boundary, second_boundary] = boundaries;
 	// Ordinary viewport requests normally converge well below this ceiling. A
 	// tight angular request on a complete periodic chart (for example, a sphere)
 	// can legitimately require more than 128 intervals around the full normal
@@ -2025,7 +2194,7 @@ fn adaptive_axis_coordinates(face: &TrimmedFace, axis: ParametricAxis, first_bou
 	coordinates.push(minimum);
 	coordinates.push(maximum);
 	coordinates.sort_by(f64::total_cmp);
-	coordinates.dedup_by(|first, second| (*first - *second).abs() <= tolerance);
+	coordinates.dedup_by(|first, second| (*first - *second).abs() <= sampling.coordinate_tolerance);
 	if coordinates.len() < 2 {
 		return Err(Error::TriangulationFailed);
 	}
@@ -2040,7 +2209,7 @@ fn adaptive_axis_coordinates(face: &TrimmedFace, axis: ParametricAxis, first_bou
 		let mut insertions = Vec::new();
 		for pair in coordinates.windows(2) {
 			let midpoint = (pair[0] + pair[1]) * 0.5;
-			if midpoint > pair[0] && midpoint < pair[1] && axis_interval_needs_split(face, axis, pair[0], midpoint, pair[1], target_length, linear, angular)? {
+			if midpoint > pair[0] && midpoint < pair[1] && axis_interval_needs_split(face, axis, [pair[0], midpoint, pair[1]], sampling)? {
 				insertions.push((pair[1] - pair[0], midpoint));
 			}
 		}
@@ -2058,7 +2227,8 @@ fn adaptive_axis_coordinates(face: &TrimmedFace, axis: ParametricAxis, first_bou
 	Ok(coordinates)
 }
 
-fn axis_interval_needs_split(face: &TrimmedFace, axis: ParametricAxis, first: f64, midpoint: f64, last: f64, target_length: f64, linear: f64, angular: f64) -> Result<bool, Error> {
+fn axis_interval_needs_split(face: &TrimmedFace, axis: ParametricAxis, interval: [f64; 3], sampling: AxisSampling) -> Result<bool, Error> {
+	let [first, midpoint, last] = interval;
 	let [u_min, u_max, v_min, v_max] = face.surface.uv_bounds;
 	let cross_values = match axis {
 		ParametricAxis::U => [v_min, v_min * 0.75 + v_max * 0.25, (v_min + v_max) * 0.5, v_min * 0.25 + v_max * 0.75, v_max],
@@ -2072,7 +2242,7 @@ fn axis_interval_needs_split(face: &TrimmedFace, axis: ParametricAxis, first: f6
 		let deviation = point_segment_distance(middle_sample.position, first_sample.position, last_sample.position);
 		let first_angle = surface_normal_angle(first_sample, middle_sample);
 		let second_angle = surface_normal_angle(middle_sample, last_sample);
-		if path_length > target_length || deviation > linear || first_angle > angular || second_angle > angular {
+		if path_length > sampling.target_length || deviation > sampling.linear || first_angle > sampling.angular || second_angle > sampling.angular {
 			return Ok(true);
 		}
 	}
@@ -2135,9 +2305,10 @@ fn coarsen_axis_coordinates(face: &TrimmedFace, axis: ParametricAxis, coordinate
 }
 
 fn axis_coordinates_meet_error(face: &TrimmedFace, axis: ParametricAxis, coordinates: &[f64], linear: f64, angular: f64) -> Result<bool, Error> {
+	let sampling = AxisSampling { target_length: f64::INFINITY, linear, angular, coordinate_tolerance: 0.0 };
 	for interval in coordinates.windows(2) {
 		let midpoint = (interval[0] + interval[1]) * 0.5;
-		if axis_interval_needs_split(face, axis, interval[0], midpoint, interval[1], f64::INFINITY, linear, angular)? {
+		if axis_interval_needs_split(face, axis, [interval[0], midpoint, interval[1]], sampling)? {
 			return Ok(false);
 		}
 	}
@@ -2386,6 +2557,14 @@ fn augment_collapsed_boundary(face: &TrimmedFace, boundary: &[(f64, usize)], inn
 	let mut keys = boundary.iter().chain(inner).map(|entry| entry.0).collect::<Vec<_>>();
 	keys.sort_by(f64::total_cmp);
 	keys.dedup_by(|first, second| (*first - *second).abs() <= 1.0e-12);
+	let additional_vertices = keys.iter().filter(|key| !boundary.iter().any(|entry| (entry.0 - **key).abs() <= 1.0e-12)).count();
+	let planned_vertex_count = checked_add_resource(vertices.len(), additional_vertices, "tessellation collapsed boundary vertex count overflowed")?;
+	if planned_vertex_count > MAXIMUM_FACE_VERTICES {
+		return Err(resource_limit("tessellation collapsed boundary exceeded the structured vertex limit"));
+	}
+	reserve_exact(vertices, additional_vertices, "tessellation collapsed boundary vertex allocation failed")?;
+	reserve_exact(uvs, additional_vertices, "tessellation collapsed boundary parameter allocation failed")?;
+	reserve_exact(normals, additional_vertices, "tessellation collapsed boundary normal allocation failed")?;
 	let [u_min, u_max, v_min, v_max] = face.surface.uv_bounds;
 	keys.into_iter()
 		.map(|key| {
@@ -2493,6 +2672,19 @@ fn transition_key_stages(boundary: &[f64], inner: &[f64], transition_ring_count:
 		stages.push(keys);
 	}
 	Ok(stages)
+}
+
+fn transition_stage_vertex_count(boundary_count: usize, inner_count: usize, transition_ring_count: usize) -> Result<usize, Error> {
+	if boundary_count < 2 || inner_count < 2 || transition_ring_count == 0 {
+		return Err(Error::TriangulationFailed);
+	}
+	let mut total = 0usize;
+	for stage in 1..=transition_ring_count {
+		let blend = stage as f64 / (transition_ring_count + 1) as f64;
+		let sample_count = ((boundary_count as f64 + (inner_count as f64 - boundary_count as f64) * blend).round() as usize).max(2);
+		total = checked_add_resource(total, sample_count, "tessellation transition-ring vertex count overflowed")?;
+	}
+	Ok(total)
 }
 
 fn sample_key_distribution(keys: &[f64], quantile: f64) -> f64 {
@@ -2891,13 +3083,13 @@ fn fill_singular_normals(face: &TrimmedFace, uvs: &[DVec2], vertices: &[DVec3], 
 /// final connectivity and arbitrary trimmed faces retain the general path,
 /// but these coherent seeds prevent long diagonals and centroid-refinement
 /// pinwheels on the semi-organic surfaces that dominate CAD presentation.
-fn seed_structured_patch(face: &TrimmedFace, chart: FaceChart, insertion_domain: &InsertionDomain, triangulation: &mut FaceTriangulation) {
+fn seed_structured_patch(face: &TrimmedFace, chart: FaceChart, insertion_domain: &InsertionDomain, triangulation: &mut FaceTriangulation) -> Result<(), Error> {
 	let Some(trim_loop) = face.loops.first().filter(|_| face.loops.len() == 1) else {
-		return;
+		return Ok(());
 	};
 	let runs = boundary_edge_runs(trim_loop);
 	if runs.len() != 4 {
-		return;
+		return Ok(());
 	}
 	let [u_min, u_max, v_min, v_max] = face.surface.uv_bounds;
 	let u_range = u_max - u_min;
@@ -2914,35 +3106,35 @@ fn seed_structured_patch(face: &TrimmedFace, chart: FaceChart, insertion_domain:
 		} else if run_u_max - run_u_min <= u_tolerance && run_v_max - run_v_min >= v_range.abs() * 0.90 {
 			vertical.push(run);
 		} else {
-			return;
+			return Ok(());
 		}
 	}
 	if horizontal.len() != 2 || vertical.len() != 2 {
-		return;
+		return Ok(());
 	}
 
 	let u_boundary_intervals = horizontal.iter().map(|run| run.len().saturating_sub(1)).max().unwrap_or(1).max(1);
 	let v_boundary_intervals = vertical.iter().map(|run| run.len().saturating_sub(1)).max().unwrap_or(1).max(1);
 	let metric_u = {
 		let Some(first) = chart.map_uv(face, DVec2::new(u_min, (v_min + v_max) * 0.5)) else {
-			return;
+			return Ok(());
 		};
 		let Some(second) = chart.map_uv(face, DVec2::new(u_max, (v_min + v_max) * 0.5)) else {
-			return;
+			return Ok(());
 		};
 		((second.x - first.x).powi(2) + (second.y - first.y).powi(2)).sqrt()
 	};
 	let metric_v = {
 		let Some(first) = chart.map_uv(face, DVec2::new((u_min + u_max) * 0.5, v_min)) else {
-			return;
+			return Ok(());
 		};
 		let Some(second) = chart.map_uv(face, DVec2::new((u_min + u_max) * 0.5, v_max)) else {
-			return;
+			return Ok(());
 		};
 		((second.x - first.x).powi(2) + (second.y - first.y).powi(2)).sqrt()
 	};
 	if !metric_u.is_finite() || !metric_v.is_finite() || metric_u <= 1.0e-12 || metric_v <= 1.0e-12 {
-		return;
+		return Ok(());
 	}
 
 	let boundary_u_size = metric_u / u_boundary_intervals as f64;
@@ -2957,16 +3149,18 @@ fn seed_structured_patch(face: &TrimmedFace, chart: FaceChart, insertion_domain:
 			v_intervals = (v_intervals / 2).max(1);
 		}
 	}
+	let mut budget = SeedInsertionBudget::new(MAXIMUM_STRUCTURED_SEED_INSERTIONS, "structured seed");
 	for v_index in 1..v_intervals {
 		let v = v_min + v_range * v_index as f64 / v_intervals as f64;
 		for u_index in 1..u_intervals {
 			let u = u_min + u_range * u_index as f64 / u_intervals as f64;
 			let uv = DVec2::new(u, v);
 			if point_in_trim(uv, &face.loops) {
-				insert_interior_vertex(face, triangulation, uv, chart, insertion_domain);
+				budget.insert(face, triangulation, uv, chart, insertion_domain)?;
 			}
 		}
 	}
+	Ok(())
 }
 
 /// Seeds a face-local inward front that follows the exact trim density.
@@ -2980,7 +3174,8 @@ fn seed_structured_patch(face: &TrimmedFace, chart: FaceChart, insertion_domain:
 /// chart. The samples are unconstrained, so Delaunay still owns connectivity,
 /// while their spacing supplies the boundary-size field that a patch-aware
 /// mesher needs.
-fn seed_boundary_collar(face: &TrimmedFace, chart: FaceChart, insertion_domain: &InsertionDomain, triangulation: &mut FaceTriangulation) {
+fn seed_boundary_collar(face: &TrimmedFace, chart: FaceChart, insertion_domain: &InsertionDomain, triangulation: &mut FaceTriangulation) -> Result<(), Error> {
+	let mut budget = SeedInsertionBudget::new(MAXIMUM_BOUNDARY_COLLAR_INSERTIONS, "boundary collar");
 	for trim_loop in &face.loops {
 		if trim_loop.vertices.len() < 3 {
 			continue;
@@ -3022,10 +3217,11 @@ fn seed_boundary_collar(face: &TrimmedFace, chart: FaceChart, insertion_domain: 
 				let mut inserted = false;
 				for _ in 0..6 {
 					for sign in [1.0, -1.0] {
+						budget.consume()?;
 						let candidate = Point2::new(current.x + direction.x * distance * sign, current.y + direction.y * distance * sign);
 						if let Some(uv) = chart.unmap(face, candidate) {
 							if point_in_trim(uv, &face.loops) {
-								insert_interior_vertex(face, triangulation, uv, chart, insertion_domain);
+								budget.insert_consumed(face, triangulation, uv, chart, insertion_domain)?;
 								inserted = true;
 								break;
 							}
@@ -3042,6 +3238,7 @@ fn seed_boundary_collar(face: &TrimmedFace, chart: FaceChart, insertion_domain: 
 			}
 		}
 	}
+	Ok(())
 }
 
 struct InsertionDomain {
@@ -3176,7 +3373,7 @@ fn seed_best_planar_lattice(face: &TrimmedFace, chart: FaceChart, linear: f64, i
 	let mut best = None::<(PlanarMeshQuality, FaceTriangulation)>;
 	for (pattern_index, pattern) in PATTERNS.into_iter().enumerate() {
 		let mut trial = base.clone();
-		seed_metric_lattice_pattern(face, chart, linear, insertion_domain, pattern, &mut trial);
+		seed_metric_lattice_pattern(face, chart, linear, insertion_domain, pattern, &mut trial)?;
 		let Ok(mesh) = build_face_mesh(face, &trial) else {
 			continue;
 		};
@@ -3211,14 +3408,13 @@ fn seed_best_planar_lattice(face: &TrimmedFace, chart: FaceChart, linear: f64, i
 /// isotropic interior size field up front. Points stay away from the immutable
 /// exact boundary by a fraction of one cell, leaving a single graded collar
 /// for the constrained triangulation to fill.
-fn seed_metric_lattice(face: &TrimmedFace, chart: FaceChart, linear: f64, insertion_domain: &InsertionDomain, triangulation: &mut FaceTriangulation) {
-	seed_metric_lattice_pattern(face, chart, linear, insertion_domain, LatticePattern { angle: 0.0, x_phase: 0.0, y_phase: 0.0 }, triangulation);
+fn seed_metric_lattice(face: &TrimmedFace, chart: FaceChart, linear: f64, insertion_domain: &InsertionDomain, triangulation: &mut FaceTriangulation) -> Result<(), Error> {
+	seed_metric_lattice_pattern(face, chart, linear, insertion_domain, LatticePattern { angle: 0.0, x_phase: 0.0, y_phase: 0.0 }, triangulation)
 }
 
-fn seed_metric_lattice_pattern(face: &TrimmedFace, chart: FaceChart, linear: f64, insertion_domain: &InsertionDomain, pattern: LatticePattern, triangulation: &mut FaceTriangulation) {
-	const MAXIMUM_LATTICE_POINTS: usize = 32_768;
+fn seed_metric_lattice_pattern(face: &TrimmedFace, chart: FaceChart, linear: f64, insertion_domain: &InsertionDomain, pattern: LatticePattern, triangulation: &mut FaceTriangulation) -> Result<(), Error> {
 	let Some(spacing) = insertion_domain.lattice_spacing(linear) else {
-		return;
+		return Ok(());
 	};
 	let center = Point2::new((insertion_domain.minimum.x + insertion_domain.maximum.x) * 0.5, (insertion_domain.minimum.y + insertion_domain.maximum.y) * 0.5);
 	let cosine = pattern.angle.cos();
@@ -3235,9 +3431,10 @@ fn seed_metric_lattice_pattern(face: &TrimmedFace, chart: FaceChart, linear: f64
 	let row_step = spacing * 3.0_f64.sqrt() * 0.5;
 	let columns = (width / spacing).ceil() as usize + 3;
 	let rows = (height / row_step).ceil() as usize + 3;
-	if columns.saturating_mul(rows) > MAXIMUM_LATTICE_POINTS {
-		return;
+	if columns.saturating_mul(rows) > MAXIMUM_LATTICE_INSERTIONS {
+		return Err(resource_limit("tessellation metric lattice exceeded its seed insertion limit"));
 	}
+	let mut budget = SeedInsertionBudget::new(MAXIMUM_LATTICE_INSERTIONS, "metric lattice");
 	let boundary_clearance = spacing * 0.28;
 	for row in 0..rows {
 		let y = minimum.y + (row as f64 - 1.0 + pattern.y_phase) * row_step;
@@ -3250,9 +3447,10 @@ fn seed_metric_lattice_pattern(face: &TrimmedFace, chart: FaceChart, linear: f64
 			if !point_in_trim(uv, &face.loops) || insertion_domain.distance_to_boundary(point) < boundary_clearance {
 				continue;
 			}
-			insert_interior_vertex(face, triangulation, uv, chart, insertion_domain);
+			budget.insert(face, triangulation, uv, chart, insertion_domain)?;
 		}
 	}
+	Ok(())
 }
 
 fn metric_distance_to_loops(point: Point2<f64>, loops: &[Vec<Point2<f64>>]) -> f64 {
@@ -3269,6 +3467,38 @@ fn metric_point_segment_distance(point: Point2<f64>, first: Point2<f64>, second:
 	let fraction = ((offset.x * segment.x + offset.y * segment.y) / length_squared).clamp(0.0, 1.0);
 	let closest = Point2::new(first.x + segment.x * fraction, first.y + segment.y * fraction);
 	metric_distance(point, closest)
+}
+
+struct SeedInsertionBudget {
+	remaining: usize,
+	label: &'static str,
+}
+
+impl SeedInsertionBudget {
+	fn new(limit: usize, label: &'static str) -> Self {
+		Self { remaining: limit, label }
+	}
+
+	fn insert(&mut self, face: &TrimmedFace, triangulation: &mut FaceTriangulation, uv: DVec2, chart: FaceChart, insertion_domain: &InsertionDomain) -> Result<(), Error> {
+		self.consume()?;
+		self.insert_consumed(face, triangulation, uv, chart, insertion_domain)
+	}
+
+	fn consume(&mut self) -> Result<(), Error> {
+		if self.remaining == 0 {
+			return Err(resource_limit(format!("tessellation {} exceeded its insertion limit", self.label)));
+		}
+		self.remaining -= 1;
+		Ok(())
+	}
+
+	fn insert_consumed(&self, face: &TrimmedFace, triangulation: &mut FaceTriangulation, uv: DVec2, chart: FaceChart, insertion_domain: &InsertionDomain) -> Result<(), Error> {
+		if triangulation.num_vertices() >= MAXIMUM_CDT_FACE_VERTICES {
+			return Err(resource_limit("tessellation face exceeded the CDT vertex limit"));
+		}
+		insert_interior_vertex(face, triangulation, uv, chart, insertion_domain);
+		Ok(())
+	}
 }
 
 fn insert_interior_vertex(face: &TrimmedFace, triangulation: &mut FaceTriangulation, uv: DVec2, chart: FaceChart, insertion_domain: &InsertionDomain) {
@@ -3655,24 +3885,13 @@ fn point_in_polygon(point: DVec2, vertices: &[BoundaryVertex]) -> bool {
 }
 
 fn assemble_mesh_data(faces: Vec<MeshedFace>, edges: &[Vec<DVec3>], include_edges: bool) -> Result<ffi::MeshData, Error> {
-	let mut result = ffi::MeshData {
-		vertices: Vec::new(),
-		normals: Vec::new(),
-		indices: Vec::new(),
-		face_tshape_ids: Vec::new(),
-		chunk_face_tshape_ids: Vec::new(),
-		chunk_face_indices: Vec::new(),
-		face_vertex_offsets: vec![0],
-		face_index_offsets: vec![0],
-		edge_points: Vec::new(),
-		chunk_edge_indices: Vec::new(),
-		edge_point_offsets: vec![0],
-		success: false,
-	};
 	let mut seen_face_indices = BTreeSet::new();
-	let mut edge_refinements = BTreeMap::<u32, Vec<DVec3>>::new();
-	for face in faces {
-		if face.vertices.is_empty() || face.vertices.len() != face.normals.len() || !face.indices.len().is_multiple_of(3) || face.indices.iter().any(|index| *index as usize >= face.vertices.len()) || face.vertices.iter().any(|vertex| !vertex.is_finite()) || face.normals.iter().any(|normal| !normal.is_finite()) || !seen_face_indices.insert(face.index) {
+	let mut edge_refinements = BTreeMap::<u32, &[DVec3]>::new();
+	let mut vertex_count = 0usize;
+	let mut index_count = 0usize;
+	let mut triangle_count = 0usize;
+	for face in &faces {
+		if face.vertices.is_empty() || face.vertices.len() != face.uvs.len() || face.vertices.len() != face.normals.len() || face.vertices.len() > MAXIMUM_FACE_VERTICES || !face.indices.len().is_multiple_of(3) || face.indices.iter().any(|index| *index as usize >= face.vertices.len()) || face.vertices.iter().any(|vertex| !vertex.is_finite()) || face.normals.iter().any(|normal| !normal.is_finite()) || !seen_face_indices.insert(face.index) {
 			return Err(Error::TriangulationFailed);
 		}
 		for (edge_index, points) in &face.refined_edges {
@@ -3680,62 +3899,125 @@ fn assemble_mesh_data(faces: Vec<MeshedFace>, edges: &[Vec<DVec3>], include_edge
 				Some(existing) if !point_sequences_match(existing, points) => return Err(Error::TriangulationFailed),
 				Some(_) => {}
 				None => {
-					edge_refinements.insert(*edge_index, points.clone());
+					edge_refinements.insert(*edge_index, points);
 				}
 			}
 		}
-		let triangle_count = face.indices.len() / 3;
-		let vertex_offset = u32::try_from(result.vertices.len() / 3).map_err(|_| Error::TriangulationFailed)?;
-		result.chunk_face_indices.push(face.index);
-		result.chunk_face_tshape_ids.push(face.tshape_id);
-		for vertex in face.vertices {
-			result.vertices.extend(vertex.to_array());
-		}
-		for normal in face.normals {
-			result.normals.extend(normal.to_array());
-		}
-		for index in face.indices {
-			result.indices.push(vertex_offset.checked_add(index).ok_or(Error::TriangulationFailed)?);
-		}
-		result.face_tshape_ids.extend(std::iter::repeat_n(face.tshape_id, triangle_count));
-		result.face_vertex_offsets.push(u32::try_from(result.vertices.len() / 3).map_err(|_| Error::TriangulationFailed)?);
-		result.face_index_offsets.push(u32::try_from(result.indices.len()).map_err(|_| Error::TriangulationFailed)?);
+		vertex_count = checked_add_resource(vertex_count, face.vertices.len(), "tessellation request vertex count overflowed")?;
+		index_count = checked_add_resource(index_count, face.indices.len(), "tessellation request index count overflowed")?;
+		triangle_count = checked_add_resource(triangle_count, face.indices.len() / 3, "tessellation request triangle count overflowed")?;
 	}
+	if vertex_count > MAXIMUM_REQUEST_VERTICES || triangle_count > MAXIMUM_REQUEST_TRIANGLES || index_count > MAXIMUM_REQUEST_INDICES || vertex_count > u32::MAX as usize || index_count > u32::MAX as usize {
+		return Err(resource_limit("tessellation request exceeded aggregate mesh resource limits"));
+	}
+
+	let mut effective_edges = Vec::<(&[DVec3], bool, u32)>::new();
+	let mut edge_point_count = 0usize;
 	if include_edges {
-		let mut effective_edges = edges.to_vec();
-		for (edge_index, mut refinement) in edge_refinements {
-			let edge = effective_edges.get_mut(edge_index as usize).ok_or(Error::TriangulationFailed)?;
-			if edge.len() < 2 || refinement.len() < 2 || edge.iter().any(|point| !point.is_finite()) || refinement.iter().any(|point| !point.is_finite()) {
-				return Err(Error::TriangulationFailed);
-			}
-			let source_first = point_key(edge[0]);
-			let source_last = point_key(*edge.last().ok_or(Error::TriangulationFailed)?);
-			if point_key(refinement[0]) == source_last && point_key(*refinement.last().ok_or(Error::TriangulationFailed)?) == source_first {
-				refinement.reverse();
-			} else if point_key(refinement[0]) != source_first || point_key(*refinement.last().ok_or(Error::TriangulationFailed)?) != source_last {
-				return Err(Error::TriangulationFailed);
-			}
-			if edge.iter().any(|source| !refinement.iter().any(|point| point_key(*point) == point_key(*source))) {
-				return Err(Error::TriangulationFailed);
-			}
-			*edge = refinement;
-		}
-		for (index, edge) in effective_edges.iter().enumerate() {
-			if edge.len() < 2 || edge.iter().any(|point| !point.is_finite()) {
-				return Err(Error::TriangulationFailed);
-			}
-			// Degenerate pole/seam edges are required to close an exact B-rep
-			// chart, but they do not describe a selectable geometric edge and
-			// must not publish repeated zero-length presentation segments.
-			if edge.iter().all(|point| point_key(*point) == point_key(edge[0])) {
+		reserve_exact(&mut effective_edges, edges.len(), "tessellation edge plan allocation failed")?;
+		for (index, edge) in edges.iter().enumerate() {
+			let edge_index = u32::try_from(index).map_err(|_| resource_limit("tessellation edge count exceeded index capacity"))?;
+			let (points, reversed) = if let Some(refinement) = edge_refinements.get(&edge_index).copied() {
+				if edge.len() < 2 || refinement.len() < 2 || edge.iter().any(|point| !point.is_finite()) || refinement.iter().any(|point| !point.is_finite()) {
+					return Err(Error::TriangulationFailed);
+				}
+				let source_first = point_key(edge[0]);
+				let source_last = point_key(*edge.last().ok_or(Error::TriangulationFailed)?);
+				let reversed = if point_key(refinement[0]) == source_last && point_key(*refinement.last().ok_or(Error::TriangulationFailed)?) == source_first {
+					true
+				} else if point_key(refinement[0]) == source_first && point_key(*refinement.last().ok_or(Error::TriangulationFailed)?) == source_last {
+					false
+				} else {
+					return Err(Error::TriangulationFailed);
+				};
+				if edge.iter().any(|source| !refinement.iter().any(|point| point_key(*point) == point_key(*source))) {
+					return Err(Error::TriangulationFailed);
+				}
+				(refinement, reversed)
+			} else {
+				if edge.len() < 2 || edge.iter().any(|point| !point.is_finite()) {
+					return Err(Error::TriangulationFailed);
+				}
+				(edge.as_slice(), false)
+			};
+			if points.iter().all(|point| point_key(*point) == point_key(points[0])) {
 				continue;
 			}
-			result.chunk_edge_indices.push(u32::try_from(index).map_err(|_| Error::TriangulationFailed)?);
-			for point in edge {
+			edge_point_count = checked_add_resource(edge_point_count, points.len(), "tessellation edge-point count overflowed")?;
+			effective_edges.push((points, reversed, edge_index));
+		}
+	}
+
+	let face_count = faces.len();
+	let edge_count = effective_edges.len();
+	let face_offset_count = checked_add_resource(face_count, 1, "tessellation face-offset count overflowed")?;
+	let edge_offset_count = checked_add_resource(edge_count, 1, "tessellation edge-offset count overflowed")?;
+	let vertex_values = checked_mul_resource(vertex_count, 3, "tessellation vertex payload size overflowed")?;
+	let normal_values = checked_mul_resource(vertex_count, 3, "tessellation normal payload size overflowed")?;
+	let edge_point_values = checked_mul_resource(edge_point_count, 3, "tessellation edge payload size overflowed")?;
+	validate_request_payload_bytes(vertex_count, triangle_count, face_count, edge_point_count, edge_count)?;
+	if edge_point_count > u32::MAX as usize {
+		return Err(resource_limit("tessellation request exceeded the output payload limit"));
+	}
+
+	let mut result = ffi::MeshData {
+		vertices: Vec::new(),
+		normals: Vec::new(),
+		indices: Vec::new(),
+		face_tshape_ids: Vec::new(),
+		chunk_face_tshape_ids: Vec::new(),
+		chunk_face_indices: Vec::new(),
+		face_vertex_offsets: Vec::new(),
+		face_index_offsets: Vec::new(),
+		edge_points: Vec::new(),
+		chunk_edge_indices: Vec::new(),
+		edge_point_offsets: Vec::new(),
+		success: false,
+	};
+	reserve_exact(&mut result.vertices, vertex_values, "tessellation vertex payload allocation failed")?;
+	reserve_exact(&mut result.normals, normal_values, "tessellation normal payload allocation failed")?;
+	reserve_exact(&mut result.indices, index_count, "tessellation index payload allocation failed")?;
+	reserve_exact(&mut result.face_tshape_ids, triangle_count, "tessellation face payload allocation failed")?;
+	reserve_exact(&mut result.chunk_face_tshape_ids, face_count, "tessellation face payload allocation failed")?;
+	reserve_exact(&mut result.chunk_face_indices, face_count, "tessellation face payload allocation failed")?;
+	reserve_exact(&mut result.face_vertex_offsets, face_offset_count, "tessellation face-offset allocation failed")?;
+	reserve_exact(&mut result.face_index_offsets, face_offset_count, "tessellation face-offset allocation failed")?;
+	reserve_exact(&mut result.edge_points, edge_point_values, "tessellation edge payload allocation failed")?;
+	reserve_exact(&mut result.chunk_edge_indices, edge_count, "tessellation edge payload allocation failed")?;
+	reserve_exact(&mut result.edge_point_offsets, edge_offset_count, "tessellation edge-offset allocation failed")?;
+	result.face_vertex_offsets.push(0);
+	result.face_index_offsets.push(0);
+	result.edge_point_offsets.push(0);
+
+	for face in &faces {
+		let vertex_offset = u32::try_from(result.vertices.len() / 3).map_err(|_| resource_limit("tessellation vertex count exceeded index capacity"))?;
+		result.chunk_face_indices.push(face.index);
+		result.chunk_face_tshape_ids.push(face.tshape_id);
+		for vertex in &face.vertices {
+			result.vertices.extend(vertex.to_array());
+		}
+		for normal in &face.normals {
+			result.normals.extend(normal.to_array());
+		}
+		for index in &face.indices {
+			result.indices.push(vertex_offset.checked_add(*index).ok_or_else(|| resource_limit("tessellation vertex index overflowed"))?);
+		}
+		result.face_tshape_ids.extend(std::iter::repeat_n(face.tshape_id, face.indices.len() / 3));
+		result.face_vertex_offsets.push(u32::try_from(result.vertices.len() / 3).map_err(|_| resource_limit("tessellation vertex count exceeded index capacity"))?);
+		result.face_index_offsets.push(u32::try_from(result.indices.len()).map_err(|_| resource_limit("tessellation index count exceeded index capacity"))?);
+	}
+	for (points, reversed, edge_index) in effective_edges {
+		result.chunk_edge_indices.push(edge_index);
+		if reversed {
+			for point in points.iter().rev() {
 				result.edge_points.extend(point.to_array());
 			}
-			result.edge_point_offsets.push(u32::try_from(result.edge_points.len() / 3).map_err(|_| Error::TriangulationFailed)?);
+		} else {
+			for point in points {
+				result.edge_points.extend(point.to_array());
+			}
 		}
+		result.edge_point_offsets.push(u32::try_from(result.edge_points.len() / 3).map_err(|_| resource_limit("tessellation edge-point count exceeded index capacity"))?);
 	}
 	result.success = true;
 	Ok(result)
@@ -3777,6 +4059,24 @@ fn valid_boundary_provenance(vertices: &[BoundaryVertex], edges: &[Vec<DVec3>]) 
 		}
 	}
 	true
+}
+
+fn validate_face_trim_resource_limits(face_loop_offsets: &[u32], loop_vertex_offsets: &[u32], face_count: usize) -> Result<(), Error> {
+	for face in 0..face_count {
+		let loop_start = *face_loop_offsets.get(face).ok_or(Error::TriangulationFailed)? as usize;
+		let loop_end = *face_loop_offsets.get(face + 1).ok_or(Error::TriangulationFailed)? as usize;
+		let trim_start = *loop_vertex_offsets.get(loop_start).ok_or(Error::TriangulationFailed)? as usize;
+		let trim_end = *loop_vertex_offsets.get(loop_end).ok_or(Error::TriangulationFailed)? as usize;
+		let face_loop_count = loop_end.checked_sub(loop_start).ok_or(Error::TriangulationFailed)?;
+		let trim_vertex_count = trim_end.checked_sub(trim_start).ok_or(Error::TriangulationFailed)?;
+		if face_loop_count > MAXIMUM_FACE_TRIM_LOOPS {
+			return Err(resource_limit("tessellation face exceeded the trim-loop limit"));
+		}
+		if trim_vertex_count > MAXIMUM_FACE_TRIM_VERTICES {
+			return Err(resource_limit("tessellation face exceeded the trim-vertex limit"));
+		}
+	}
+	Ok(())
 }
 
 fn decode_source(data: ffi::BrepMeshSourceData) -> Result<BrepMeshSource, Error> {
@@ -3825,6 +4125,7 @@ fn decode_source(data: ffi::BrepMeshSourceData) -> Result<BrepMeshSource, Error>
 		}
 		return Err(Error::TriangulationFailed);
 	}
+	validate_face_trim_resource_limits(&data.face_loop_offsets, &data.loop_vertex_offsets, face_count)?;
 	let edge_points = data.edge_points.chunks_exact(3).map(|point| DVec3::new(point[0], point[1], point[2])).collect::<Vec<_>>();
 	if edge_points.iter().any(|point| !point.is_finite()) {
 		return Err(Error::TriangulationFailed);
@@ -3969,6 +4270,66 @@ pub(super) fn boundary_occurrence_metadata_overflow_is_rejected() -> bool {
 	let mut vertex = ParametricVertex { uv: DVec2::ZERO, metric: Point2::new(0.0, 0.0), boundary_position: None, boundary_occurrences: [None, None] };
 	let occurrence = |loop_index| BoundaryOccurrence { loop_index, edge_index: 7, occurrence_index: loop_index };
 	vertex.add_boundary_occurrence(occurrence(0)).is_ok() && vertex.add_boundary_occurrence(occurrence(0)).is_ok() && vertex.add_boundary_occurrence(occurrence(1)).is_ok() && vertex.add_boundary_occurrence(occurrence(2)).is_err()
+}
+
+#[cfg(feature = "test-support")]
+pub(super) fn synthetic_trim_resource_limit_errors() -> Result<(Error, Error), Error> {
+	validate_face_trim_resource_limits(&[0, 1], &[0, MAXIMUM_FACE_TRIM_VERTICES as u32], 1)?;
+	let trim_vertex_error = validate_face_trim_resource_limits(&[0, 1], &[0, MAXIMUM_FACE_TRIM_VERTICES as u32 + 1], 1).expect_err("one trim vertex over the quota must fail");
+
+	let loop_offsets_at_limit = vec![0; MAXIMUM_FACE_TRIM_LOOPS + 1];
+	validate_face_trim_resource_limits(&[0, MAXIMUM_FACE_TRIM_LOOPS as u32], &loop_offsets_at_limit, 1)?;
+	let loop_offsets_over_limit = vec![0; MAXIMUM_FACE_TRIM_LOOPS + 2];
+	let trim_loop_error = validate_face_trim_resource_limits(&[0, MAXIMUM_FACE_TRIM_LOOPS as u32 + 1], &loop_offsets_over_limit, 1).expect_err("one trim loop over the quota must fail");
+	Ok((trim_vertex_error, trim_loop_error))
+}
+
+#[cfg(all(feature = "test-support", not(target_arch = "wasm32")))]
+pub(super) fn synthetic_aggregate_resource_limit_error(parallel: bool) -> Result<Error, Error> {
+	use rayon::prelude::*;
+
+	const FACE_COUNT_AT_LIMIT: usize = 64;
+	let face_vertices = MAXIMUM_REQUEST_VERTICES / FACE_COUNT_AT_LIMIT;
+	let face_triangles = MAXIMUM_REQUEST_TRIANGLES / FACE_COUNT_AT_LIMIT;
+	let face_indices = MAXIMUM_REQUEST_INDICES / FACE_COUNT_AT_LIMIT;
+	let face_payload = checked_add_resource(checked_mul_resource(face_vertices, 48, "synthetic payload overflowed")?, checked_mul_resource(face_triangles, 20, "synthetic payload overflowed")?, "synthetic payload overflowed")?;
+	let budget = RequestMeshBudget::default();
+	let admit = |_| budget.admit_counts(face_vertices, face_triangles, face_indices, face_payload);
+	let result = if parallel { bounded_face_pool()?.install(|| (0..=FACE_COUNT_AT_LIMIT).into_par_iter().try_for_each(admit)) } else { (0..=FACE_COUNT_AT_LIMIT).try_for_each(admit) };
+	Ok(result.expect_err("one synthetic face over the aggregate quota must fail"))
+}
+
+#[cfg(all(feature = "test-support", not(target_arch = "wasm32")))]
+pub(super) fn synthetic_resource_accounting_totals(worker_count: usize) -> Result<[usize; 4], Error> {
+	use rayon::prelude::*;
+
+	const FACE_COUNT: usize = 64;
+	let face_vertices = MAXIMUM_REQUEST_VERTICES / FACE_COUNT;
+	let face_triangles = MAXIMUM_REQUEST_TRIANGLES / FACE_COUNT;
+	let face_indices = MAXIMUM_REQUEST_INDICES / FACE_COUNT;
+	let face_payload = checked_add_resource(checked_mul_resource(face_vertices, 48, "synthetic payload overflowed")?, checked_mul_resource(face_triangles, 20, "synthetic payload overflowed")?, "synthetic payload overflowed")?;
+	let budget = RequestMeshBudget::default();
+	let pool = rayon::ThreadPoolBuilder::new().num_threads(worker_count).build().map_err(|_| resource_limit("synthetic accounting worker pool failed"))?;
+	pool.install(|| (0..FACE_COUNT).into_par_iter().try_for_each(|_| budget.admit_counts(face_vertices, face_triangles, face_indices, face_payload)))?;
+	let totals = budget.snapshot()?;
+	Ok([totals.vertices, totals.triangles, totals.indices, totals.payload_bytes])
+}
+
+#[cfg(feature = "test-support")]
+pub(super) fn synthetic_transition_ring_resource_limit_error() -> Result<Error, Error> {
+	let transition_vertices = transition_stage_vertex_count(MAXIMUM_FACE_TRIM_VERTICES, MAXIMUM_FACE_TRIM_VERTICES, 64)?;
+	if transition_vertices <= MAXIMUM_FACE_VERTICES {
+		return Err(Error::TriangulationFailed);
+	}
+	Ok(resource_limit("tessellation inset structured transition rings exceeded the vertex limit"))
+}
+
+#[cfg(feature = "test-support")]
+pub(super) fn synthetic_payload_resource_limit_error() -> Result<Error, Error> {
+	let fixed_bytes = validate_request_payload_bytes(0, 0, 0, 0, 0)?;
+	let edge_points_at_limit = (MAXIMUM_REQUEST_PAYLOAD_BYTES - fixed_bytes) / 24;
+	validate_request_payload_bytes(0, 0, 0, edge_points_at_limit, 0)?;
+	Ok(validate_request_payload_bytes(0, 0, 0, edge_points_at_limit + 1, 0).expect_err("one edge point over the payload quota must fail"))
 }
 
 #[cfg(feature = "test-support")]

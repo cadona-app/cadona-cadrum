@@ -56,6 +56,33 @@ pub fn tessellation_rejects_boundary_metadata_overflow() -> bool {
 	tessellation::boundary_occurrence_metadata_overflow_is_rejected()
 }
 
+/// Exercise the exact per-face trim limits without allocating trim payloads.
+pub fn tessellation_synthetic_trim_resource_limit_errors() -> Result<(Error, Error), Error> {
+	tessellation::synthetic_trim_resource_limit_errors()
+}
+
+/// Exercise request-wide resource accounting in serial or bounded parallel mode.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn tessellation_synthetic_aggregate_resource_limit_error(parallel: bool) -> Result<Error, Error> {
+	tessellation::synthetic_aggregate_resource_limit_error(parallel)
+}
+
+/// Return count-only request totals accumulated with the requested worker count.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn tessellation_synthetic_resource_accounting_totals(worker_count: usize) -> Result<[usize; 4], Error> {
+	tessellation::synthetic_resource_accounting_totals(worker_count)
+}
+
+/// Exercise the complete 64-ring structured-patch vertex preplan.
+pub fn tessellation_synthetic_transition_ring_resource_limit_error() -> Result<Error, Error> {
+	tessellation::synthetic_transition_ring_resource_limit_error()
+}
+
+/// Exercise the exact output-payload byte quota without allocating payloads.
+pub fn tessellation_synthetic_payload_resource_limit_error() -> Result<Error, Error> {
+	tessellation::synthetic_payload_resource_limit_error()
+}
+
 /// Confirm that the production snapshot decoder rejects malformed parallel
 /// arrays, invalid rational-surface values, broken boundary references, and
 /// duplicate face identities before constructing a tessellator domain value.
