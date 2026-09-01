@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::f64::consts::TAU;
 
-use cadrum::{BSplineEnd, DVec3, Edge, MeshChunks, ProfileOrient, Solid, Tessellation, TopologySnapshot};
+use cadrum::{BSplineEnd, DVec3, Edge, MeshChunks, ProfileOrient, Solid, Tessellation, TopologyQueryOptions, TopologySnapshot};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct ExactPoint([u64; 3]);
@@ -209,7 +209,7 @@ fn assert_exact_interior_error(name: &str, solid: &Solid, chunks: &MeshChunks, m
 fn mesh_and_topology(name: &str, solid: &Solid, options: Tessellation) -> (MeshChunks, TopologySnapshot) {
 	let validation = solid.validate().unwrap_or_else(|error| panic!("{name}: validate exact fixture: {error:?}"));
 	assert!(validation.valid, "{name}: adversarial fixture is not a valid exact solid: {validation:?}");
-	let topology = solid.topology_snapshot().unwrap_or_else(|error| panic!("{name}: snapshot exact topology: {error:?}"));
+	let topology = solid.topology_snapshot_with_options(TopologyQueryOptions::SEMANTIC_IDENTITY).unwrap_or_else(|error| panic!("{name}: snapshot exact topology: {error:?}"));
 	let chunks = Solid::mesh_chunks([solid], options).unwrap_or_else(|error| panic!("{name}: tessellate valid exact fixture: {error:?}"));
 	(chunks, topology)
 }
@@ -262,7 +262,7 @@ fn periodic_cylinder_trim_crossing_seam_preserves_exact_occurrence_multiplicity(
 	let trimmed: Solid = (&cylinder - &notch).build().expect("cut a seam-crossing cylindrical notch");
 	let validation = trimmed.validate().expect("validate seam-crossing cylinder trim");
 	assert!(validation.valid, "seam-crossing cylinder trim is not an exact-valid fixture: {validation:?}");
-	let topology = trimmed.topology_snapshot().expect("snapshot seam-crossing cylinder topology");
+	let topology = trimmed.topology_snapshot_with_options(TopologyQueryOptions::SEMANTIC_IDENTITY).expect("snapshot seam-crossing cylinder topology");
 	let seam_edges = topology.edge_ids().iter().enumerate().filter(|(edge, _)| topology.edge_facts(*edge as u32).is_some_and(|facts| facts.seam)).map(|(edge, _)| edge).collect::<Vec<_>>();
 	assert!(!seam_edges.is_empty(), "fixture did not retain a periodic seam");
 	eprintln!("seam-crossing cylinder trim: exact-valid fixture contains periodic seam edges {seam_edges:?}");
