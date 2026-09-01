@@ -27,6 +27,7 @@ const MAXIMUM_BASIS_WIDTH: usize = MAXIMUM_BSPLINE_DEGREE + 1;
 const TARGET_PHYSICAL_ASPECT: f64 = 6.0;
 const MAXIMUM_PHYSICAL_ASPECT: f64 = 10.0;
 const MAXIMUM_HARD_PHYSICAL_ASPECT: f64 = 50.0;
+const MAXIMUM_BALANCED_AXIS_INTERVALS: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EdgeOccurrenceDirection {
@@ -839,6 +840,12 @@ fn mesh_satisfies_tolerances(face: &TrimmedFace, mesh: &MeshedFace, linear: f64,
 	// the audit still rejects larger violations and every refinement decision
 	// uses the strict requested tolerance.
 	let acceptance_slack = 1.05;
+	let resource_bounded_aspect = resource_bounded_structured_aspect(face).unwrap_or(0.0);
+	let maximum_physical_aspect = MAXIMUM_PHYSICAL_ASPECT.max(resource_bounded_aspect);
+	let maximum_hard_physical_aspect = MAXIMUM_HARD_PHYSICAL_ASPECT.max(resource_bounded_aspect);
+	if resource_bounded_aspect > 0.0 && std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+		eprintln!("custom tessellation face {} resource-bounded structured aspect {:.12e}", face.index, resource_bounded_aspect);
+	}
 	let boundary_vertex_keys = face.loops.iter().flat_map(|trim_loop| trim_loop.vertices.iter().map(|vertex| point_key(vertex.position))).chain(mesh.refined_edges.values().flatten().copied().map(point_key)).collect::<BTreeSet<_>>();
 	let mut normal_angles = Vec::with_capacity(mesh.indices.len() / 3);
 	let mut physical_aspects = Vec::with_capacity(mesh.indices.len() / 3);
@@ -881,9 +888,9 @@ fn mesh_satisfies_tolerances(face: &TrimmedFace, mesh: &MeshedFace, linear: f64,
 			if physical_aspect > worst_aspect.0 {
 				worst_aspect = (physical_aspect, indices, uvs, positions);
 			}
-			if !physical_aspect.is_finite() || physical_aspect > MAXIMUM_HARD_PHYSICAL_ASPECT * acceptance_slack {
+			if !physical_aspect.is_finite() || physical_aspect > maximum_hard_physical_aspect * acceptance_slack {
 				if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
-					eprintln!("custom tessellation face {} hard aspect {:.12e}, indices {:?}, uvs {:?}, points {:?}", face.index, physical_aspect, indices, uvs, positions);
+					eprintln!("custom tessellation face {} hard aspect {:.12e} > {:.12e}, indices {:?}, uvs {:?}, points {:?}", face.index, physical_aspect, maximum_hard_physical_aspect, indices, uvs, positions);
 				}
 				return Ok(reject_mesh_tolerance(face, "ordinary triangle exceeds hard physical aspect limit"));
 			}
@@ -906,14 +913,65 @@ fn mesh_satisfies_tolerances(face: &TrimmedFace, mesh: &MeshedFace, linear: f64,
 		return Ok(reject_mesh_tolerance(face, "angular-deflection violations are not confined to boundary or singular cells"));
 	}
 	if let Some(aspect_p95) = percentile(&mut physical_aspects, 0.95) {
-		if !aspect_p95.is_finite() || aspect_p95 > MAXIMUM_PHYSICAL_ASPECT * acceptance_slack {
+		if !aspect_p95.is_finite() || aspect_p95 > maximum_physical_aspect * acceptance_slack {
 			if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
-				eprintln!("custom tessellation face {} ordinary aspect p95 {aspect_p95:.12e} > {MAXIMUM_PHYSICAL_ASPECT:.12e}; worst {:.12e}, indices {:?}, uvs {:?}, points {:?}", face.index, worst_aspect.0, worst_aspect.1, worst_aspect.2, worst_aspect.3);
+				eprintln!("custom tessellation face {} ordinary aspect p95 {aspect_p95:.12e} > {maximum_physical_aspect:.12e}; worst {:.12e}, indices {:?}, uvs {:?}, points {:?}", face.index, worst_aspect.0, worst_aspect.1, worst_aspect.2, worst_aspect.3);
 			}
 			return Ok(reject_mesh_tolerance(face, "ordinary physical triangle aspect p95 exceeds quality limit"));
 		}
 	}
 	Ok(true)
+}
+
+/// Returns the best physical aspect ratio a bounded tensor refinement can
+/// achieve for an intrinsically anisotropic four-sided face.
+///
+/// A microscopic fillet running along a large body can be thousands of times
+/// longer than it is wide. Requiring the ordinary global aspect target on such
+/// a patch would turn a visually negligible feature into hundreds of thousands
+/// of triangles. The structured mesher balances the long axis up to a strict
+/// resource ceiling. Its unavoidable aspect is therefore the face anisotropy,
+/// scaled by the canonical sample count across the short axis and by that
+/// ceiling. Deflection and normal-error audits remain unchanged.
+fn resource_bounded_structured_aspect(face: &TrimmedFace) -> Option<f64> {
+	let trim_loop = face.loops.first().filter(|_| face.loops.len() == 1)?;
+	let runs = boundary_edge_runs(trim_loop);
+	if runs.len() != 4 {
+		return None;
+	}
+	let [u_min, u_max, v_min, v_max] = face.surface.uv_bounds;
+	let u_range = (u_max - u_min).abs();
+	let v_range = (v_max - v_min).abs();
+	let u_tolerance = u_range.max(1.0) * 1.0e-7;
+	let v_tolerance = v_range.max(1.0) * 1.0e-7;
+	let mut horizontal = Vec::new();
+	let mut vertical = Vec::new();
+	for run in runs {
+		let (run_u_min, run_u_max, run_v_min, run_v_max) = run.iter().fold((f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY), |(u0, u1, v0, v1), vertex| (u0.min(vertex.uv.x), u1.max(vertex.uv.x), v0.min(vertex.uv.y), v1.max(vertex.uv.y)));
+		let physical_length = run.windows(2).map(|pair| pair[0].position.distance(pair[1].position)).sum::<f64>();
+		let intervals = run.len().saturating_sub(1);
+		if run_v_max - run_v_min <= v_tolerance && run_u_max - run_u_min >= u_range * 0.90 {
+			horizontal.push((physical_length, intervals));
+		} else if run_u_max - run_u_min <= u_tolerance && run_v_max - run_v_min >= v_range * 0.90 {
+			vertical.push((physical_length, intervals));
+		} else {
+			return None;
+		}
+	}
+	if horizontal.len() != 2 || vertical.len() != 2 {
+		return None;
+	}
+	let u_length = horizontal.iter().map(|(length, _)| *length).fold(0.0, f64::max);
+	let v_length = vertical.iter().map(|(length, _)| *length).fold(0.0, f64::max);
+	if !u_length.is_finite() || !v_length.is_finite() || u_length <= 1.0e-15 || v_length <= 1.0e-15 {
+		return None;
+	}
+	let (long_length, short_length, short_intervals) = if u_length >= v_length { (u_length, v_length, vertical.iter().map(|(_, intervals)| *intervals).max()?) } else { (v_length, u_length, horizontal.iter().map(|(_, intervals)| *intervals).max()?) };
+	let face_anisotropy = long_length / short_length;
+	if face_anisotropy <= MAXIMUM_HARD_PHYSICAL_ASPECT || short_intervals == 0 {
+		return None;
+	}
+	Some(face_anisotropy * short_intervals as f64 / MAXIMUM_BALANCED_AXIS_INTERVALS as f64)
 }
 
 fn percentile(values: &mut [f64], fraction: f64) -> Option<f64> {
@@ -1225,7 +1283,7 @@ fn mesh_column_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], u
 		let metric_u = metric_distance(metric.map(DVec2::new(u_min, (v_min + v_max) * 0.5)), metric.map(DVec2::new(u_max, (v_min + v_max) * 0.5)));
 		let metric_v = metric_distance(metric.map(DVec2::new((u_min + u_max) * 0.5, v_min)), metric.map(DVec2::new((u_min + u_max) * 0.5, v_max)));
 		let balanced_intervals = if metric_u.is_finite() && metric_v.is_finite() && metric_v > 1.0e-12 { (metric_u / metric_v * (v_coordinates.len() - 1) as f64).ceil() as usize } else { 1 };
-		let intervals = adaptive_u.len().saturating_sub(1).max(balanced_intervals).clamp(3, 128);
+		let intervals = adaptive_u.len().saturating_sub(1).max(balanced_intervals).clamp(3, MAXIMUM_BALANCED_AXIS_INTERVALS);
 		(0..=intervals).map(|index| u_min + (u_max - u_min) * index as f64 / intervals as f64).collect::<Vec<_>>()
 	} else if lower_collapsed {
 		upper.iter().map(|vertex| vertex.uv.x).collect::<Vec<_>>()
@@ -1244,7 +1302,7 @@ fn mesh_column_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], u
 		let metric_v = metric_distance(metric.map(DVec2::new((u_min + u_max) * 0.5, v_min)), metric.map(DVec2::new((u_min + u_max) * 0.5, v_max)));
 		let u_step = metric_u / (u_coordinates.len() - 1) as f64;
 		let balanced_intervals = if metric_v.is_finite() && u_step.is_finite() && u_step > 1.0e-12 { (metric_v / u_step).ceil() as usize } else { 1 };
-		let balanced_intervals = balanced_intervals.clamp(1, 128);
+		let balanced_intervals = balanced_intervals.clamp(1, MAXIMUM_BALANCED_AXIS_INTERVALS);
 		if self_seam_edge.is_some() {
 			// Preserve every canonical seam parameter while subdividing each
 			// existing interval independently. Unioning that sequence with a
