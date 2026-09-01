@@ -141,6 +141,7 @@
 #include <initializer_list>
 #include <limits>
 #include <new>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 #include <array>
@@ -3558,6 +3559,10 @@ BrepMeshSourceData extract_brep_mesh_source(
         return result;
     } catch (const std::bad_alloc&) {
         record_resource_failure(__func__, "native extraction allocation failed");
+        return result;
+    } catch (const std::length_error&) {
+        record_resource_failure(
+            __func__, "native extraction container limit exceeded");
         return result;
     } catch (const Standard_Failure& failure) {
         record_standard_failure(__func__, "extract", 7, failure);

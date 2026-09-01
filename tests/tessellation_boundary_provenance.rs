@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use cadrum::{
-	occt::test_support::{tessellation_boundary_runs, tessellation_rejects_boundary_metadata_overflow, tessellation_rejects_invalid_boundary_direction, BoundaryDirection, BoundaryRun},
+	occt::test_support::{tessellation_boundary_runs, tessellation_rejects_boundary_metadata_overflow, tessellation_rejects_corrupted_source_contracts, tessellation_rejects_invalid_boundary_direction, BoundaryDirection, BoundaryRun},
 	DVec3, Edge, ProfileOrient, Solid, Tessellation, TopologyQueryOptions,
 };
 
@@ -31,6 +31,12 @@ fn decoder_rejects_invalid_occurrence_direction_metadata() {
 #[test]
 fn boundary_occurrence_metadata_overflow_is_rejected_explicitly() {
 	assert!(tessellation_rejects_boundary_metadata_overflow());
+}
+
+#[test]
+fn decoder_rejects_corrupted_parallel_arrays_and_cross_references() {
+	let cube = Solid::cube(DVec3::ZERO, DVec3::splat(10.0));
+	assert!(tessellation_rejects_corrupted_source_contracts(&cube, options()).expect("exercise corrupted exact-snapshot contracts"));
 }
 
 #[test]

@@ -56,6 +56,36 @@ pub fn tessellation_rejects_boundary_metadata_overflow() -> bool {
 	tessellation::boundary_occurrence_metadata_overflow_is_rejected()
 }
 
+/// Confirm that the production snapshot decoder rejects malformed parallel
+/// arrays, invalid rational-surface values, broken boundary references, and
+/// duplicate face identities before constructing a tessellator domain value.
+pub fn tessellation_rejects_corrupted_source_contracts(solid: &Solid, options: Tessellation) -> Result<bool, Error> {
+	let mut malformed_offsets = extract_tessellation_source(solid, options)?;
+	malformed_offsets.face_pole_offsets.pop();
+	let malformed_offsets_rejected = tessellation::decode_boundary_run_provenance(malformed_offsets).is_err();
+
+	let mut non_finite_weight = extract_tessellation_source(solid, options)?;
+	*non_finite_weight.weights.first_mut().ok_or(Error::TriangulationFailed)? = f64::NAN;
+	let non_finite_weight_rejected = tessellation::decode_boundary_run_provenance(non_finite_weight).is_err();
+
+	let mut invalid_boundary_reference = extract_tessellation_source(solid, options)?;
+	*invalid_boundary_reference.loop_edge_sample_indices.first_mut().ok_or(Error::TriangulationFailed)? = u32::MAX;
+	let invalid_boundary_reference_rejected = tessellation::decode_boundary_run_provenance(invalid_boundary_reference).is_err();
+
+	let mut excessive_approximation = extract_tessellation_source(solid, options)?;
+	*excessive_approximation.face_approximation_errors.first_mut().ok_or(Error::TriangulationFailed)? = excessive_approximation.linear_deflection * 2.0;
+	let excessive_approximation_rejected = tessellation::decode_boundary_run_provenance(excessive_approximation).is_err();
+
+	let mut duplicate_face = extract_tessellation_source(solid, options)?;
+	if duplicate_face.face_indices.len() < 2 {
+		return Err(Error::TriangulationFailed);
+	}
+	duplicate_face.face_indices[1] = duplicate_face.face_indices[0];
+	let duplicate_face_rejected = tessellation::decode_boundary_run_provenance(duplicate_face).is_err();
+
+	Ok(malformed_offsets_rejected && non_finite_weight_rejected && invalid_boundary_reference_rejected && excessive_approximation_rejected && duplicate_face_rejected)
+}
+
 fn extract_tessellation_source(solid: &Solid, options: Tessellation) -> Result<ffi::BrepMeshSourceData, Error> {
 	if !options.deflection_linear.is_finite() || options.deflection_linear <= 0.0 {
 		return Err(Error::InvalidInput("tessellation linear deflection must be finite and greater than zero".into()));
