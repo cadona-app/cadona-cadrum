@@ -409,8 +409,8 @@ fn push_accessor_index(views: &mut Vec<String>, accs: &mut Vec<String>, bin: &mu
 /// Per-triangle face normal from the cross product of its two edges.
 /// Not normalized — callers that need a unit vector should normalize.
 /// Sign convention matches the STL writer at `Mesh::write_stl`: outward-
-/// pointing for face-orientation-consistent winding (which OCCT meshing
-/// produces).
+/// pointing for face-orientation-consistent winding (which the B-rep
+/// tessellator produces).
 fn tri_normal(mesh: &Mesh, ti: usize) -> DVec3 {
 	let i0 = mesh.indices[ti * 3];
 	let i1 = mesh.indices[ti * 3 + 1];

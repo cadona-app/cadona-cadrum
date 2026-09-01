@@ -877,8 +877,8 @@ impl Solid {
 	}
 
 	/// Return ordered topological edge polylines from a detached whole-shape
-	/// triangulation. Surface chunks are discarded, but the native meshing pass
-	/// is required so every edge uses its face triangulation's exact nodes.
+	/// snapshot. Surface chunks are discarded, but canonical edge samples still
+	/// anchor every incident face in the Rust-owned tessellation.
 	pub fn edge_polyline_chunks(&self, options: crate::traits::Tessellation) -> Result<Vec<crate::common::mesh::EdgePolylineChunk>, Error> {
 		super::io::edge_polyline_chunks(self, options)
 	}

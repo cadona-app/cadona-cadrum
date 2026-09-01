@@ -724,7 +724,9 @@ std::unique_ptr<TopoDS_Shape> project_shape_to_plane(const TopoDS_Shape& shape,
         // infinite parameters ("BRep_Builder::Infinite parameter"), so bound
         // the face generously around the shape's own extent.
         Bnd_Box bounds;
-        BRepBndLib::Add(shape, bounds);
+        // Exact B-rep geometry is authoritative. Do not let a stale imported
+        // Poly_Triangulation influence the projection tool's working extent.
+        BRepBndLib::Add(shape, bounds, false);
         if (bounds.IsVoid()) return nullptr;
         gp_Pnt bounds_min = bounds.CornerMin();
         gp_Pnt bounds_max = bounds.CornerMax();
@@ -1693,7 +1695,9 @@ void shape_bounding_box(const TopoDS_Shape& shape,
     double& xmax, double& ymax, double& zmax)
 {
     Bnd_Box box;
-    BRepBndLib::Add(shape, box);
+    // Bounds are exact topology facts, not presentation-cache facts. Imported
+    // B-reps may carry a stale Poly_Triangulation, so explicitly ignore it.
+    BRepBndLib::Add(shape, box, false);
     box.Get(xmin, ymin, zmin, xmax, ymax, zmax);
 }
 
@@ -4061,7 +4065,9 @@ rust::Vec<double> edge_approximation_segments(
         double eff_chord = linear;
         if (relative) {
             Bnd_Box box;
-            BRepBndLib::Add(edge, box);
+            // A stored polygon or face triangulation must not change the
+            // scale used to approximate this exact curve.
+            BRepBndLib::Add(edge, box, false);
             if (!box.IsVoid()) {
                 double xmin, ymin, zmin, xmax, ymax, zmax;
                 box.Get(xmin, ymin, zmin, xmax, ymax, zmax);
