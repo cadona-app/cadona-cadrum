@@ -99,10 +99,15 @@
 #include <GeomAbs_JoinType.hxx>
 
 // --- Mesh, classification, mass / surface properties ---
+#include <BRepLib_ToolTriangulatedShape.hxx>
+#include <BRepMesh_IncrementalMesh.hxx>
 #include <BRepBndLib.hxx>
 #include <Bnd_Box.hxx>
 #include <BRepGProp.hxx>
 #include <GProp_GProps.hxx>
+#include <IMeshTools_Parameters.hxx>
+#include <Poly_PolygonOnTriangulation.hxx>
+#include <Poly_Triangulation.hxx>
 
 // --- Curve adaptation / approximation ---
 #include <BRepAdaptor_Curve.hxx>
@@ -1831,7 +1836,8 @@ static bool map_unique_brep_subshapes_bounded(
     size_t maximum,
     const char* quota_message,
     const CancellationToken& progress,
-    BrepShapeMap& shapes)
+    BrepShapeMap& shapes,
+    const char* operation = "extract_brep_mesh_source")
 {
     for (TopExp_Explorer explorer(shape, shape_kind);
          explorer.More(); explorer.Next()) {
@@ -1839,8 +1845,7 @@ static bool map_unique_brep_subshapes_bounded(
         const TopoDS_Shape& current = explorer.Current();
         if (shapes.Contains(current)) continue;
         if (static_cast<size_t>(shapes.Extent()) >= maximum) {
-            record_resource_failure(
-                "extract_brep_mesh_source", quota_message);
+            record_resource_failure(operation, quota_message);
             return false;
         }
         shapes.Add(current);
@@ -1849,7 +1854,8 @@ static bool map_unique_brep_subshapes_bounded(
 }
 
 static Handle(Geom_Surface) unwrapped_brep_surface(
-    Handle(Geom_Surface) surface)
+    Handle(Geom_Surface) surface,
+    const char* operation = "extract_brep_mesh_source")
 {
     constexpr int maximum_wrapper_depth = 16;
     for (int depth = 0; depth < maximum_wrapper_depth; ++depth) {
@@ -1861,8 +1867,7 @@ static Handle(Geom_Surface) unwrapped_brep_surface(
     }
     if (!Handle(Geom_RectangularTrimmedSurface)::DownCast(surface).IsNull()) {
         record_resource_failure(
-            "extract_brep_mesh_source",
-            "surface wrapper-depth quota exceeded");
+            operation, "surface wrapper-depth quota exceeded");
         return Handle(Geom_Surface)();
     }
     return surface;
@@ -1872,7 +1877,8 @@ static bool preflight_brep_copy_surface_storage(
     const BrepShapeMap& faces,
     size_t maximum_control_points,
     size_t maximum_knots,
-    const CancellationToken& progress)
+    const CancellationToken& progress,
+    const char* operation = "extract_brep_mesh_source")
 {
     size_t control_points = 0;
     size_t knots = 0;
@@ -1882,7 +1888,7 @@ static bool preflight_brep_copy_surface_storage(
     for (int index = 1; index <= faces.Extent(); ++index) {
         if (rust_progress_cancelled(progress)) return false;
         Handle(Geom_Surface) surface = unwrapped_brep_surface(
-            BRep_Tool::Surface(TopoDS::Face(faces(index))));
+            BRep_Tool::Surface(TopoDS::Face(faces(index))), operation);
         if (surface.IsNull()) return false;
         Handle(Geom_BSplineSurface) spline =
             Handle(Geom_BSplineSurface)::DownCast(surface);
@@ -1913,20 +1919,17 @@ static bool preflight_brep_copy_surface_storage(
                 next_control_points)
             || !checked_size_add(knots, surface_knots, next_knots)) {
             record_resource_failure(
-                "extract_brep_mesh_source",
-                "surface-copy storage size arithmetic overflow");
+                operation, "surface-copy storage size arithmetic overflow");
             return false;
         }
         if (next_control_points > maximum_control_points) {
             record_resource_failure(
-                "extract_brep_mesh_source",
-                "surface-copy control-point quota exceeded");
+                operation, "surface-copy control-point quota exceeded");
             return false;
         }
         if (next_knots > maximum_knots) {
             record_resource_failure(
-                "extract_brep_mesh_source",
-                "surface-copy knot quota exceeded");
+                operation, "surface-copy knot quota exceeded");
             return false;
         }
         control_points = next_control_points;
@@ -3691,6 +3694,555 @@ BrepMeshSourceData extract_brep_mesh_source(
         return result;
     } catch (...) {
         record_input_failure(__func__, "B-rep source extraction failed");
+        return result;
+    }
+    return result;
+}
+
+constexpr size_t maximum_raw_occt_vertices = 4'194'304;
+constexpr size_t maximum_raw_occt_triangles = 8'388'608;
+constexpr size_t maximum_raw_occt_edge_points = 4'194'304;
+
+struct RawOcctMeshBudget {
+    size_t vertices = 0;
+    size_t triangles = 0;
+    size_t edge_points = 0;
+    // The face-vertex, face-index, and edge-point offset arrays start at zero.
+    size_t serialized_bytes = 3 * sizeof(uint32_t);
+
+    bool claim(
+        size_t& counter,
+        size_t amount,
+        size_t maximum,
+        const char* message)
+    {
+        size_t next = 0;
+        if (!checked_size_add(counter, amount, next) || next > maximum) {
+            record_resource_failure("mesh_shape_raw_occt", message);
+            return false;
+        }
+        counter = next;
+        return true;
+    }
+
+    template <typename Value>
+    bool reserve_append(
+        rust::Vec<Value>& output,
+        size_t amount,
+        const char* message)
+    {
+        size_t bytes = 0;
+        size_t next_size = 0;
+        size_t next_bytes = 0;
+        if (!checked_size_multiply(amount, sizeof(Value), bytes)
+            || !checked_size_add(output.size(), amount, next_size)
+            || !checked_size_add(serialized_bytes, bytes, next_bytes)) {
+            record_resource_failure(
+                "mesh_shape_raw_occt",
+                "raw OCCT mesh output size arithmetic overflow");
+            return false;
+        }
+        if (next_bytes > maximum_brep_serialized_bytes) {
+            record_resource_failure("mesh_shape_raw_occt", message);
+            return false;
+        }
+        serialized_bytes = next_bytes;
+        if (output.capacity() < next_size) output.reserve(next_size);
+        return true;
+    }
+
+    bool reserve_face(
+        MeshData& result,
+        size_t node_count,
+        size_t triangle_count)
+    {
+        size_t coordinate_count = 0;
+        size_t index_count = 0;
+        if (!checked_size_multiply(node_count, 3, coordinate_count)
+            || !checked_size_multiply(triangle_count, 3, index_count)) {
+            record_resource_failure(
+                "mesh_shape_raw_occt",
+                "raw OCCT face output size arithmetic overflow");
+            return false;
+        }
+        return claim(
+                   vertices,
+                   node_count,
+                   maximum_raw_occt_vertices,
+                   "raw OCCT vertex quota exceeded")
+            && claim(
+                triangles,
+                triangle_count,
+                maximum_raw_occt_triangles,
+                "raw OCCT triangle quota exceeded")
+            && reserve_append(
+                result.vertices,
+                coordinate_count,
+                "raw OCCT serialized vertex byte quota exceeded")
+            && reserve_append(
+                result.normals,
+                coordinate_count,
+                "raw OCCT serialized normal byte quota exceeded")
+            && reserve_append(
+                result.indices,
+                index_count,
+                "raw OCCT serialized index byte quota exceeded")
+            && reserve_append(
+                result.face_tshape_ids,
+                triangle_count,
+                "raw OCCT serialized face-identity byte quota exceeded")
+            && reserve_append(
+                result.chunk_face_tshape_ids,
+                1,
+                "raw OCCT serialized face-chunk byte quota exceeded")
+            && reserve_append(
+                result.chunk_face_indices,
+                1,
+                "raw OCCT serialized face-index byte quota exceeded")
+            && reserve_append(
+                result.face_vertex_offsets,
+                1,
+                "raw OCCT serialized face-offset byte quota exceeded")
+            && reserve_append(
+                result.face_index_offsets,
+                1,
+                "raw OCCT serialized face-offset byte quota exceeded");
+    }
+
+    bool reserve_edge(MeshData& result, size_t point_count) {
+        size_t coordinate_count = 0;
+        if (!checked_size_multiply(point_count, 3, coordinate_count)) {
+            record_resource_failure(
+                "mesh_shape_raw_occt",
+                "raw OCCT edge output size arithmetic overflow");
+            return false;
+        }
+        return claim(
+                   edge_points,
+                   point_count,
+                   maximum_raw_occt_edge_points,
+                   "raw OCCT edge-point quota exceeded")
+            && reserve_append(
+                result.edge_points,
+                coordinate_count,
+                "raw OCCT serialized edge-point byte quota exceeded")
+            && reserve_append(
+                result.chunk_edge_indices,
+                1,
+                "raw OCCT serialized edge-index byte quota exceeded")
+            && reserve_append(
+                result.edge_point_offsets,
+                1,
+                "raw OCCT serialized edge-offset byte quota exceeded");
+    }
+};
+
+static bool raw_occt_copy_ordinals(
+    BRepBuilderAPI_Copy& copier,
+    const BrepShapeMap& source_shapes,
+    const BrepShapeMap& copied_shapes,
+    const CancellationToken& progress,
+    std::vector<int>& copied_ordinals)
+{
+    copied_ordinals.assign(static_cast<size_t>(source_shapes.Extent()), 0);
+    std::vector<bool> copied_seen(
+        static_cast<size_t>(copied_shapes.Extent()), false);
+    for (int index = 1; index <= source_shapes.Extent(); ++index) {
+        if (rust_progress_cancelled(progress)) return false;
+        const TopoDS_Shape copied = copier.ModifiedShape(source_shapes(index));
+        if (copied.IsNull()) return false;
+        const int copied_ordinal = copied_shapes.FindIndex(copied);
+        if (copied_ordinal < 1
+            || copied_seen[static_cast<size_t>(copied_ordinal - 1)]) {
+            return false;
+        }
+        copied_ordinals[static_cast<size_t>(index - 1)] = copied_ordinal;
+        copied_seen[static_cast<size_t>(copied_ordinal - 1)] = true;
+    }
+    return std::find(copied_seen.begin(), copied_seen.end(), false)
+        == copied_seen.end();
+}
+
+static bool append_raw_occt_face_mesh(
+    const TopoDS_Face& face,
+    uint32_t source_face_index,
+    uint64_t source_face_tshape_id,
+    const CancellationToken& progress,
+    RawOcctMeshBudget& budget,
+    MeshData& result)
+{
+    if (rust_progress_cancelled(progress)) return false;
+    TopLoc_Location location;
+    Handle(Poly_Triangulation) triangulation =
+        BRep_Tool::Triangulation(face, location);
+    if (triangulation.IsNull()) return false;
+    // Ask OCCT to evaluate its native surface normals on its own mesh nodes.
+    // No Plex normal averaging, filtering, or repair is applied afterward.
+    BRepLib_ToolTriangulatedShape::ComputeNormals(face, triangulation);
+    if (rust_progress_cancelled(progress) || !triangulation->HasNormals()) {
+        return false;
+    }
+
+    const int node_count = triangulation->NbNodes();
+    const int triangle_count = triangulation->NbTriangles();
+    if (node_count < 3 || triangle_count < 1
+        || !budget.reserve_face(
+            result,
+            static_cast<size_t>(node_count),
+            static_cast<size_t>(triangle_count))) {
+        return false;
+    }
+    const uint32_t vertex_offset =
+        static_cast<uint32_t>(result.vertices.size() / 3);
+    result.chunk_face_tshape_ids.push_back(source_face_tshape_id);
+    result.chunk_face_indices.push_back(source_face_index);
+    const gp_Trsf location_transform = location.Transformation();
+    const bool reversed = face.Orientation() == TopAbs_REVERSED;
+    if (!reversed && face.Orientation() != TopAbs_FORWARD) return false;
+    for (int index = 1; index <= node_count; ++index) {
+        if (rust_progress_cancelled(progress)) return false;
+        gp_Pnt point = triangulation->Node(index);
+        point.Transform(location_transform);
+        gp_Dir normal = triangulation->Normal(index);
+        normal.Transform(location_transform);
+        if (reversed) normal.Reverse();
+        result.vertices.push_back(point.X());
+        result.vertices.push_back(point.Y());
+        result.vertices.push_back(point.Z());
+        result.normals.push_back(normal.X());
+        result.normals.push_back(normal.Y());
+        result.normals.push_back(normal.Z());
+    }
+    for (int index = 1; index <= triangle_count; ++index) {
+        if (rust_progress_cancelled(progress)) return false;
+        int first = 0;
+        int second = 0;
+        int third = 0;
+        triangulation->Triangle(index).Get(first, second, third);
+        if (first < 1 || second < 1 || third < 1
+            || first > node_count || second > node_count
+            || third > node_count) {
+            return false;
+        }
+        result.indices.push_back(vertex_offset + static_cast<uint32_t>(first - 1));
+        result.indices.push_back(
+            vertex_offset
+            + static_cast<uint32_t>((reversed ? third : second) - 1));
+        result.indices.push_back(
+            vertex_offset
+            + static_cast<uint32_t>((reversed ? second : third) - 1));
+        result.face_tshape_ids.push_back(source_face_tshape_id);
+    }
+    result.face_vertex_offsets.push_back(
+        static_cast<uint32_t>(result.vertices.size() / 3));
+    result.face_index_offsets.push_back(
+        static_cast<uint32_t>(result.indices.size()));
+    return true;
+}
+
+static bool append_raw_occt_edge_polygon(
+    const TopoDS_Edge& edge,
+    uint32_t source_edge_index,
+    const CancellationToken& progress,
+    RawOcctMeshBudget& budget,
+    MeshData& result)
+{
+    if (rust_progress_cancelled(progress)) return false;
+    Handle(Poly_PolygonOnTriangulation) polygon;
+    Handle(Poly_Triangulation) triangulation;
+    TopLoc_Location location;
+    BRep_Tool::PolygonOnTriangulation(
+        edge, polygon, triangulation, location);
+    // OCCT does not create a polygon for a zero-length pole edge. Omitting it
+    // preserves the source ordinal of every emitted edge without inventing a
+    // presentation segment.
+    if (polygon.IsNull() || triangulation.IsNull()
+        || polygon->NbNodes() < 2) {
+        return true;
+    }
+    const auto& nodes = polygon->Nodes();
+    const size_t point_count = static_cast<size_t>(nodes.Length());
+    if (!budget.reserve_edge(result, point_count)) return false;
+    const bool reversed = edge.Orientation() == TopAbs_REVERSED;
+    if (!reversed && edge.Orientation() != TopAbs_FORWARD) return false;
+    result.chunk_edge_indices.push_back(source_edge_index);
+    const gp_Trsf location_transform = location.Transformation();
+    for (int ordinal = nodes.Lower(); ordinal <= nodes.Upper(); ++ordinal) {
+        if (rust_progress_cancelled(progress)) return false;
+        const int node_index = reversed
+            ? nodes(nodes.Upper() - (ordinal - nodes.Lower()))
+            : nodes(ordinal);
+        if (node_index < 1 || node_index > triangulation->NbNodes()) {
+            return false;
+        }
+        gp_Pnt point = triangulation->Node(node_index);
+        point.Transform(location_transform);
+        result.edge_points.push_back(point.X());
+        result.edge_points.push_back(point.Y());
+        result.edge_points.push_back(point.Z());
+    }
+    result.edge_point_offsets.push_back(
+        static_cast<uint32_t>(result.edge_points.size() / 3));
+    return true;
+}
+
+MeshData mesh_shape_raw_occt(
+    const TopoDS_Shape& shape,
+    double linear,
+    double angular,
+    bool relative,
+    bool parallel,
+    bool include_edges,
+    const CancellationToken& progress)
+{
+    MeshData result;
+    result.success = false;
+    result.face_vertex_offsets.push_back(0);
+    result.face_index_offsets.push_back(0);
+    result.edge_point_offsets.push_back(0);
+    const char* failure_stage = "validate_input";
+    ScopedFailureDiagnostic failure_diagnostic(
+        __func__, failure_stage, result.success, progress);
+    try {
+        if (shape.IsNull()
+            || !std::isfinite(linear) || linear <= 0.0
+            || !std::isfinite(angular) || angular <= 0.0) {
+            record_input_failure(
+                __func__,
+                "shape and tessellation tolerances must be valid");
+            return result;
+        }
+        if (rust_progress_cancelled(progress)) return result;
+
+        failure_stage = "map_source_topology";
+        BrepShapeMap source_faces;
+        BrepShapeMap source_edges;
+        BrepShapeMap source_vertices;
+        if (!map_unique_brep_subshapes_bounded(
+                shape,
+                TopAbs_FACE,
+                maximum_brep_faces,
+                "shape face quota exceeded",
+                progress,
+                source_faces,
+                __func__)
+            || !map_unique_brep_subshapes_bounded(
+                shape,
+                TopAbs_EDGE,
+                maximum_brep_edges,
+                "shape edge quota exceeded",
+                progress,
+                source_edges,
+                __func__)
+            || !map_unique_brep_subshapes_bounded(
+                shape,
+                TopAbs_VERTEX,
+                maximum_brep_vertices,
+                "shape vertex quota exceeded",
+                progress,
+                source_vertices,
+                __func__)) {
+            return result;
+        }
+        failure_stage = "preflight_copy_surface_storage";
+        if (!preflight_brep_copy_surface_storage(
+                source_faces,
+                maximum_brep_control_points,
+                maximum_brep_knots,
+                progress,
+                __func__)) {
+            return result;
+        }
+
+        failure_stage = "copy_detached_shape";
+        if (rust_progress_cancelled(progress)) return result;
+        BRepBuilderAPI_Copy copier(shape, true, false);
+        if (rust_progress_cancelled(progress)
+            || !copier.IsDone() || copier.Shape().IsNull()) {
+            return result;
+        }
+        const TopoDS_Shape detached_shape = copier.Shape();
+
+        failure_stage = "map_detached_topology";
+        BrepShapeMap detached_faces;
+        BrepShapeMap detached_edges;
+        BrepShapeMap detached_vertices;
+        if (!map_unique_brep_subshapes_bounded(
+                detached_shape,
+                TopAbs_FACE,
+                maximum_brep_faces,
+                "detached shape face quota exceeded",
+                progress,
+                detached_faces,
+                __func__)
+            || !map_unique_brep_subshapes_bounded(
+                detached_shape,
+                TopAbs_EDGE,
+                maximum_brep_edges,
+                "detached shape edge quota exceeded",
+                progress,
+                detached_edges,
+                __func__)
+            || !map_unique_brep_subshapes_bounded(
+                detached_shape,
+                TopAbs_VERTEX,
+                maximum_brep_vertices,
+                "detached shape vertex quota exceeded",
+                progress,
+                detached_vertices,
+                __func__)) {
+            return result;
+        }
+        if (detached_faces.Extent() != source_faces.Extent()
+            || detached_edges.Extent() != source_edges.Extent()
+            || detached_vertices.Extent() != source_vertices.Extent()) {
+            return result;
+        }
+        std::vector<int> copied_face_ordinals;
+        std::vector<int> copied_edge_ordinals;
+        if (!raw_occt_copy_ordinals(
+                copier,
+                source_faces,
+                detached_faces,
+                progress,
+                copied_face_ordinals)
+            || !raw_occt_copy_ordinals(
+                copier,
+                source_edges,
+                detached_edges,
+                progress,
+                copied_edge_ordinals)) {
+            return result;
+        }
+
+        failure_stage = "mesh_detached_shape";
+        IMeshTools_Parameters parameters;
+        parameters.Deflection = linear;
+        parameters.Angle = angular;
+        parameters.Relative = relative;
+        parameters.InParallel = parallel;
+        Handle(RustProgressIndicator) indicator =
+            new RustProgressIndicator(progress);
+        BRepMesh_IncrementalMesh mesher(
+            detached_shape, parameters, indicator->Start());
+        if (rust_progress_cancelled(progress) || !mesher.IsDone()) {
+            return result;
+        }
+
+        RawOcctMeshBudget budget;
+        failure_stage = "copy_face_triangulations";
+        for (int source_index = 1;
+             source_index <= source_faces.Extent(); ++source_index) {
+            if (rust_progress_cancelled(progress)) return result;
+            const TopoDS_Face face = TopoDS::Face(
+                detached_faces(copied_face_ordinals[
+                    static_cast<size_t>(source_index - 1)]));
+            if (!append_raw_occt_face_mesh(
+                    face,
+                    static_cast<uint32_t>(source_index - 1),
+                    reinterpret_cast<uint64_t>(
+                        source_faces(source_index).TShape().get()),
+                    progress,
+                    budget,
+                    result)) {
+                return result;
+            }
+        }
+        if (include_edges) {
+            failure_stage = "copy_edge_polygons";
+            for (int source_index = 1;
+                 source_index <= source_edges.Extent(); ++source_index) {
+                if (rust_progress_cancelled(progress)) return result;
+                const TopoDS_Edge edge = TopoDS::Edge(
+                    detached_edges(copied_edge_ordinals[
+                        static_cast<size_t>(source_index - 1)]));
+                if (!append_raw_occt_edge_polygon(
+                        edge,
+                        static_cast<uint32_t>(source_index - 1),
+                        progress,
+                        budget,
+                        result)) {
+                    return result;
+                }
+            }
+        }
+        if (rust_progress_cancelled(progress)) return result;
+        failure_stage = "complete";
+        result.success = true;
+    } catch (const Standard_OutOfMemory& failure) {
+        record_standard_failure(__func__, "resource_limit", 5, failure);
+    } catch (const std::bad_alloc&) {
+        record_resource_failure(
+            __func__, "raw OCCT mesh allocation failed");
+    } catch (const std::length_error&) {
+        record_resource_failure(
+            __func__, "raw OCCT mesh container limit exceeded");
+    } catch (const Standard_Failure& failure) {
+        record_standard_failure(__func__, failure_stage, 7, failure);
+    }
+    return result;
+}
+
+bool test_seed_occt_triangulation_cache(
+    const TopoDS_Shape& shape,
+    double linear,
+    double angular,
+    bool relative)
+{
+    try {
+        if (shape.IsNull()
+            || !std::isfinite(linear) || linear <= 0.0
+            || !std::isfinite(angular) || angular <= 0.0) {
+            return false;
+        }
+        IMeshTools_Parameters parameters;
+        parameters.Deflection = linear;
+        parameters.Angle = angular;
+        parameters.Relative = relative;
+        parameters.InParallel = false;
+        BRepMesh_IncrementalMesh mesher(shape, parameters);
+        return mesher.IsDone();
+    } catch (const Standard_Failure&) {
+        return false;
+    }
+}
+
+TriangulationCacheData test_occt_triangulation_cache(
+    const TopoDS_Shape& shape)
+{
+    TriangulationCacheData result;
+    result.success = false;
+    try {
+        BrepShapeMap faces;
+        TopExp::MapShapes(shape, TopAbs_FACE, faces);
+        if (faces.Extent() < 0
+            || static_cast<size_t>(faces.Extent()) > maximum_brep_faces) {
+            return result;
+        }
+        result.face_count = static_cast<uint32_t>(faces.Extent());
+        for (int index = 1; index <= faces.Extent(); ++index) {
+            TopLoc_Location location;
+            const Handle(Poly_Triangulation) triangulation =
+                BRep_Tool::Triangulation(
+                    TopoDS::Face(faces(index)), location);
+            if (triangulation.IsNull()) continue;
+            const int node_count = triangulation->NbNodes();
+            const int triangle_count = triangulation->NbTriangles();
+            if (node_count < 0 || triangle_count < 0
+                || result.node_count
+                    > std::numeric_limits<uint64_t>::max()
+                        - static_cast<uint64_t>(node_count)
+                || result.triangle_count
+                    > std::numeric_limits<uint64_t>::max()
+                        - static_cast<uint64_t>(triangle_count)) {
+                return result;
+            }
+            ++result.triangulated_face_count;
+            result.node_count += static_cast<uint64_t>(node_count);
+            result.triangle_count += static_cast<uint64_t>(triangle_count);
+        }
+        result.success = true;
+    } catch (const Standard_Failure&) {
         return result;
     }
     return result;

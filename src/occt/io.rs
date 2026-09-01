@@ -265,6 +265,25 @@ pub(super) fn mesh_chunks_cancelable<'a>(solids: impl IntoIterator<Item = &'a So
 	decode_mesh_chunks(data, options)
 }
 
+pub(super) fn mesh_chunks_raw_occt<'a>(solids: impl IntoIterator<Item = &'a Solid>, options: crate::traits::Tessellation) -> Result<crate::common::mesh::MeshChunks, Error> {
+	mesh_chunks_raw_occt_cancelable(solids, options, &ffi::CancellationToken::new())
+}
+
+pub(super) fn mesh_chunks_raw_occt_cancelable<'a>(solids: impl IntoIterator<Item = &'a Solid>, options: crate::traits::Tessellation, progress: &ffi::CancellationToken) -> Result<crate::common::mesh::MeshChunks, Error> {
+	validate_tessellation_options(options)?;
+	let solids = solids.into_iter().collect::<Vec<_>>();
+	let compound = CompoundShape::new(solids.iter().copied());
+	ffi::begin_operation();
+	let data = ffi::mesh_shape_raw_occt(compound.inner(), options.deflection_linear, options.deflection_angular, options.relative_linear, options.parallel, options.include_edges, progress);
+	if progress.is_cancelled() {
+		return Err(Error::Cancelled);
+	}
+	if !data.success {
+		return Err(ffi::operation_error(Error::TriangulationFailed, "mesh shape with raw OCCT tessellator", "mesh"));
+	}
+	decode_mesh_chunks(data, options)
+}
+
 pub(super) fn mesh_face_chunks(solid: &Solid, face_indices: &[u32], options: crate::traits::Tessellation) -> Result<Vec<crate::common::mesh::FaceMeshChunk>, Error> {
 	mesh_face_chunks_cancelable(solid, face_indices, options, &ffi::CancellationToken::new())
 }
@@ -275,12 +294,7 @@ pub(super) fn mesh_face_chunks_cancelable(solid: &Solid, face_indices: &[u32], o
 }
 
 fn custom_mesh_data(shape: &ffi::TopoDS_Shape, face_indices: &[u32], options: crate::traits::Tessellation, progress: &ffi::CancellationToken) -> Result<ffi::MeshData, Error> {
-	if !options.deflection_linear.is_finite() || options.deflection_linear <= 0.0 {
-		return Err(Error::InvalidInput("tessellation linear deflection must be finite and greater than zero".into()));
-	}
-	if !options.deflection_angular.is_finite() || options.deflection_angular <= 0.0 {
-		return Err(Error::InvalidInput("tessellation angular deflection must be finite and greater than zero".into()));
-	}
+	validate_tessellation_options(options)?;
 	if face_indices.iter().copied().collect::<std::collections::BTreeSet<_>>().len() != face_indices.len() {
 		return Err(Error::InvalidInput("tessellation face selection contains duplicate indices".into()));
 	}
@@ -293,6 +307,16 @@ fn custom_mesh_data(shape: &ffi::TopoDS_Shape, face_indices: &[u32], options: cr
 		return Err(ffi::operation_error(Error::TriangulationFailed, "extract B-rep tessellation source", "extract"));
 	}
 	tessellation::mesh_brep_source(source, options, progress)
+}
+
+fn validate_tessellation_options(options: crate::traits::Tessellation) -> Result<(), Error> {
+	if !options.deflection_linear.is_finite() || options.deflection_linear <= 0.0 {
+		return Err(Error::InvalidInput("tessellation linear deflection must be finite and greater than zero".into()));
+	}
+	if !options.deflection_angular.is_finite() || options.deflection_angular <= 0.0 {
+		return Err(Error::InvalidInput("tessellation angular deflection must be finite and greater than zero".into()));
+	}
+	Ok(())
 }
 
 fn validate_flat_mesh_data(data: &ffi::MeshData) -> Result<(), Error> {

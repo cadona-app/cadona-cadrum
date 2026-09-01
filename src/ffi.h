@@ -26,6 +26,7 @@ struct OperationDiagnosticData;
 // Forward-declare shared structs (defined by cxx in ffi.rs.h)
 struct MeshData;
 struct BrepMeshSourceData;
+struct TriangulationCacheData;
 struct TopologyData;
 struct ValidationData;
 struct HistoryData;
@@ -267,6 +268,19 @@ BrepMeshSourceData extract_brep_mesh_source(
 	bool relative,
 	const CancellationToken& progress);
 
+// Explicit diagnostic/fallback path using OCCT's native triangulator on a
+// detached deep copy. Only Deflection, Angle, Relative, and InParallel are
+// configured; the cached polygons and normals are copied to Rust unchanged
+// except for occurrence transforms and outward winding/orientation.
+MeshData mesh_shape_raw_occt(
+	const TopoDS_Shape& shape,
+	double linear,
+	double angular,
+	bool relative,
+	bool parallel,
+	bool include_edges,
+	const CancellationToken& progress);
+
 // Test-support entry point for exercising the production extraction
 // preflight with small fixture-specific limits. Rust keeps the native shape
 // handle behind `Solid` and exposes this only from its hidden test module.
@@ -278,6 +292,13 @@ bool test_brep_extraction_preflight_limits(
 	uint32_t maximum_control_points,
 	uint32_t maximum_knots,
 	const CancellationToken& progress);
+bool test_seed_occt_triangulation_cache(
+	const TopoDS_Shape& shape,
+	double linear,
+	double angular,
+	bool relative);
+TriangulationCacheData test_occt_triangulation_cache(
+	const TopoDS_Shape& shape);
 
 // ==================== Topology enumeration ====================
 

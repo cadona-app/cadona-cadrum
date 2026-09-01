@@ -861,6 +861,21 @@ impl Solid {
 		super::io::mesh_chunks_cancelable(solids, options, progress)
 	}
 
+	/// Mesh topology-keyed chunks with OCCT's unmodified native triangulator.
+	///
+	/// This is an explicit diagnostic and compatibility fallback. It meshes a
+	/// detached deep copy, does not read or update this solid's triangulation
+	/// cache, and does not change the custom Rust tessellator used by
+	/// [`Self::mesh_chunks`].
+	pub fn mesh_chunks_raw_occt<'a>(solids: impl IntoIterator<Item = &'a Self>, options: crate::traits::Tessellation) -> Result<crate::common::mesh::MeshChunks, Error> {
+		super::io::mesh_chunks_raw_occt(solids, options)
+	}
+
+	/// Mesh with the raw OCCT fallback and cooperative cancellation.
+	pub fn mesh_chunks_raw_occt_cancelable<'a>(solids: impl IntoIterator<Item = &'a Self>, options: crate::traits::Tessellation, progress: &ffi::CancellationToken) -> Result<crate::common::mesh::MeshChunks, Error> {
+		super::io::mesh_chunks_raw_occt_cancelable(solids, options, progress)
+	}
+
 	/// Return only selected artifact-local face ordinals from a coherent
 	/// whole-shape meshing pass.
 	///

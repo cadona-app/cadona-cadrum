@@ -27,6 +27,14 @@ mod ffi_bridge {
 		success: bool,
 	}
 
+	struct TriangulationCacheData {
+		face_count: u32,
+		triangulated_face_count: u32,
+		node_count: u64,
+		triangle_count: u64,
+		success: bool,
+	}
+
 	/// Rust-owned input for the custom B-rep tessellator.
 	///
 	/// OCCT contributes exact topology and canonical 3D boundary positions,
@@ -282,7 +290,13 @@ mod ffi_bridge {
 		// ==================== Meshing ====================
 
 		fn extract_brep_mesh_source(shape: &TopoDS_Shape, face_indices: &[u32], linear: f64, angular: f64, relative: bool, progress: &CancellationToken) -> BrepMeshSourceData;
+		fn mesh_shape_raw_occt(shape: &TopoDS_Shape, linear: f64, angular: f64, relative: bool, parallel: bool, include_edges: bool, progress: &CancellationToken) -> MeshData;
+		#[allow(dead_code)]
 		fn test_brep_extraction_preflight_limits(shape: &TopoDS_Shape, maximum_faces: u32, maximum_edges: u32, maximum_vertices: u32, maximum_control_points: u32, maximum_knots: u32, progress: &CancellationToken) -> bool;
+		#[allow(dead_code)]
+		fn test_seed_occt_triangulation_cache(shape: &TopoDS_Shape, linear: f64, angular: f64, relative: bool) -> bool;
+		#[allow(dead_code)]
+		fn test_occt_triangulation_cache(shape: &TopoDS_Shape) -> TriangulationCacheData;
 
 		// ==================== Topology enumeration ====================
 

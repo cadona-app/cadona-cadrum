@@ -127,6 +127,33 @@ pub fn tessellation_extraction_preflight_with_limits(solid: &Solid, maximum_face
 	Err(ffi::operation_error(Error::TriangulationFailed, "preflight B-rep tessellation extraction", "preflight"))
 }
 
+/// OCCT triangulation cache counts retained on an authoritative test shape.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OcctTriangulationCacheStats {
+	pub face_count: u32,
+	pub triangulated_face_count: u32,
+	pub node_count: u64,
+	pub triangle_count: u64,
+}
+
+/// Seed the authoritative shape's OCCT cache for detached-copy regression tests.
+pub fn tessellation_seed_occt_cache(solid: &Solid, options: Tessellation) -> Result<(), Error> {
+	ffi::begin_operation();
+	if ffi::test_seed_occt_triangulation_cache(solid.inner(), options.deflection_linear, options.deflection_angular, options.relative_linear) {
+		return Ok(());
+	}
+	Err(ffi::operation_error(Error::TriangulationFailed, "seed OCCT triangulation cache", "mesh"))
+}
+
+/// Inspect the authoritative shape's cache without exposing an OCCT handle.
+pub fn tessellation_occt_cache_stats(solid: &Solid) -> Result<OcctTriangulationCacheStats, Error> {
+	let stats = ffi::test_occt_triangulation_cache(solid.inner());
+	if !stats.success {
+		return Err(Error::TriangulationFailed);
+	}
+	Ok(OcctTriangulationCacheStats { face_count: stats.face_count, triangulated_face_count: stats.triangulated_face_count, node_count: stats.node_count, triangle_count: stats.triangle_count })
+}
+
 fn extract_tessellation_source(solid: &Solid, options: Tessellation) -> Result<ffi::BrepMeshSourceData, Error> {
 	if !options.deflection_linear.is_finite() || options.deflection_linear <= 0.0 {
 		return Err(Error::InvalidInput("tessellation linear deflection must be finite and greater than zero".into()));
