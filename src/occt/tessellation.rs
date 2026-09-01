@@ -17,9 +17,12 @@ use crate::{Error, Tessellation};
 // resource ceiling without imposing the obsolete u16-sized limit that made a
 // valid high-resolution face impossible to export.
 const MAXIMUM_FACE_VERTICES: usize = 1_048_576;
-const MAXIMUM_REFINEMENT_PASSES: usize = 32;
-const MAXIMUM_REQUIRED_INSERTIONS_PER_PASS: usize = 4_096;
-const MAXIMUM_QUALITY_INSERTIONS_PER_PASS: usize = 1_024;
+const MAXIMUM_REQUIRED_REFINEMENT_PASSES: usize = 32;
+const MAXIMUM_QUALITY_REFINEMENT_PASSES: usize = 8;
+const MAXIMUM_REQUIRED_INSERTIONS_PER_PASS: usize = 2_048;
+const MAXIMUM_QUALITY_INSERTIONS_PER_PASS: usize = 512;
+const MAXIMUM_REQUIRED_INSERTIONS: usize = 65_536;
+const MAXIMUM_QUALITY_INSERTIONS: usize = 4_096;
 // Geom_BSplineSurface::MaxDegree() is 25. The FFI extracts only OCCT surfaces,
 // so fixed storage covers every valid input without a hot-path heap allocation.
 const MAXIMUM_BSPLINE_DEGREE: usize = 25;
@@ -339,6 +342,132 @@ impl MetricMap {
 	}
 }
 
+/// Exact two-dimensional coordinates for a geometrically planar B-rep face.
+///
+/// A planar rational surface is not required to have an affine UV chart. A
+/// constant first-fundamental-form approximation can therefore report good UV
+/// triangles even when their physical shape is poor. This chart projects the
+/// evaluated surface into an orthonormal plane and inverts candidate points
+/// with bounded Newton iterations, so CDT quality is measured in real model
+/// units.
+#[derive(Clone, Copy, Debug)]
+struct PlanarChart {
+	origin: DVec3,
+	x_axis: DVec3,
+	y_axis: DVec3,
+	reference_uv: DVec2,
+	reference_xy: DVec2,
+	bounds: [f64; 4],
+	extent: f64,
+}
+
+impl PlanarChart {
+	fn from_face(face: &TrimmedFace) -> Option<Self> {
+		let [u_min, u_max, v_min, v_max] = face.surface.uv_bounds;
+		let probes = [DVec2::new((u_min + u_max) * 0.5, (v_min + v_max) * 0.5), DVec2::new(u_min * 0.75 + u_max * 0.25, (v_min + v_max) * 0.5), DVec2::new((u_min + u_max) * 0.5, v_min * 0.75 + v_max * 0.25), DVec2::new(u_min * 0.25 + u_max * 0.75, v_min * 0.25 + v_max * 0.75)];
+		let (reference_uv, sample) = probes.into_iter().filter_map(|uv| face.surface.evaluate(uv).map(|sample| (uv, sample))).max_by(|(_, first), (_, second)| first.du.cross(first.dv).length_squared().total_cmp(&second.du.cross(second.dv).length_squared()))?;
+		let normal = sample.du.cross(sample.dv).try_normalize()?;
+		let x_axis = sample.du.reject_from_normalized(normal).try_normalize().or_else(|| sample.dv.reject_from_normalized(normal).try_normalize())?;
+		let y_axis = normal.cross(x_axis).try_normalize()?;
+		let origin = sample.position;
+		let project = |position: DVec3| DVec2::new((position - origin).dot(x_axis), (position - origin).dot(y_axis));
+		let reference_xy = project(sample.position);
+		let (minimum, maximum) = face.loops.iter().flat_map(|trim_loop| trim_loop.vertices.iter().map(|vertex| project(vertex.position))).fold((DVec2::splat(f64::INFINITY), DVec2::splat(f64::NEG_INFINITY)), |(minimum, maximum), point| (minimum.min(point), maximum.max(point)));
+		let extent = (maximum - minimum).abs().max_element();
+		(origin.is_finite() && x_axis.is_finite() && y_axis.is_finite() && reference_xy.is_finite() && extent.is_finite() && extent > 1.0e-12).then_some(Self { origin, x_axis, y_axis, reference_uv, reference_xy, bounds: face.surface.uv_bounds, extent })
+	}
+
+	fn map_position(self, position: DVec3) -> Option<Point2<f64>> {
+		let offset = position - self.origin;
+		let point = Point2::new(offset.dot(self.x_axis), offset.dot(self.y_axis));
+		(point.x.is_finite() && point.y.is_finite()).then_some(point)
+	}
+
+	fn map_uv(self, face: &TrimmedFace, uv: DVec2) -> Option<Point2<f64>> {
+		self.map_position(face.surface.evaluate(uv)?.position)
+	}
+
+	fn unmap(self, face: &TrimmedFace, target: Point2<f64>) -> Option<DVec2> {
+		const MAXIMUM_NEWTON_ITERATIONS: usize = 16;
+		let target = DVec2::new(target.x, target.y);
+		let reference = face.surface.evaluate(self.reference_uv)?;
+		let reference_jacobian = DVec2::new(reference.du.dot(self.x_axis), reference.du.dot(self.y_axis));
+		let reference_second = DVec2::new(reference.dv.dot(self.x_axis), reference.dv.dot(self.y_axis));
+		let mut uv = self.reference_uv + solve_planar_jacobian(reference_jacobian, reference_second, target - self.reference_xy)?;
+		uv.x = uv.x.clamp(self.bounds[0], self.bounds[1]);
+		uv.y = uv.y.clamp(self.bounds[2], self.bounds[3]);
+		let tolerance = self.extent * 1.0e-10;
+		for _ in 0..MAXIMUM_NEWTON_ITERATIONS {
+			let sample = face.surface.evaluate(uv)?;
+			let xy = DVec2::new((sample.position - self.origin).dot(self.x_axis), (sample.position - self.origin).dot(self.y_axis));
+			let residual = xy - target;
+			if residual.length() <= tolerance {
+				return Some(uv);
+			}
+			let du = DVec2::new(sample.du.dot(self.x_axis), sample.du.dot(self.y_axis));
+			let dv = DVec2::new(sample.dv.dot(self.x_axis), sample.dv.dot(self.y_axis));
+			let step = solve_planar_jacobian(du, dv, residual)?;
+			if !step.is_finite() {
+				return None;
+			}
+			uv -= step;
+			uv.x = uv.x.clamp(self.bounds[0], self.bounds[1]);
+			uv.y = uv.y.clamp(self.bounds[2], self.bounds[3]);
+		}
+		let mapped = self.map_uv(face, uv)?;
+		(metric_distance(mapped, Point2::new(target.x, target.y)) <= tolerance * 4.0).then_some(uv)
+	}
+}
+
+fn solve_planar_jacobian(du: DVec2, dv: DVec2, residual: DVec2) -> Option<DVec2> {
+	let determinant = du.x * dv.y - dv.x * du.y;
+	let scale = du.length().max(dv.length()).max(1.0);
+	if !determinant.is_finite() || determinant.abs() <= scale * scale * 1.0e-14 {
+		return None;
+	}
+	let solution = DVec2::new((residual.x * dv.y - dv.x * residual.y) / determinant, (du.x * residual.y - residual.x * du.y) / determinant);
+	solution.is_finite().then_some(solution)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FaceChart {
+	Curved(MetricMap),
+	Planar(PlanarChart),
+}
+
+impl FaceChart {
+	fn from_face(face: &TrimmedFace) -> Option<Self> {
+		if face.surface.is_planar() {
+			PlanarChart::from_face(face).map(Self::Planar)
+		} else {
+			Some(Self::Curved(MetricMap::from_face(face)))
+		}
+	}
+
+	fn map_uv(self, face: &TrimmedFace, uv: DVec2) -> Option<Point2<f64>> {
+		match self {
+			Self::Curved(metric) => Some(metric.map(uv)),
+			Self::Planar(chart) => chart.map_uv(face, uv),
+		}
+		.map(spade::mitigate_underflow)
+	}
+
+	fn map_boundary(self, face: &TrimmedFace, boundary: &BoundaryVertex) -> Option<Point2<f64>> {
+		match self {
+			Self::Curved(metric) => Some(metric.map(boundary.uv)),
+			Self::Planar(chart) => chart.map_position(boundary.position).or_else(|| chart.map_uv(face, boundary.uv)),
+		}
+		.map(spade::mitigate_underflow)
+	}
+
+	fn unmap(self, face: &TrimmedFace, point: Point2<f64>) -> Option<DVec2> {
+		match self {
+			Self::Curved(metric) => metric.unmap(point),
+			Self::Planar(chart) => chart.unmap(face, point),
+		}
+	}
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ParametricVertex {
 	uv: DVec2,
@@ -439,32 +568,27 @@ struct MeshedFace {
 	/// refinement. Ordinary inter-face edges are never refined here.
 	refined_edges: BTreeMap<u32, Vec<DVec3>>,
 	boundary_refinements: Vec<BoundaryOccurrenceRefinement>,
+	/// Vertices in a topology-forced boundary transition whose aspect cannot
+	/// be improved without moving canonical trim samples.
+	quality_exempt_vertices: BTreeSet<u32>,
 }
 
 impl FaceBoundaryContract {
 	fn from_face(face: &TrimmedFace, refinements: &[BoundaryOccurrenceRefinement]) -> Result<Self, Error> {
 		let mut segments = BTreeMap::new();
 		let mut occurrence_directions = BTreeMap::new();
-		let target_chart_direction = if face.reversed { -1 } else { 1 };
 		for (loop_index, trim_loop) in face.loops.iter().enumerate() {
 			let loop_index = u32::try_from(loop_index).map_err(|_| Error::TriangulationFailed)?;
-			let signed_area = trim_loop
-				.vertices
-				.iter()
-				.zip(trim_loop.vertices.iter().cycle().skip(1))
-				.take(trim_loop.vertices.len())
-				.map(|(first, second)| first.uv.perp_dot(second.uv))
-				.sum::<f64>();
+			let signed_area = trim_loop.vertices.iter().zip(trim_loop.vertices.iter().cycle().skip(1)).take(trim_loop.vertices.len()).map(|(first, second)| first.uv.perp_dot(second.uv)).sum::<f64>();
 			if !signed_area.is_finite() || signed_area == 0.0 {
 				return Err(Error::TriangulationFailed);
 			}
-			let loop_direction = if signed_area.signum() as i8 == target_chart_direction { 1 } else { -1 };
 			for index in 0..trim_loop.vertices.len() {
 				let first = trim_loop.vertices[index];
 				let second = trim_loop.vertices[(index + 1) % trim_loop.vertices.len()];
 				let occurrence = BoundaryOccurrence { loop_index, edge_index: first.edge_index, occurrence_index: first.edge_occurrence_index };
-				match occurrence_directions.insert(occurrence, (first.edge_occurrence_direction, loop_direction)) {
-					Some(existing) if existing != (first.edge_occurrence_direction, loop_direction) => return Err(Error::TriangulationFailed),
+				match occurrence_directions.insert(occurrence, first.edge_occurrence_direction) {
+					Some(existing) if existing != first.edge_occurrence_direction => return Err(Error::TriangulationFailed),
 					_ => {}
 				}
 				let canonical_segment_index = match first.edge_occurrence_direction {
@@ -474,7 +598,11 @@ impl FaceBoundaryContract {
 				let id = BoundarySegmentId { occurrence, canonical_segment_index };
 				let first = BoundaryContractPoint { uv: first.uv, position: first.position };
 				let second = BoundaryContractPoint { uv: second.uv, position: second.position };
-				let segment = if point_key(first.position) == point_key(second.position) { FaceBoundarySegment::Collapsed { first, second } } else { FaceBoundarySegment::Geometric { first, second, expected_direction: loop_direction } };
+				// Every source segment is stored in the exact trim traversal order.
+				// Inner loops naturally have the opposite chart winding, but the
+				// incident triangle must still follow that stored traversal. Comparing
+				// against the outer-loop winding a second time reverses valid holes.
+				let segment = if point_key(first.position) == point_key(second.position) { FaceBoundarySegment::Collapsed { first, second } } else { FaceBoundarySegment::Geometric { first, second, expected_direction: 1 } };
 				if segments.insert(id, segment).is_some() {
 					return Err(Error::TriangulationFailed);
 				}
@@ -490,13 +618,16 @@ impl FaceBoundaryContract {
 			if source_ids.is_empty() {
 				return Err(Error::TriangulationFailed);
 			}
-			let Some((source_direction, loop_direction)) = occurrence_directions.get(&refinement.occurrence).copied() else {
+			let Some(source_direction) = occurrence_directions.get(&refinement.occurrence).copied() else {
 				return Err(Error::TriangulationFailed);
 			};
 			if source_direction != refinement.direction {
 				return Err(Error::TriangulationFailed);
 			}
-			let expected_direction = loop_direction * if refinement.direction == EdgeOccurrenceDirection::Forward { 1 } else { -1 };
+			// Refinement point sequences are canonical-edge ordered rather than
+			// trim-traversal ordered, so only the occurrence orientation determines
+			// the expected local direction.
+			let expected_direction = if refinement.direction == EdgeOccurrenceDirection::Forward { 1 } else { -1 };
 			let source_points = source_ids.iter().flat_map(|id| segments[id].points()).map(|point| point_key(point.position)).collect::<BTreeSet<_>>();
 			if source_points.iter().any(|source| !refinement.points.iter().any(|point| point_key(point.position) == *source)) {
 				return Err(Error::TriangulationFailed);
@@ -538,7 +669,11 @@ impl FaceBoundaryContract {
 
 		fn parameter_key(uv: DVec2) -> ParameterKey {
 			fn coordinate_key(value: f64) -> u64 {
-				if value == 0.0 { 0 } else { value.to_bits() }
+				if value == 0.0 {
+					0
+				} else {
+					value.to_bits()
+				}
 			}
 			ParameterKey(coordinate_key(uv.x), coordinate_key(uv.y))
 		}
@@ -548,7 +683,11 @@ impl FaceBoundaryContract {
 		}
 
 		fn ordered_pair<T: Ord>(first: T, second: T) -> (T, T) {
-			if first <= second { (first, second) } else { (second, first) }
+			if first <= second {
+				(first, second)
+			} else {
+				(second, first)
+			}
 		}
 
 		let mut segment_lookup = BTreeMap::<(BoundaryPointKey, BoundaryPointKey), Vec<BoundarySegmentId>>::new();
@@ -608,13 +747,7 @@ impl FaceBoundaryContract {
 		for ((first, second), edge_use) in edge_uses {
 			let first_aliases = aliases.get(first as usize).ok_or(Error::TriangulationFailed)?;
 			let second_aliases = aliases.get(second as usize).ok_or(Error::TriangulationFailed)?;
-			let matches = first_aliases
-				.iter()
-				.flat_map(|first| second_aliases.iter().map(move |second| ordered_pair(*first, *second)))
-				.filter_map(|points| segment_lookup.get(&points))
-				.flatten()
-				.copied()
-				.collect::<BTreeSet<_>>();
+			let matches = first_aliases.iter().flat_map(|first| second_aliases.iter().map(move |second| ordered_pair(*first, *second))).filter_map(|points| segment_lookup.get(&points)).flatten().copied().collect::<BTreeSet<_>>();
 			if matches.is_empty() && edge_use.incidence == 2 && edge_use.balance == 0 {
 				continue;
 			}
@@ -693,32 +826,60 @@ fn mesh_face(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::Canc
 	if progress.is_cancelled() {
 		return Err(Error::Cancelled);
 	}
-	if let Some(mesh) = mesh_structured_patch(face, linear, angular)? {
-		if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
-			eprintln!("custom tessellation face {} used structured patch: {} vertices, {} triangles", face.index, mesh.vertices.len(), mesh.indices.len() / 3);
-			diagnose_meshed_face(&mesh);
+	if !face.surface.is_planar() {
+		let structured_mesh = mesh_structured_patch(face, linear, angular).map_err(|error| {
+			if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+				eprintln!("custom tessellation face {} could not build its structured patch: {error:?}", face.index);
+			}
+			error
+		})?;
+		if let Some(mesh) = structured_mesh {
+			if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+				eprintln!("custom tessellation face {} used structured patch: {} vertices, {} triangles", face.index, mesh.vertices.len(), mesh.indices.len() / 3);
+				diagnose_meshed_face(&mesh);
+			}
+			return Ok(mesh);
 		}
-		return Ok(mesh);
 	}
 	if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
 		eprintln!("custom tessellation face {} used trimmed CDT", face.index);
 	}
-	let metric = MetricMap::from_face(face);
+	let chart = FaceChart::from_face(face).ok_or_else(|| {
+		if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+			eprintln!("custom tessellation face {} could not construct its metric chart", face.index);
+		}
+		Error::TriangulationFailed
+	})?;
 	let mut triangulation = FaceTriangulation::new();
 	for (loop_index, trim_loop) in face.loops.iter().enumerate() {
 		let loop_index = u32::try_from(loop_index).map_err(|_| Error::TriangulationFailed)?;
 		let mut handles = Vec::with_capacity(trim_loop.vertices.len());
 		for (index, boundary) in trim_loop.vertices.iter().enumerate() {
-			let metric_position = metric.map(boundary.uv);
+			let metric_position = chart.map_boundary(face, boundary).ok_or_else(|| {
+				if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+					eprintln!("custom tessellation face {} could not map boundary vertex {index} of loop {loop_index}", face.index);
+				}
+				Error::TriangulationFailed
+			})?;
 			let boundary_occurrences = boundary_vertex_occurrences(loop_index, trim_loop, index);
 			let handle = if let Some(existing) = triangulation.locate_vertex(metric_position) {
 				let existing = existing.fix();
 				for occurrence in boundary_occurrences.into_iter().flatten() {
-					triangulation.vertex_data_mut(existing).add_boundary_occurrence(occurrence)?;
+					triangulation.vertex_data_mut(existing).add_boundary_occurrence(occurrence).map_err(|error| {
+						if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+							eprintln!("custom tessellation face {} boundary vertex {index} of loop {loop_index} exceeded occurrence capacity at metric position {metric_position:?}", face.index);
+						}
+						error
+					})?;
 				}
 				existing
 			} else {
-				triangulation.insert(ParametricVertex { uv: boundary.uv, metric: metric_position, boundary_position: Some(boundary.position), boundary_occurrences }).map_err(|_| Error::TriangulationFailed)?
+				triangulation.insert(ParametricVertex { uv: boundary.uv, metric: metric_position, boundary_position: Some(boundary.position), boundary_occurrences }).map_err(|error| {
+					if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+						eprintln!("custom tessellation face {} could not insert boundary vertex {index} of loop {loop_index} at metric position {metric_position:?}: {error:?}", face.index);
+					}
+					Error::TriangulationFailed
+				})?
 			};
 			handles.push(handle);
 		}
@@ -726,6 +887,9 @@ fn mesh_face(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::Canc
 			let first = handles[index];
 			let second = handles[(index + 1) % handles.len()];
 			if first == second || !triangulation.can_add_constraint(first, second) {
+				if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+					eprintln!("custom tessellation face {} could not constrain boundary segment {index} of loop {loop_index}: identical={}, first={}, second={}", face.index, first == second, first.index(), second.index());
+				}
 				return Err(Error::TriangulationFailed);
 			}
 			triangulation.add_constraint(first, second);
@@ -734,31 +898,48 @@ fn mesh_face(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::Canc
 	if triangulation.num_vertices() < 3 {
 		return Err(Error::TriangulationFailed);
 	}
+	let insertion_domain = InsertionDomain::from_face(face, chart).ok_or_else(|| {
+		if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+			eprintln!("custom tessellation face {} could not construct its insertion domain", face.index);
+		}
+		Error::TriangulationFailed
+	})?;
 
-	seed_structured_patch(face, metric, &mut triangulation);
-	if !face.surface.is_planar() {
-		seed_boundary_collar(face, metric, &mut triangulation);
+	if face.surface.is_planar() {
+		triangulation = seed_best_planar_lattice(face, chart, linear, &insertion_domain, triangulation)?;
+	} else {
+		seed_structured_patch(face, chart, &insertion_domain, &mut triangulation);
+		seed_boundary_collar(face, chart, &insertion_domain, &mut triangulation);
+		seed_metric_lattice(face, chart, linear, &insertion_domain, &mut triangulation);
 	}
-	seed_metric_lattice(face, metric, linear, &mut triangulation);
 
 	// Seed broad trimmed regions before exact-error refinement. A boundary-only
 	// Delaunay mesh of a circle or other many-sided convex face otherwise tends
 	// to contain long, visually conspicuous diagonals. The seed is unconstrained
 	// and therefore cannot disturb the canonical samples shared by adjacent faces.
-	if triangulation.num_vertices() > 8 {
+	if !face.surface.is_planar() && triangulation.num_vertices() > 8 {
 		let outer = &face.loops[0].vertices;
 		let center = outer.iter().map(|vertex| vertex.uv).sum::<DVec2>() / outer.len() as f64;
 		if point_in_trim(center, &face.loops) {
-			insert_interior_vertex(face, &mut triangulation, center, metric);
+			insert_interior_vertex(face, &mut triangulation, center, chart, &insertion_domain);
 		}
 	}
 
 	let usable_linear = (linear - face.surface.approximation_error).max(linear * 0.20).max(1.0e-10);
-	for _ in 0..MAXIMUM_REFINEMENT_PASSES {
+	let mut required_passes = 0;
+	let mut quality_passes = 0;
+	let mut required_insertions = 0;
+	let mut quality_insertions = 0;
+	loop {
 		if progress.is_cancelled() {
 			return Err(Error::Cancelled);
 		}
-		let mut candidates = refinement_candidates(face, &triangulation, usable_linear, angular.max(1.0e-3));
+		let mut candidates = refinement_candidates(face, &triangulation, usable_linear, angular.max(1.0e-3), progress).map_err(|error| {
+			if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+				eprintln!("custom tessellation face {} could not evaluate trimmed CDT refinement candidates: {error:?}", face.index);
+			}
+			error
+		})?;
 		if face.surface.is_planar() {
 			candidates.retain(|candidate| candidate.required);
 		}
@@ -768,23 +949,43 @@ fn mesh_face(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::Canc
 		let refining_required_error = candidates.iter().any(|candidate| candidate.required);
 		candidates.retain(|candidate| candidate.required == refining_required_error);
 		candidates.sort_by(|first, second| second.required.cmp(&first.required).then_with(|| second.score.total_cmp(&first.score)).then_with(|| first.uv.x.total_cmp(&second.uv.x)).then_with(|| first.uv.y.total_cmp(&second.uv.y)));
+		let (passes, insertion_count, maximum_passes, maximum_total, maximum_per_pass) = if refining_required_error { (&mut required_passes, &mut required_insertions, MAXIMUM_REQUIRED_REFINEMENT_PASSES, MAXIMUM_REQUIRED_INSERTIONS, MAXIMUM_REQUIRED_INSERTIONS_PER_PASS) } else { (&mut quality_passes, &mut quality_insertions, MAXIMUM_QUALITY_REFINEMENT_PASSES, MAXIMUM_QUALITY_INSERTIONS, MAXIMUM_QUALITY_INSERTIONS_PER_PASS) };
+		if *passes >= maximum_passes || *insertion_count >= maximum_total {
+			break;
+		}
+		*passes += 1;
 		let before = triangulation.num_vertices();
 		let room = MAXIMUM_FACE_VERTICES - before;
-		let maximum_insertions = if refining_required_error { MAXIMUM_REQUIRED_INSERTIONS_PER_PASS } else { MAXIMUM_QUALITY_INSERTIONS_PER_PASS };
+		let maximum_insertions = maximum_per_pass.min(maximum_total - *insertion_count);
 		let mut seen_candidates = BTreeSet::new();
-		for candidate in candidates
-			.into_iter()
-			.filter(|candidate| seen_candidates.insert((candidate.uv.x.to_bits(), candidate.uv.y.to_bits())))
-			.take(maximum_insertions.min(room))
-		{
-			insert_interior_vertex(face, &mut triangulation, candidate.uv, metric);
+		for (index, candidate) in candidates.into_iter().filter(|candidate| seen_candidates.insert((candidate.uv.x.to_bits(), candidate.uv.y.to_bits()))).take(maximum_insertions.min(room)).enumerate() {
+			if index.is_multiple_of(32) && progress.is_cancelled() {
+				return Err(Error::Cancelled);
+			}
+			insert_interior_vertex(face, &mut triangulation, candidate.uv, chart, &insertion_domain);
 		}
-		if triangulation.num_vertices() == before {
+		let inserted = triangulation.num_vertices() - before;
+		*insertion_count += inserted;
+		if inserted == 0 {
 			break;
 		}
 	}
-	let mesh = build_face_mesh(face, &triangulation)?;
-	if !mesh_satisfies_tolerances(face, &mesh, linear, angular)? {
+	let mesh = build_face_mesh(face, &triangulation).map_err(|error| {
+		if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+			eprintln!("custom tessellation face {} could not build its trimmed CDT mesh: {error:?}", face.index);
+		}
+		error
+	})?;
+	let satisfies_tolerances = mesh_satisfies_tolerances(face, &mesh, linear, angular).map_err(|error| {
+		if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+			eprintln!("custom tessellation face {} could not validate its trimmed CDT mesh tolerances: {error:?}", face.index);
+		}
+		error
+	})?;
+	if !satisfies_tolerances {
+		if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+			eprintln!("custom tessellation face {} rejected its trimmed CDT mesh because it exceeds tessellation tolerances", face.index);
+		}
 		return Err(Error::TriangulationFailed);
 	}
 	if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
@@ -808,6 +1009,7 @@ fn boundary_vertex_occurrences(loop_index: u32, trim_loop: &TrimLoop, index: usi
 
 fn diagnose_meshed_face(mesh: &MeshedFace) {
 	let mut worst = (1.0, 0, [0_u32; 3], [0.0; 3]);
+	let mut worst_aspect = (0.0, 0, [0_u32; 3]);
 	for (triangle_index, triangle) in mesh.indices.chunks_exact(3).enumerate() {
 		let triangle = [triangle[0], triangle[1], triangle[2]];
 		let points = triangle.map(|index| mesh.vertices[index as usize]);
@@ -819,8 +1021,13 @@ fn diagnose_meshed_face(mesh: &MeshedFace) {
 		if minimum < worst.0 {
 			worst = (minimum, triangle_index, triangle, alignment);
 		}
+		let aspect = triangle_aspect(points);
+		if aspect > worst_aspect.0 {
+			worst_aspect = (aspect, triangle_index, triangle);
+		}
 	}
 	eprintln!("custom tessellation face {} worst normal alignment: {:.12}, triangle {}, indices {:?}, alignments {:?}, points {:?}", mesh.index, worst.0, worst.1, worst.2, worst.3, worst.2.map(|index| mesh.vertices[index as usize]));
+	eprintln!("custom tessellation face {} worst aspect: {:.12}, triangle {}, indices {:?}, uvs {:?}, points {:?}", mesh.index, worst_aspect.0, worst_aspect.1, worst_aspect.2, worst_aspect.2.map(|index| mesh.uvs[index as usize]), worst_aspect.2.map(|index| mesh.vertices[index as usize]));
 }
 
 fn mesh_satisfies_tolerances(face: &TrimmedFace, mesh: &MeshedFace, linear: f64, angular: f64) -> Result<bool, Error> {
@@ -871,7 +1078,7 @@ fn mesh_satisfies_tolerances(face: &TrimmedFace, mesh: &MeshedFace, linear: f64,
 		let angle = geometric_normal.dot(expected_normal).clamp(-1.0, 1.0).acos();
 		if angle > usable_angular * 3.0 * acceptance_slack {
 			if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
-				eprintln!("custom tessellation face {} rejected triangle {:?} at {:?}: normal angle {angle:.12e} > 3 * {usable_angular:.12e}, points {positions:?}", face.index, indices, center_uv);
+				eprintln!("custom tessellation face {} rejected triangle {:?} at {:?}: normal angle {angle:.12e} > 3 * {usable_angular:.12e}, uvs {uvs:?}, points {positions:?}", face.index, indices, center_uv);
 			}
 			return Ok(reject_mesh_tolerance(face, "triangle interior exceeds angular deflection"));
 		}
@@ -881,7 +1088,7 @@ fn mesh_satisfies_tolerances(face: &TrimmedFace, mesh: &MeshedFace, linear: f64,
 		// aspect can be forced by topology rather than mesher choice. Audit the
 		// broad distribution and hard maximum on ordinary interior cells, where
 		// poor quality is both avoidable and actionable.
-		let constrained_or_singular = positions.iter().any(|position| boundary_vertex_keys.contains(&point_key(*position))) || uvs.iter().any(|uv| collapsed_parameter_axis(face, *uv).is_some());
+		let constrained_or_singular = positions.iter().any(|position| boundary_vertex_keys.contains(&point_key(*position))) || triangle.iter().any(|index| mesh.quality_exempt_vertices.contains(index)) || uvs.iter().any(|uv| collapsed_parameter_axis(face, *uv).is_some());
 		if !constrained_or_singular {
 			let physical_aspect = triangle_aspect(positions);
 			physical_aspects.push(physical_aspect);
@@ -1101,10 +1308,20 @@ fn mesh_structured_patch(face: &TrimmedFace, linear: f64, angular: f64) -> Resul
 		return Ok(None);
 	}
 
-	let Some(mesh) = mesh_inset_structured_patch(face, lower, upper, left, right, u_tolerance, v_tolerance, linear, angular)? else {
-		return Ok(None);
-	};
-	mesh_satisfies_tolerances(face, &mesh, linear, angular).map(|accepted| accepted.then_some(mesh))
+	// Start with a shallow graded collar and increase only when the exact final
+	// audit finds that the boundary-to-core transition is still too abrupt.
+	// This keeps ordinary faces compact while giving high-curvature lofts a
+	// deterministic structured refinement path instead of falling back to an
+	// unstructured point cloud.
+	for transition_ring_count in [8, 16, 32] {
+		let Some(mesh) = mesh_inset_structured_patch(face, lower, upper, left, right, u_tolerance, v_tolerance, linear, angular, transition_ring_count)? else {
+			return Ok(None);
+		};
+		if mesh_satisfies_tolerances(face, &mesh, linear, angular)? {
+			return Ok(Some(mesh));
+		}
+	}
+	Ok(None)
 }
 
 /// Builds periodic singular charts as latitude-like rows whose sample count
@@ -1233,7 +1450,7 @@ fn mesh_singular_row_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVert
 	}
 	let refined_edges = BTreeMap::from([(seam_edge_index, refined_seam_points)]);
 	let boundary_refinements = self_seam_boundary_refinements(left, right, &v_coordinates, &refined_edges[&seam_edge_index])?;
-	Ok(Some(MeshedFace { index: face.index, tshape_id: face.tshape_id, vertices, uvs, normals, indices, refined_edges, boundary_refinements }))
+	Ok(Some(MeshedFace { index: face.index, tshape_id: face.tshape_id, vertices, uvs, normals, indices, refined_edges, boundary_refinements, quality_exempt_vertices: BTreeSet::new() }))
 }
 
 fn surface_polyline_length(face: &TrimmedFace, u_coordinates: &[f64], v: f64) -> Result<f64, Error> {
@@ -1419,7 +1636,7 @@ fn mesh_column_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], u
 		Some(edge_index) => self_seam_boundary_refinements(left, right, &v_coordinates, &refined_edges[&edge_index])?,
 		None => Vec::new(),
 	};
-	Ok(Some(MeshedFace { index: face.index, tshape_id: face.tshape_id, vertices, uvs, normals, indices, refined_edges, boundary_refinements }))
+	Ok(Some(MeshedFace { index: face.index, tshape_id: face.tshape_id, vertices, uvs, normals, indices, refined_edges, boundary_refinements, quality_exempt_vertices: BTreeSet::new() }))
 }
 
 fn subdivide_axis_intervals(coordinates: &[f64], maximum_step: f64) -> Vec<f64> {
@@ -1561,7 +1778,8 @@ fn boundary_position_at_coordinate(boundary: &[&BoundaryVertex], coordinate: f64
 /// zipper strips connect that grid to the original boundaries. Consequently
 /// adjacent faces still consume byte-identical shared-edge positions, while
 /// the face interior has coherent rows instead of an unconstrained CDT fan.
-fn mesh_inset_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], upper: &[&BoundaryVertex], left: &[&BoundaryVertex], right: &[&BoundaryVertex], u_tolerance: f64, v_tolerance: f64, linear: f64, angular: f64) -> Result<Option<MeshedFace>, Error> {
+#[allow(clippy::too_many_arguments)]
+fn mesh_inset_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], upper: &[&BoundaryVertex], left: &[&BoundaryVertex], right: &[&BoundaryVertex], u_tolerance: f64, v_tolerance: f64, linear: f64, angular: f64, transition_ring_count: usize) -> Result<Option<MeshedFace>, Error> {
 	let [u_min, u_max, v_min, v_max] = face.surface.uv_bounds;
 	let metric = MetricMap::from_face(face);
 	let metric_u = metric_distance(metric.map(DVec2::new(u_min, (v_min + v_max) * 0.5)), metric.map(DVec2::new(u_max, (v_min + v_max) * 0.5)));
@@ -1578,8 +1796,8 @@ fn mesh_inset_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], up
 	// A tensor-cell diagonal combines error from both parametric directions.
 	// Refine each one-dimensional axis to half the requested tolerance so the
 	// two contributions remain bounded when the grid is triangulated.
-	let mut u_axis = adaptive_axis_coordinates(face, ParametricAxis::U, lower, upper, target_length, linear * 0.5, angular * 0.5, u_tolerance)?;
-	let mut v_axis = adaptive_axis_coordinates(face, ParametricAxis::V, left, right, target_length, linear * 0.5, angular * 0.5, v_tolerance)?;
+	let mut u_axis = adaptive_axis_coordinates(face, ParametricAxis::U, lower, upper, target_length, linear * 0.4, angular * 0.4, u_tolerance)?;
+	let mut v_axis = adaptive_axis_coordinates(face, ParametricAxis::V, left, right, target_length, linear * 0.4, angular * 0.4, v_tolerance)?;
 	ensure_axis_interior(&mut u_axis, u_min, u_max);
 	ensure_axis_interior(&mut v_axis, v_min, v_max);
 	// Opposite trims can contribute almost-coincident parameters even though
@@ -1595,6 +1813,7 @@ fn mesh_inset_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], up
 	// over-resolved axis; the final surface audit below rejects this candidate
 	// if the reduced chart no longer meets linear or angular tolerances.
 	const TARGET_STRUCTURED_GRID_CELLS: usize = 2_304;
+	const COARSENING_SEARCH_TOLERANCE_SCALE: f64 = 2.0;
 	while (u_axis.len() - 1).saturating_mul(v_axis.len() - 1) > TARGET_STRUCTURED_GRID_CELLS {
 		let u_intervals = u_axis.len() - 1;
 		let v_intervals = v_axis.len() - 1;
@@ -1603,10 +1822,10 @@ fn mesh_inset_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], up
 		let before = (u_axis.len(), v_axis.len());
 		if u_step <= v_step && u_intervals > 3 {
 			let target_intervals = (TARGET_STRUCTURED_GRID_CELLS / v_intervals).clamp(3, u_intervals - 1);
-			u_axis = coarsen_axis_coordinates(face, ParametricAxis::U, &u_axis, target_intervals + 1, linear, angular)?;
+			u_axis = coarsen_axis_coordinates(face, ParametricAxis::U, &u_axis, target_intervals + 1, linear * COARSENING_SEARCH_TOLERANCE_SCALE, angular * COARSENING_SEARCH_TOLERANCE_SCALE)?;
 		} else if v_intervals > 3 {
 			let target_intervals = (TARGET_STRUCTURED_GRID_CELLS / u_intervals).clamp(3, v_intervals - 1);
-			v_axis = coarsen_axis_coordinates(face, ParametricAxis::V, &v_axis, target_intervals + 1, linear, angular)?;
+			v_axis = coarsen_axis_coordinates(face, ParametricAxis::V, &v_axis, target_intervals + 1, linear * COARSENING_SEARCH_TOLERANCE_SCALE, angular * COARSENING_SEARCH_TOLERANCE_SCALE)?;
 		} else {
 			break;
 		}
@@ -1636,10 +1855,13 @@ fn mesh_inset_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], up
 	// transitioning to the denser core. This graded annulus prevents a sparse
 	// straight edge from forming a near-collinear fan against a dense interior
 	// row, without ever adding a vertex to the canonical shared edge itself.
-	let u_transition = transition_axis_index(u_axis.len());
-	let v_transition = transition_axis_index(v_axis.len());
-	let u_coordinates = u_axis[u_transition..u_axis.len() - u_transition].to_vec();
-	let v_coordinates = v_axis[v_transition..v_axis.len() - v_transition].to_vec();
+	let u_transition = transition_axis_index(u_axis.len(), transition_ring_count);
+	let v_transition = transition_axis_index(v_axis.len(), transition_ring_count);
+	let mut u_coordinates = u_axis[u_transition..u_axis.len() - u_transition].to_vec();
+	let mut v_coordinates = v_axis[v_transition..v_axis.len() - v_transition].to_vec();
+	if !refine_tensor_coordinates(face, &mut u_coordinates, &mut v_coordinates, u_tolerance, v_tolerance, linear * 0.9, angular * 3.0)? {
+		return Ok(None);
+	}
 	if !strictly_increasing(&u_coordinates) || !strictly_increasing(&v_coordinates) {
 		return Ok(None);
 	}
@@ -1670,10 +1892,12 @@ fn mesh_inset_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], up
 	upper_indices = augment_collapsed_boundary(face, &upper_indices, &top_inner, PatchSide::Upper, &mut vertices, &mut uvs, &mut normals)?;
 	left_indices = augment_collapsed_boundary(face, &left_indices, &left_inner, PatchSide::Left, &mut vertices, &mut uvs, &mut normals)?;
 	right_indices = augment_collapsed_boundary(face, &right_indices, &right_inner, PatchSide::Right, &mut vertices, &mut uvs, &mut normals)?;
-	let lower_rings = append_transition_rings(face, &lower_indices, &bottom_inner, PatchSide::Lower, u_coordinates[0], u_coordinates[u_coordinates.len() - 1], v_coordinates[0], v_coordinates[v_coordinates.len() - 1], &mut vertices, &mut uvs, &mut normals)?;
-	let upper_rings = append_transition_rings(face, &upper_indices, &top_inner, PatchSide::Upper, u_coordinates[0], u_coordinates[u_coordinates.len() - 1], v_coordinates[0], v_coordinates[v_coordinates.len() - 1], &mut vertices, &mut uvs, &mut normals)?;
-	let left_rings = append_transition_rings(face, &left_indices, &left_inner, PatchSide::Left, u_coordinates[0], u_coordinates[u_coordinates.len() - 1], v_coordinates[0], v_coordinates[v_coordinates.len() - 1], &mut vertices, &mut uvs, &mut normals)?;
-	let right_rings = append_transition_rings(face, &right_indices, &right_inner, PatchSide::Right, u_coordinates[0], u_coordinates[u_coordinates.len() - 1], v_coordinates[0], v_coordinates[v_coordinates.len() - 1], &mut vertices, &mut uvs, &mut normals)?;
+	let mut lower_rings = append_transition_rings(face, &lower_indices, &bottom_inner, PatchSide::Lower, u_coordinates[0], u_coordinates[u_coordinates.len() - 1], v_coordinates[0], v_coordinates[v_coordinates.len() - 1], transition_ring_count, &mut vertices, &mut uvs, &mut normals)?;
+	let mut upper_rings = append_transition_rings(face, &upper_indices, &top_inner, PatchSide::Upper, u_coordinates[0], u_coordinates[u_coordinates.len() - 1], v_coordinates[0], v_coordinates[v_coordinates.len() - 1], transition_ring_count, &mut vertices, &mut uvs, &mut normals)?;
+	let mut left_rings = append_transition_rings(face, &left_indices, &left_inner, PatchSide::Left, u_coordinates[0], u_coordinates[u_coordinates.len() - 1], v_coordinates[0], v_coordinates[v_coordinates.len() - 1], transition_ring_count, &mut vertices, &mut uvs, &mut normals)?;
+	let mut right_rings = append_transition_rings(face, &right_indices, &right_inner, PatchSide::Right, u_coordinates[0], u_coordinates[u_coordinates.len() - 1], v_coordinates[0], v_coordinates[v_coordinates.len() - 1], transition_ring_count, &mut vertices, &mut uvs, &mut normals)?;
+	share_transition_ring_corners(&mut lower_rings, &mut upper_rings, &mut left_rings, &mut right_rings)?;
+	let quality_exempt_vertices = lower_indices.iter().chain(&upper_indices).chain(&left_indices).chain(&right_indices).map(|(_, index)| *index).chain([&lower_rings, &upper_rings, &left_rings, &right_rings].into_iter().flat_map(|rings| rings.iter().flatten().map(|(_, index)| *index))).map(|index| u32::try_from(index).map_err(|_| Error::TriangulationFailed)).collect::<Result<BTreeSet<_>, _>>()?;
 	if vertices.len() > MAXIMUM_FACE_VERTICES {
 		return Err(Error::TriangulationFailed);
 	}
@@ -1692,7 +1916,7 @@ fn mesh_inset_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], up
 		return Err(Error::TriangulationFailed);
 	}
 	fill_singular_normals(face, &uvs, &vertices, &indices, &mut normals)?;
-	Ok(Some(MeshedFace { index: face.index, tshape_id: face.tshape_id, vertices, uvs, normals, indices, refined_edges: BTreeMap::new(), boundary_refinements: Vec::new() }))
+	Ok(Some(MeshedFace { index: face.index, tshape_id: face.tshape_id, vertices, uvs, normals, indices, refined_edges: BTreeMap::new(), boundary_refinements: Vec::new(), quality_exempt_vertices }))
 }
 
 #[derive(Clone, Copy)]
@@ -1915,11 +2139,117 @@ fn axis_coordinates_meet_error(face: &TrimmedFace, axis: ParametricAxis, coordin
 	Ok(true)
 }
 
-fn transition_axis_index(axis_length: usize) -> usize {
-	// Reserve several adaptive intervals for a graded boundary annulus. The
-	// progressive rings below change sample density across that physical width
-	// instead of concentrating skinny triangles in the first UV interval.
-	4.min(axis_length.saturating_sub(2) / 3).max(1)
+fn transition_axis_index(axis_length: usize, transition_ring_count: usize) -> usize {
+	// Reserve approximately one adaptive interval of physical width per collar
+	// ring. Refining the transition must widen its annulus as well as add rows;
+	// otherwise angular refinement merely packs increasingly skinny triangles
+	// into the same narrow strip.
+	transition_ring_count.min(axis_length.saturating_sub(2) / 3).max(1)
+}
+
+/// Audits the actual tensor rows and cells instead of assuming that a handful
+/// of cross-axis probes represent the whole rational surface. A localized
+/// mixed derivative can make one otherwise-valid interval fail only in a
+/// narrow region. Deterministic midpoint insertion keeps the grid coherent,
+/// chooses the less expensive refinement direction for a failing cell, and
+/// remains bounded independently of surface complexity.
+fn refine_tensor_coordinates(face: &TrimmedFace, u_coordinates: &mut Vec<f64>, v_coordinates: &mut Vec<f64>, u_tolerance: f64, v_tolerance: f64, linear: f64, angular: f64) -> Result<bool, Error> {
+	const MAXIMUM_TENSOR_AXIS_POINTS: usize = 513;
+	const MAXIMUM_TENSOR_CELLS: usize = 131_072;
+	const MAXIMUM_TENSOR_REFINEMENT_PASSES: usize = 8;
+
+	for _ in 0..MAXIMUM_TENSOR_REFINEMENT_PASSES {
+		let mut u_insertions = Vec::new();
+		for interval in u_coordinates.windows(2) {
+			let midpoint = (interval[0] + interval[1]) * 0.5;
+			let mut needs_split = false;
+			for v in v_coordinates.iter().copied() {
+				let first = face.surface.evaluate(DVec2::new(interval[0], v)).ok_or(Error::TriangulationFailed)?.position;
+				let middle = face.surface.evaluate(DVec2::new(midpoint, v)).ok_or(Error::TriangulationFailed)?.position;
+				let last = face.surface.evaluate(DVec2::new(interval[1], v)).ok_or(Error::TriangulationFailed)?.position;
+				if point_segment_distance(middle, first, last) > linear {
+					needs_split = true;
+					break;
+				}
+			}
+			if needs_split {
+				u_insertions.push(midpoint);
+			}
+		}
+
+		let mut v_insertions = Vec::new();
+		for interval in v_coordinates.windows(2) {
+			let midpoint = (interval[0] + interval[1]) * 0.5;
+			let mut needs_split = false;
+			for u in u_coordinates.iter().copied() {
+				let first = face.surface.evaluate(DVec2::new(u, interval[0])).ok_or(Error::TriangulationFailed)?.position;
+				let middle = face.surface.evaluate(DVec2::new(u, midpoint)).ok_or(Error::TriangulationFailed)?.position;
+				let last = face.surface.evaluate(DVec2::new(u, interval[1])).ok_or(Error::TriangulationFailed)?.position;
+				if point_segment_distance(middle, first, last) > linear {
+					needs_split = true;
+					break;
+				}
+			}
+			if needs_split {
+				v_insertions.push(midpoint);
+			}
+		}
+
+		// Row-wise chord checks cannot see error introduced by the diagonal of a
+		// doubly curved cell. Audit both possible diagonal splits against the exact
+		// surface. When neither split meets the requested error, compare virtual U
+		// and V subdivisions and insert only the midpoint that lowers the worst
+		// child-cell error most. This produces a graded tensor mesh instead of
+		// abandoning a well-structured face for an unconstrained point cloud.
+		for u_interval in u_coordinates.windows(2) {
+			for v_interval in v_coordinates.windows(2) {
+				let current = tensor_cell_error(face, u_interval[0], u_interval[1], v_interval[0], v_interval[1], linear, angular)?;
+				if current <= 1.0 {
+					continue;
+				}
+				let u_midpoint = (u_interval[0] + u_interval[1]) * 0.5;
+				let v_midpoint = (v_interval[0] + v_interval[1]) * 0.5;
+				let u_error = tensor_cell_error(face, u_interval[0], u_midpoint, v_interval[0], v_interval[1], linear, angular)?.max(tensor_cell_error(face, u_midpoint, u_interval[1], v_interval[0], v_interval[1], linear, angular)?);
+				let v_error = tensor_cell_error(face, u_interval[0], u_interval[1], v_interval[0], v_midpoint, linear, angular)?.max(tensor_cell_error(face, u_interval[0], u_interval[1], v_midpoint, v_interval[1], linear, angular)?);
+				if u_error <= v_error {
+					u_insertions.push(u_midpoint);
+				} else {
+					v_insertions.push(v_midpoint);
+				}
+			}
+		}
+
+		if u_insertions.is_empty() && v_insertions.is_empty() {
+			return Ok(true);
+		}
+		let next_u_count = u_coordinates.len().saturating_add(u_insertions.len());
+		let next_v_count = v_coordinates.len().saturating_add(v_insertions.len());
+		if next_u_count > MAXIMUM_TENSOR_AXIS_POINTS || next_v_count > MAXIMUM_TENSOR_AXIS_POINTS || next_u_count.saturating_sub(1).saturating_mul(next_v_count.saturating_sub(1)) > MAXIMUM_TENSOR_CELLS {
+			return Ok(false);
+		}
+		u_coordinates.extend(u_insertions);
+		u_coordinates.sort_by(f64::total_cmp);
+		u_coordinates.dedup_by(|first, second| (*first - *second).abs() <= u_tolerance);
+		v_coordinates.extend(v_insertions);
+		v_coordinates.sort_by(f64::total_cmp);
+		v_coordinates.dedup_by(|first, second| (*first - *second).abs() <= v_tolerance);
+	}
+	Ok(false)
+}
+
+fn tensor_cell_error(face: &TrimmedFace, u_min: f64, u_max: f64, v_min: f64, v_max: f64, linear: f64, angular: f64) -> Result<f64, Error> {
+	let uvs = [DVec2::new(u_min, v_min), DVec2::new(u_max, v_min), DVec2::new(u_max, v_max), DVec2::new(u_min, v_max)];
+	let positions = uvs.map(|uv| face.surface.evaluate(uv).map(|sample| sample.position).ok_or(Error::TriangulationFailed)).into_iter().collect::<Result<Vec<_>, _>>()?;
+	let positions: [DVec3; 4] = positions.try_into().map_err(|_| Error::TriangulationFailed)?;
+	let first = [[0, 1, 2], [0, 2, 3]];
+	let second = [[0, 1, 3], [1, 2, 3]];
+	let split_error = |split: [[usize; 3]; 2]| -> Result<f64, Error> {
+		split.into_iter().try_fold(0.0_f64, |worst, triangle| {
+			let error = strip_triangle_error(face, triangle.map(|index| uvs[index]), triangle.map(|index| positions[index]), linear, angular)?;
+			Ok(worst.max(error))
+		})
+	};
+	Ok(split_error(first)?.min(split_error(second)?))
 }
 
 fn regularize_axis_coordinates(coordinates: &[f64]) -> Vec<f64> {
@@ -1968,7 +2298,11 @@ fn append_boundary_side(face: &TrimmedFace, vertices_on_side: &[&BoundaryVertex]
 
 fn weld_exact_boundary_corners(sides: [&mut Vec<(f64, usize)>; 4], vertices: &[DVec3], uvs: &[DVec2]) -> Result<(), Error> {
 	fn coordinate_key(value: f64) -> u64 {
-		if value == 0.0 { 0 } else { value.to_bits() }
+		if value == 0.0 {
+			0
+		} else {
+			value.to_bits()
+		}
 	}
 
 	let mut canonical = BTreeMap::<(u64, u64, PointKey), usize>::new();
@@ -1994,7 +2328,11 @@ fn weld_exact_boundary_corners(sides: [&mut Vec<(f64, usize)>; 4], vertices: &[D
 
 fn weld_exact_mesh_vertex_indices(vertices: &[DVec3], uvs: &[DVec2], indices: &mut Vec<u32>) -> Result<(), Error> {
 	fn coordinate_key(value: f64) -> u64 {
-		if value == 0.0 { 0 } else { value.to_bits() }
+		if value == 0.0 {
+			0
+		} else {
+			value.to_bits()
+		}
 	}
 
 	if vertices.len() != uvs.len() || !indices.len().is_multiple_of(3) {
@@ -2011,12 +2349,7 @@ fn weld_exact_mesh_vertex_indices(vertices: &[DVec3], uvs: &[DVec2], indices: &m
 	for index in indices.iter_mut() {
 		*index = *replacements.get(*index as usize).ok_or(Error::TriangulationFailed)?;
 	}
-	*indices = indices
-		.chunks_exact(3)
-		.filter(|triangle| triangle[0] != triangle[1] && triangle[1] != triangle[2] && triangle[2] != triangle[0])
-		.flatten()
-		.copied()
-		.collect();
+	*indices = indices.chunks_exact(3).filter(|triangle| triangle[0] != triangle[1] && triangle[1] != triangle[2] && triangle[2] != triangle[0]).flatten().copied().collect();
 	Ok(())
 }
 
@@ -2066,10 +2399,11 @@ fn augment_collapsed_boundary(face: &TrimmedFace, boundary: &[(f64, usize)], inn
 		.collect()
 }
 
-fn append_transition_rings(face: &TrimmedFace, boundary: &[(f64, usize)], inner: &[(f64, usize)], side: PatchSide, core_u_min: f64, core_u_max: f64, core_v_min: f64, core_v_max: f64, vertices: &mut Vec<DVec3>, uvs: &mut Vec<DVec2>, normals: &mut Vec<DVec3>) -> Result<Vec<Vec<(f64, usize)>>, Error> {
+#[allow(clippy::too_many_arguments)]
+fn append_transition_rings(face: &TrimmedFace, boundary: &[(f64, usize)], inner: &[(f64, usize)], side: PatchSide, core_u_min: f64, core_u_max: f64, core_v_min: f64, core_v_max: f64, transition_ring_count: usize, vertices: &mut Vec<DVec3>, uvs: &mut Vec<DVec2>, normals: &mut Vec<DVec3>) -> Result<Vec<Vec<(f64, usize)>>, Error> {
 	let boundary_keys = boundary.iter().map(|entry| entry.0).collect::<Vec<_>>();
 	let inner_keys = inner.iter().map(|entry| entry.0).collect::<Vec<_>>();
-	let key_stages = transition_key_stages(&boundary_keys, &inner_keys)?;
+	let key_stages = transition_key_stages(&boundary_keys, &inner_keys, transition_ring_count)?;
 	let [face_u_min, face_u_max, face_v_min, face_v_max] = face.surface.uv_bounds;
 	let stage_count = key_stages.len();
 	key_stages
@@ -2097,58 +2431,86 @@ fn append_transition_rings(face: &TrimmedFace, boundary: &[(f64, usize)], inner:
 		.collect()
 }
 
-fn transition_key_stages(boundary: &[f64], inner: &[f64]) -> Result<Vec<Vec<f64>>, Error> {
-	// A shallow collar makes the radial spacing comparable to even the densest
-	// canonical trim intervals. With only a handful of rings, an adaptively
-	// sampled curved boundary can be joined to a distant interior row by long,
-	// needle-like cells even when the monotone connectivity is optimal.
-	const TRANSITION_RING_COUNT: usize = 16;
-	if boundary.len() < 2 || inner.len() < 2 || !strictly_increasing(boundary) || !strictly_increasing(inner) {
+/// Gives every logical collar corner one topological vertex per transition
+/// stage. Adjacent sides derive the same mathematical corner through a
+/// different interpolation expression; those expressions can differ by one
+/// ULP and must not be used as topology identity. Sharing by side and stage is
+/// exact by construction and leaves non-corner samples untouched.
+fn share_transition_ring_corners(lower: &mut [Vec<(f64, usize)>], upper: &mut [Vec<(f64, usize)>], left: &mut [Vec<(f64, usize)>], right: &mut [Vec<(f64, usize)>]) -> Result<(), Error> {
+	if lower.len() != upper.len() || lower.len() != left.len() || lower.len() != right.len() {
 		return Err(Error::TriangulationFailed);
 	}
-	let mut target = boundary.iter().chain(inner).copied().collect::<Vec<_>>();
-	target.sort_by(f64::total_cmp);
-	target.dedup_by(|first, second| (*first - *second).abs() <= 1.0e-12);
-	target = regularize_axis_coordinates(&target);
-	let mut current = boundary.to_vec();
-	let mut stages = vec![current.clone()];
-	while current.len() < target.len() && stages.len() < TRANSITION_RING_COUNT {
-		if stages.len() + 1 == TRANSITION_RING_COUNT {
-			current = target.clone();
-			stages.push(current.clone());
-			break;
+	for stage in 0..lower.len() {
+		if lower[stage].len() < 2 || upper[stage].len() < 2 || left[stage].len() < 2 || right[stage].len() < 2 {
+			return Err(Error::TriangulationFailed);
 		}
-		let mut additions = Vec::new();
-		for interval in current.windows(2) {
-			let missing = target.iter().copied().filter(|key| *key > interval[0] + 1.0e-12 && *key < interval[1] - 1.0e-12 && !current.iter().any(|existing| (*existing - *key).abs() <= 1.0e-12)).collect::<Vec<_>>();
-			let midpoint = (interval[0] + interval[1]) * 0.5;
-			if let Some(key) = missing.into_iter().min_by(|first, second| (first - midpoint).abs().total_cmp(&(second - midpoint).abs()).then_with(|| first.total_cmp(second))) {
-				additions.push(key);
-			}
-		}
-		if additions.is_empty() {
-			current = target.clone();
-		} else {
-			current.extend(additions);
-			current.sort_by(f64::total_cmp);
-			current.dedup_by(|first, second| (*first - *second).abs() <= 1.0e-12);
-		}
-		stages.push(current.clone());
+		let lower_left = lower[stage][0].1;
+		let lower_right = lower[stage].last().ok_or(Error::TriangulationFailed)?.1;
+		let upper_left = upper[stage][0].1;
+		let upper_right = upper[stage].last().ok_or(Error::TriangulationFailed)?.1;
+		left[stage][0].1 = lower_left;
+		right[stage][0].1 = lower_right;
+		let left_last = left[stage].len() - 1;
+		let right_last = right[stage].len() - 1;
+		left[stage][left_last].1 = upper_left;
+		right[stage][right_last].1 = upper_right;
 	}
-	while stages.len() < TRANSITION_RING_COUNT {
-		stages.push(target.clone());
+	Ok(())
+}
+
+fn transition_key_stages(boundary: &[f64], inner: &[f64], transition_ring_count: usize) -> Result<Vec<Vec<f64>>, Error> {
+	// A shallow collar makes the radial spacing comparable to even the densest
+	// canonical trim intervals. Morph quantile-corresponding samples from the
+	// boundary distribution to the regular interior distribution. This retires
+	// curvature-driven micro-intervals gradually instead of propagating their
+	// union through the whole annulus or changing density in one abrupt strip.
+	if boundary.len() < 2 || inner.len() < 2 || transition_ring_count == 0 || !strictly_increasing(boundary) || !strictly_increasing(inner) {
+		return Err(Error::TriangulationFailed);
+	}
+	let mut stages = Vec::with_capacity(transition_ring_count);
+	for stage in 1..=transition_ring_count {
+		let blend = stage as f64 / (transition_ring_count + 1) as f64;
+		// Change density progressively as well as moving the samples. Giving the
+		// very first ring the full core count would connect each sparse canonical
+		// boundary interval to a fan of tiny tangential intervals, producing the
+		// exact slivers this collar exists to avoid.
+		let sample_count = ((boundary.len() as f64 + (inner.len() as f64 - boundary.len() as f64) * blend).round() as usize).max(2);
+		let mut keys = Vec::with_capacity(sample_count);
+		for index in 0..sample_count {
+			let quantile = index as f64 / (sample_count - 1) as f64;
+			let boundary_key = sample_key_distribution(boundary, quantile);
+			let inner_key = sample_key_distribution(inner, quantile);
+			keys.push(boundary_key + (inner_key - boundary_key) * blend);
+		}
+		if !strictly_increasing(&keys) {
+			return Err(Error::TriangulationFailed);
+		}
+		stages.push(keys);
 	}
 	Ok(stages)
+}
+
+fn sample_key_distribution(keys: &[f64], quantile: f64) -> f64 {
+	let coordinate = quantile.clamp(0.0, 1.0) * (keys.len() - 1) as f64;
+	let lower = coordinate.floor() as usize;
+	let upper = (lower + 1).min(keys.len() - 1);
+	let blend = coordinate - lower as f64;
+	keys[lower] + (keys[upper] - keys[lower]) * blend
 }
 
 #[allow(clippy::too_many_arguments)]
 fn triangulate_transition_rings(face: &TrimmedFace, boundary: &[(f64, usize)], rings: &[Vec<(f64, usize)>], inner: &[(f64, usize)], outer_to_inner: bool, vertices: &[DVec3], uvs: &[DVec2], normals: &[DVec3], linear: f64, angular: f64, indices: &mut Vec<u32>) -> Result<(), Error> {
 	let mut previous = boundary;
-	for ring in rings {
+	for (ring_index, ring) in rings.iter().enumerate() {
+		// Equal-density generated rings have quantile-corresponding vertices. Pair
+		// them by construction even though their keys move slightly; density-changing
+		// stages and the immutable boundary/core transitions use the general
+		// minimax dynamic program.
+		let tolerance = if ring_index == 0 { 1.0e-10 } else { f64::INFINITY };
 		if outer_to_inner {
-			triangulate_monotone_strip(face, previous, ring, vertices, uvs, normals, 1.0e-10, linear, angular, indices)?;
+			triangulate_monotone_strip(face, previous, ring, vertices, uvs, normals, tolerance, linear, angular, indices)?;
 		} else {
-			triangulate_monotone_strip(face, ring, previous, vertices, uvs, normals, 1.0e-10, linear, angular, indices)?;
+			triangulate_monotone_strip(face, ring, previous, vertices, uvs, normals, tolerance, linear, angular, indices)?;
 		}
 		previous = ring;
 	}
@@ -2203,27 +2565,29 @@ fn triangulate_monotone_strip(face: &TrimmedFace, left: &[(f64, usize)], right: 
 				let upper_right = right[right_index + 1].1;
 				let first_split = [[lower_left, lower_right, upper_right], [lower_left, upper_right, upper_left]];
 				let second_split = [[lower_left, lower_right, upper_left], [lower_right, upper_right, upper_left]];
-				let split = if split_quality(first_split, vertices) <= split_quality(second_split, vertices) { first_split } else { second_split };
+				let first_score = regular_split_score(face, first_split, vertices, uvs, linear, angular)?;
+				let second_score = regular_split_score(face, second_split, vertices, uvs, linear, angular)?;
+				let split = if strip_score_is_better(first_score, second_score) { first_split } else { second_split };
 				for triangle in split {
-					push_surface_oriented_triangle(triangle, vertices, normals, indices)?;
+					push_chart_oriented_triangle(face, triangle, vertices, uvs, normals, indices)?;
 				}
 				left_index += 1;
 				right_index += 1;
 			}
 			(Some(left_v), Some(right_v)) if left_v < right_v => {
-				push_surface_oriented_triangle([left[left_index].1, right[right_index].1, left[left_index + 1].1], vertices, normals, indices)?;
+				push_chart_oriented_triangle(face, [left[left_index].1, right[right_index].1, left[left_index + 1].1], vertices, uvs, normals, indices)?;
 				left_index += 1;
 			}
 			(Some(_), Some(_)) => {
-				push_surface_oriented_triangle([left[left_index].1, right[right_index].1, right[right_index + 1].1], vertices, normals, indices)?;
+				push_chart_oriented_triangle(face, [left[left_index].1, right[right_index].1, right[right_index + 1].1], vertices, uvs, normals, indices)?;
 				right_index += 1;
 			}
 			(Some(_), None) => {
-				push_surface_oriented_triangle([left[left_index].1, right[right_index].1, left[left_index + 1].1], vertices, normals, indices)?;
+				push_chart_oriented_triangle(face, [left[left_index].1, right[right_index].1, left[left_index + 1].1], vertices, uvs, normals, indices)?;
 				left_index += 1;
 			}
 			(None, Some(_)) => {
-				push_surface_oriented_triangle([left[left_index].1, right[right_index].1, right[right_index + 1].1], vertices, normals, indices)?;
+				push_chart_oriented_triangle(face, [left[left_index].1, right[right_index].1, right[right_index + 1].1], vertices, uvs, normals, indices)?;
 				right_index += 1;
 			}
 			(None, None) => break,
@@ -2237,6 +2601,26 @@ struct StripScore {
 	worst_error: f64,
 	worst_aspect: f64,
 	total_aspect: f64,
+}
+
+fn regular_split_score(face: &TrimmedFace, split: [[usize; 3]; 2], vertices: &[DVec3], uvs: &[DVec2], linear: f64, angular: f64) -> Result<StripScore, Error> {
+	let mut score = StripScore { worst_error: 1.0, worst_aspect: 0.0, total_aspect: 0.0 };
+	for triangle in split {
+		let positions = triangle.map(|index| vertices[index]);
+		let error = strip_triangle_error(face, triangle.map(|index| uvs[index]), positions, linear, angular)?;
+		let aspect = triangle_aspect(positions);
+		if !aspect.is_finite() {
+			return Err(Error::TriangulationFailed);
+		}
+		score.worst_error = score.worst_error.max(error);
+		score.worst_aspect = score.worst_aspect.max(aspect);
+		score.total_aspect += aspect;
+	}
+	Ok(score)
+}
+
+fn strip_score_is_better(candidate: StripScore, current: StripScore) -> bool {
+	candidate.worst_error < current.worst_error || candidate.worst_error == current.worst_error && (candidate.worst_aspect < current.worst_aspect || candidate.worst_aspect == current.worst_aspect && candidate.total_aspect <= current.total_aspect)
 }
 
 #[derive(Clone, Copy)]
@@ -2300,7 +2684,7 @@ fn triangulate_unequal_monotone_strip(face: &TrimmedFace, left: &[(f64, usize)],
 		}
 	}
 	for triangle in triangles.into_iter().rev() {
-		push_surface_oriented_triangle(triangle, vertices, normals, indices)?;
+		push_chart_oriented_triangle(face, triangle, vertices, uvs, normals, indices)?;
 	}
 	Ok(())
 }
@@ -2378,6 +2762,41 @@ fn push_surface_oriented_triangle(mut triangle: [usize; 3], vertices: &[DVec3], 
 	Ok(())
 }
 
+fn push_chart_oriented_triangle(face: &TrimmedFace, mut triangle: [usize; 3], vertices: &[DVec3], uvs: &[DVec2], normals: &[DVec3], indices: &mut Vec<u32>) -> Result<(), Error> {
+	let chart = triangle.map(|index| uvs[index]);
+	let chart_area = (chart[1] - chart[0]).perp_dot(chart[2] - chart[0]);
+	if !chart_area.is_finite() {
+		return Err(Error::TriangulationFailed);
+	}
+	let target_direction = if face.reversed { -1.0 } else { 1.0 };
+	if chart_area * target_direction < 0.0 {
+		triangle.swap(1, 2);
+	}
+
+	let points = triangle.map(|index| vertices[index]);
+	let area = (points[1] - points[0]).cross(points[2] - points[0]);
+	if !area.is_finite() {
+		return Err(Error::TriangulationFailed);
+	}
+	if area.length_squared() <= triangle_area_threshold(points) {
+		if triangle_has_collapsed_edge(points) {
+			return Ok(());
+		}
+		return Err(Error::TriangulationFailed);
+	}
+	let expected = triangle.into_iter().map(|index| normals[index]).sum::<DVec3>();
+	if expected.length_squared() > 1.0e-24 && area.dot(expected) < 0.0 {
+		if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+			eprintln!("custom tessellation face {} chart orientation disagrees with exact surface normal for triangle {triangle:?}", face.index);
+		}
+		return Err(Error::TriangulationFailed);
+	}
+	for index in triangle {
+		indices.push(u32::try_from(index).map_err(|_| Error::TriangulationFailed)?);
+	}
+	Ok(())
+}
+
 fn triangle_area_threshold(points: [DVec3; 3]) -> f64 {
 	let maximum_edge_squared = [(points[1] - points[0]).length_squared(), (points[2] - points[1]).length_squared(), (points[0] - points[2]).length_squared()].into_iter().fold(0.0, f64::max);
 	(maximum_edge_squared * maximum_edge_squared * 1.0e-24).max(1.0e-30)
@@ -2387,10 +2806,6 @@ fn triangle_has_collapsed_edge(points: [DVec3; 3]) -> bool {
 	let edge_squared = [(points[1] - points[0]).length_squared(), (points[2] - points[1]).length_squared(), (points[0] - points[2]).length_squared()];
 	let maximum = edge_squared.into_iter().fold(0.0, f64::max);
 	edge_squared.into_iter().fold(f64::INFINITY, f64::min) <= (maximum * 1.0e-24).max(1.0e-30)
-}
-
-fn split_quality(triangles: [[usize; 3]; 2], vertices: &[DVec3]) -> f64 {
-	triangles.into_iter().map(|triangle| triangle_aspect(triangle.map(|index| vertices[index]))).filter(|aspect| aspect.is_finite()).fold(0.0, f64::max)
 }
 
 fn oriented_surface_normal(face: &TrimmedFace, uv: DVec2) -> Option<DVec3> {
@@ -2463,7 +2878,7 @@ fn fill_singular_normals(face: &TrimmedFace, uvs: &[DVec2], vertices: &[DVec3], 
 /// final connectivity and arbitrary trimmed faces retain the general path,
 /// but these coherent seeds prevent long diagonals and centroid-refinement
 /// pinwheels on the semi-organic surfaces that dominate CAD presentation.
-fn seed_structured_patch(face: &TrimmedFace, metric: MetricMap, triangulation: &mut FaceTriangulation) {
+fn seed_structured_patch(face: &TrimmedFace, chart: FaceChart, insertion_domain: &InsertionDomain, triangulation: &mut FaceTriangulation) {
 	let Some(trim_loop) = face.loops.first().filter(|_| face.loops.len() == 1) else {
 		return;
 	};
@@ -2496,13 +2911,21 @@ fn seed_structured_patch(face: &TrimmedFace, metric: MetricMap, triangulation: &
 	let u_boundary_intervals = horizontal.iter().map(|run| run.len().saturating_sub(1)).max().unwrap_or(1).max(1);
 	let v_boundary_intervals = vertical.iter().map(|run| run.len().saturating_sub(1)).max().unwrap_or(1).max(1);
 	let metric_u = {
-		let first = metric.map(DVec2::new(u_min, (v_min + v_max) * 0.5));
-		let second = metric.map(DVec2::new(u_max, (v_min + v_max) * 0.5));
+		let Some(first) = chart.map_uv(face, DVec2::new(u_min, (v_min + v_max) * 0.5)) else {
+			return;
+		};
+		let Some(second) = chart.map_uv(face, DVec2::new(u_max, (v_min + v_max) * 0.5)) else {
+			return;
+		};
 		((second.x - first.x).powi(2) + (second.y - first.y).powi(2)).sqrt()
 	};
 	let metric_v = {
-		let first = metric.map(DVec2::new((u_min + u_max) * 0.5, v_min));
-		let second = metric.map(DVec2::new((u_min + u_max) * 0.5, v_max));
+		let Some(first) = chart.map_uv(face, DVec2::new((u_min + u_max) * 0.5, v_min)) else {
+			return;
+		};
+		let Some(second) = chart.map_uv(face, DVec2::new((u_min + u_max) * 0.5, v_max)) else {
+			return;
+		};
 		((second.x - first.x).powi(2) + (second.y - first.y).powi(2)).sqrt()
 	};
 	if !metric_u.is_finite() || !metric_v.is_finite() || metric_u <= 1.0e-12 || metric_v <= 1.0e-12 {
@@ -2527,7 +2950,7 @@ fn seed_structured_patch(face: &TrimmedFace, metric: MetricMap, triangulation: &
 			let u = u_min + u_range * u_index as f64 / u_intervals as f64;
 			let uv = DVec2::new(u, v);
 			if point_in_trim(uv, &face.loops) {
-				insert_interior_vertex(face, triangulation, uv, metric);
+				insert_interior_vertex(face, triangulation, uv, chart, insertion_domain);
 			}
 		}
 	}
@@ -2544,12 +2967,15 @@ fn seed_structured_patch(face: &TrimmedFace, metric: MetricMap, triangulation: &
 /// chart. The samples are unconstrained, so Delaunay still owns connectivity,
 /// while their spacing supplies the boundary-size field that a patch-aware
 /// mesher needs.
-fn seed_boundary_collar(face: &TrimmedFace, metric: MetricMap, triangulation: &mut FaceTriangulation) {
+fn seed_boundary_collar(face: &TrimmedFace, chart: FaceChart, insertion_domain: &InsertionDomain, triangulation: &mut FaceTriangulation) {
 	for trim_loop in &face.loops {
 		if trim_loop.vertices.len() < 3 {
 			continue;
 		}
-		let points = trim_loop.vertices.iter().map(|vertex| metric.map(vertex.uv)).collect::<Vec<_>>();
+		let points = trim_loop.vertices.iter().filter_map(|vertex| chart.map_boundary(face, vertex)).collect::<Vec<_>>();
+		if points.len() != trim_loop.vertices.len() {
+			continue;
+		}
 		let signed_area = (0..points.len())
 			.map(|index| {
 				let first = points[index];
@@ -2584,9 +3010,9 @@ fn seed_boundary_collar(face: &TrimmedFace, metric: MetricMap, triangulation: &m
 				for _ in 0..6 {
 					for sign in [1.0, -1.0] {
 						let candidate = Point2::new(current.x + direction.x * distance * sign, current.y + direction.y * distance * sign);
-						if let Some(uv) = metric.unmap(candidate) {
+						if let Some(uv) = chart.unmap(face, candidate) {
 							if point_in_trim(uv, &face.loops) {
-								insert_interior_vertex(face, triangulation, uv, metric);
+								insert_interior_vertex(face, triangulation, uv, chart, insertion_domain);
 								inserted = true;
 								break;
 							}
@@ -2605,6 +3031,164 @@ fn seed_boundary_collar(face: &TrimmedFace, metric: MetricMap, triangulation: &m
 	}
 }
 
+struct InsertionDomain {
+	loops: Vec<Vec<Point2<f64>>>,
+	minimum: Point2<f64>,
+	maximum: Point2<f64>,
+	extent: f64,
+	representative_boundary_length: f64,
+}
+
+impl InsertionDomain {
+	fn from_face(face: &TrimmedFace, chart: FaceChart) -> Option<Self> {
+		let loops = face.loops.iter().map(|trim_loop| trim_loop.vertices.iter().filter_map(|vertex| chart.map_boundary(face, vertex)).collect::<Vec<_>>()).collect::<Vec<_>>();
+		if loops.iter().zip(&face.loops).any(|(mapped, trim_loop)| mapped.len() != trim_loop.vertices.len()) {
+			return None;
+		}
+		let mut boundary_lengths = loops
+			.iter()
+			.flat_map(|trim_loop| {
+				(0..trim_loop.len()).filter_map(|index| {
+					let length = metric_distance(trim_loop[index], trim_loop[(index + 1) % trim_loop.len()]);
+					(length.is_finite() && length > 1.0e-12).then_some(length)
+				})
+			})
+			.collect::<Vec<_>>();
+		if boundary_lengths.is_empty() {
+			return None;
+		}
+		boundary_lengths.sort_by(f64::total_cmp);
+		let representative_boundary_length = boundary_lengths[(boundary_lengths.len() * 3 / 5).min(boundary_lengths.len() - 1)];
+		let (minimum, maximum) = loops.iter().flatten().fold((Point2::new(f64::INFINITY, f64::INFINITY), Point2::new(f64::NEG_INFINITY, f64::NEG_INFINITY)), |(minimum, maximum), point| (Point2::new(minimum.x.min(point.x), minimum.y.min(point.y)), Point2::new(maximum.x.max(point.x), maximum.y.max(point.y))));
+		let extent = (maximum.x - minimum.x).abs().max((maximum.y - minimum.y).abs());
+		(extent.is_finite() && extent > 1.0e-12).then_some(Self { loops, minimum, maximum, extent, representative_boundary_length })
+	}
+
+	fn lattice_spacing(&self, linear: f64) -> Option<f64> {
+		let spacing = self.representative_boundary_length.max(self.extent / 128.0).max(linear * 1.5).min(self.extent / 8.0);
+		(spacing.is_finite() && spacing > 1.0e-12).then_some(spacing)
+	}
+
+	fn distance_to_boundary(&self, point: Point2<f64>) -> f64 {
+		metric_distance_to_loops(point, &self.loops)
+	}
+
+	fn numeric_boundary_clearance(&self) -> f64 {
+		self.extent.max(1.0) * 1.0e-10
+	}
+
+	fn duplicate_tolerance(&self) -> f64 {
+		self.extent.max(1.0) * 1.0e-12
+	}
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LatticePattern {
+	angle: f64,
+	x_phase: f64,
+	y_phase: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PlanarMeshQuality {
+	worst_aspect: f64,
+	p95_aspect: f64,
+	minimum_angle_degrees: f64,
+	p05_minimum_angle_degrees: f64,
+	mean_aspect: f64,
+	vertex_count: usize,
+}
+
+impl PlanarMeshQuality {
+	fn from_mesh(mesh: &MeshedFace) -> Option<Self> {
+		let triangles = mesh.indices.chunks_exact(3).map(|triangle| [mesh.vertices[triangle[0] as usize], mesh.vertices[triangle[1] as usize], mesh.vertices[triangle[2] as usize]]).collect::<Vec<_>>();
+		let mut aspects = triangles.iter().copied().map(triangle_aspect).collect::<Vec<_>>();
+		let mut minimum_angles = triangles.iter().copied().map(triangle_minimum_angle_degrees).collect::<Option<Vec<_>>>()?;
+		if aspects.is_empty() || aspects.iter().any(|aspect| !aspect.is_finite()) {
+			return None;
+		}
+		let worst_aspect = aspects.iter().copied().fold(0.0, f64::max);
+		let mean_aspect = aspects.iter().sum::<f64>() / aspects.len() as f64;
+		let p95_aspect = percentile(&mut aspects, 0.95)?;
+		let minimum_angle_degrees = minimum_angles.iter().copied().fold(f64::INFINITY, f64::min);
+		let p05_minimum_angle_degrees = percentile(&mut minimum_angles, 0.05)?;
+		Some(Self { worst_aspect, p95_aspect, minimum_angle_degrees, p05_minimum_angle_degrees, mean_aspect, vertex_count: mesh.vertices.len() })
+	}
+
+	fn improves(self, current: Self) -> bool {
+		self.target_penalty().total_cmp(&current.target_penalty()).then_with(|| self.p95_aspect.total_cmp(&current.p95_aspect)).then_with(|| current.p05_minimum_angle_degrees.total_cmp(&self.p05_minimum_angle_degrees)).then_with(|| self.worst_aspect.total_cmp(&current.worst_aspect)).then_with(|| self.mean_aspect.total_cmp(&current.mean_aspect)).then_with(|| self.vertex_count.cmp(&current.vertex_count)).is_lt()
+	}
+
+	fn meets_quality_target(self) -> bool {
+		self.worst_aspect <= 30.0 && self.p95_aspect <= 4.0 && self.minimum_angle_degrees >= 0.75 && self.p05_minimum_angle_degrees >= 15.0
+	}
+
+	fn target_penalty(self) -> f64 {
+		(self.worst_aspect / 30.0).max(self.p95_aspect / 4.0).max(0.75 / self.minimum_angle_degrees.max(f64::MIN_POSITIVE)).max(15.0 / self.p05_minimum_angle_degrees.max(f64::MIN_POSITIVE))
+	}
+}
+
+fn triangle_minimum_angle_degrees(points: [DVec3; 3]) -> Option<f64> {
+	let mut minimum = f64::INFINITY;
+	for corner in 0..3 {
+		let first = (points[(corner + 1) % 3] - points[corner]).try_normalize()?;
+		let second = (points[(corner + 2) % 3] - points[corner]).try_normalize()?;
+		minimum = minimum.min(first.dot(second).clamp(-1.0, 1.0).acos().to_degrees());
+	}
+	Some(minimum)
+}
+
+/// Selects a deterministic planar lattice by measuring the constrained mesh,
+/// not by assuming one world-axis phase is suitable for every trim.
+///
+/// A triangular lattice is isotropic in its interior, but its first row can be
+/// almost tangent to a curved canonical trim sample for one particular phase.
+/// That creates a visible sliver even though both the lattice and the CDT are
+/// individually well behaved. Planar faces are inexpensive to evaluate, so a
+/// small, fixed pattern set is built independently and ranked by physical
+/// worst-case, p95, and mean aspect. The exact constrained boundary is cloned
+/// unchanged into every trial; only unconstrained interior points differ.
+fn seed_best_planar_lattice(face: &TrimmedFace, chart: FaceChart, linear: f64, insertion_domain: &InsertionDomain, base: FaceTriangulation) -> Result<FaceTriangulation, Error> {
+	const PATTERNS: [LatticePattern; 8] = [
+		LatticePattern { angle: 0.0, x_phase: 0.0, y_phase: 0.0 },
+		LatticePattern { angle: 0.0, x_phase: 0.5, y_phase: 0.5 },
+		LatticePattern { angle: std::f64::consts::PI / 12.0, x_phase: 0.0, y_phase: 0.5 },
+		LatticePattern { angle: std::f64::consts::PI / 12.0, x_phase: 0.5, y_phase: 0.0 },
+		LatticePattern { angle: std::f64::consts::PI / 6.0, x_phase: 0.25, y_phase: 0.25 },
+		LatticePattern { angle: std::f64::consts::PI / 6.0, x_phase: 0.75, y_phase: 0.75 },
+		LatticePattern { angle: std::f64::consts::PI / 4.0, x_phase: 0.25, y_phase: 0.75 },
+		LatticePattern { angle: std::f64::consts::PI / 4.0, x_phase: 0.75, y_phase: 0.25 },
+	];
+
+	let mut best = None::<(PlanarMeshQuality, FaceTriangulation)>;
+	for (pattern_index, pattern) in PATTERNS.into_iter().enumerate() {
+		let mut trial = base.clone();
+		seed_metric_lattice_pattern(face, chart, linear, insertion_domain, pattern, &mut trial);
+		let Ok(mesh) = build_face_mesh(face, &trial) else {
+			continue;
+		};
+		let Some(quality) = PlanarMeshQuality::from_mesh(&mesh) else {
+			continue;
+		};
+		if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+			eprintln!("custom tessellation face {} planar lattice pattern {pattern_index} {pattern:?}: {quality:?}", face.index);
+		}
+		if quality.meets_quality_target() {
+			return Ok(trial);
+		}
+		if best.as_ref().is_none_or(|(current, _)| quality.improves(*current)) {
+			best = Some((quality, trial));
+		}
+	}
+	let Some((_, triangulation)) = best else {
+		if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+			eprintln!("custom tessellation face {} found no valid seeded planar lattice; retaining its constrained boundary triangulation", face.index);
+		}
+		return Ok(base);
+	};
+	Ok(triangulation)
+}
+
 /// Seeds arbitrary trimmed charts with a coherent triangular lattice in the
 /// local first-fundamental-form metric.
 ///
@@ -2614,55 +3198,46 @@ fn seed_boundary_collar(face: &TrimmedFace, metric: MetricMap, triangulation: &m
 /// isotropic interior size field up front. Points stay away from the immutable
 /// exact boundary by a fraction of one cell, leaving a single graded collar
 /// for the constrained triangulation to fill.
-fn seed_metric_lattice(face: &TrimmedFace, metric: MetricMap, linear: f64, triangulation: &mut FaceTriangulation) {
+fn seed_metric_lattice(face: &TrimmedFace, chart: FaceChart, linear: f64, insertion_domain: &InsertionDomain, triangulation: &mut FaceTriangulation) {
+	seed_metric_lattice_pattern(face, chart, linear, insertion_domain, LatticePattern { angle: 0.0, x_phase: 0.0, y_phase: 0.0 }, triangulation);
+}
+
+fn seed_metric_lattice_pattern(face: &TrimmedFace, chart: FaceChart, linear: f64, insertion_domain: &InsertionDomain, pattern: LatticePattern, triangulation: &mut FaceTriangulation) {
 	const MAXIMUM_LATTICE_POINTS: usize = 32_768;
-	let metric_loops = face.loops.iter().map(|trim_loop| trim_loop.vertices.iter().map(|vertex| metric.map(vertex.uv)).collect::<Vec<_>>()).collect::<Vec<_>>();
-	let mut boundary_lengths = metric_loops
-		.iter()
-		.flat_map(|trim_loop| {
-			(0..trim_loop.len()).filter_map(|index| {
-				let first = trim_loop[index];
-				let second = trim_loop[(index + 1) % trim_loop.len()];
-				let length = metric_distance(first, second);
-				(length.is_finite() && length > 1.0e-12).then_some(length)
-			})
-		})
-		.collect::<Vec<_>>();
-	if boundary_lengths.is_empty() {
+	let Some(spacing) = insertion_domain.lattice_spacing(linear) else {
 		return;
-	}
-	boundary_lengths.sort_by(f64::total_cmp);
-	let representative = boundary_lengths[(boundary_lengths.len() * 3 / 5).min(boundary_lengths.len() - 1)];
-	let (minimum, maximum) = metric_loops.iter().flatten().fold((Point2::new(f64::INFINITY, f64::INFINITY), Point2::new(f64::NEG_INFINITY, f64::NEG_INFINITY)), |(minimum, maximum), point| (Point2::new(minimum.x.min(point.x), minimum.y.min(point.y)), Point2::new(maximum.x.max(point.x), maximum.y.max(point.y))));
+	};
+	let center = Point2::new((insertion_domain.minimum.x + insertion_domain.maximum.x) * 0.5, (insertion_domain.minimum.y + insertion_domain.maximum.y) * 0.5);
+	let cosine = pattern.angle.cos();
+	let sine = pattern.angle.sin();
+	let to_lattice = |point: Point2<f64>| {
+		let x = point.x - center.x;
+		let y = point.y - center.y;
+		Point2::new(x * cosine + y * sine, -x * sine + y * cosine)
+	};
+	let from_lattice = |point: Point2<f64>| Point2::new(center.x + point.x * cosine - point.y * sine, center.y + point.x * sine + point.y * cosine);
+	let (minimum, maximum) = insertion_domain.loops.iter().flatten().map(|point| to_lattice(*point)).fold((Point2::new(f64::INFINITY, f64::INFINITY), Point2::new(f64::NEG_INFINITY, f64::NEG_INFINITY)), |(minimum, maximum), point| (Point2::new(minimum.x.min(point.x), minimum.y.min(point.y)), Point2::new(maximum.x.max(point.x), maximum.y.max(point.y))));
 	let width = maximum.x - minimum.x;
 	let height = maximum.y - minimum.y;
-	let maximum_extent = width.max(height);
-	if !maximum_extent.is_finite() || maximum_extent <= 1.0e-12 {
-		return;
-	}
-	let spacing = representative.max(maximum_extent / 128.0).max(linear * 1.5).min(maximum_extent / 8.0);
-	if !spacing.is_finite() || spacing <= 1.0e-12 {
-		return;
-	}
 	let row_step = spacing * 3.0_f64.sqrt() * 0.5;
-	let columns = (width / spacing).ceil() as usize + 2;
-	let rows = (height / row_step).ceil() as usize + 2;
+	let columns = (width / spacing).ceil() as usize + 3;
+	let rows = (height / row_step).ceil() as usize + 3;
 	if columns.saturating_mul(rows) > MAXIMUM_LATTICE_POINTS {
 		return;
 	}
 	let boundary_clearance = spacing * 0.28;
 	for row in 0..rows {
-		let y = minimum.y + row as f64 * row_step;
+		let y = minimum.y + (row as f64 - 1.0 + pattern.y_phase) * row_step;
 		let offset = if row.is_multiple_of(2) { 0.0 } else { spacing * 0.5 };
 		for column in 0..columns {
-			let point = Point2::new(minimum.x + column as f64 * spacing + offset, y);
-			let Some(uv) = metric.unmap(point) else {
+			let point = from_lattice(Point2::new(minimum.x + (column as f64 - 1.0 + pattern.x_phase) * spacing + offset, y));
+			let Some(uv) = chart.unmap(face, point) else {
 				continue;
 			};
-			if !point_in_trim(uv, &face.loops) || metric_distance_to_loops(point, &metric_loops) < boundary_clearance {
+			if !point_in_trim(uv, &face.loops) || insertion_domain.distance_to_boundary(point) < boundary_clearance {
 				continue;
 			}
-			insert_interior_vertex(face, triangulation, uv, metric);
+			insert_interior_vertex(face, triangulation, uv, chart, insertion_domain);
 		}
 	}
 }
@@ -2683,8 +3258,10 @@ fn metric_point_segment_distance(point: Point2<f64>, first: Point2<f64>, second:
 	metric_distance(point, closest)
 }
 
-fn insert_interior_vertex(face: &TrimmedFace, triangulation: &mut FaceTriangulation, uv: DVec2, metric: MetricMap) {
-	let metric_position = metric.map(uv);
+fn insert_interior_vertex(face: &TrimmedFace, triangulation: &mut FaceTriangulation, uv: DVec2, chart: FaceChart, insertion_domain: &InsertionDomain) {
+	let Some(metric_position) = chart.map_uv(face, uv) else {
+		return;
+	};
 	// Refinement probes can round onto, or a few ULPs inside, an immutable trim
 	// constraint. Spade may classify such a point as lying in the face rather
 	// than on the constraint. Inserting it creates a fan of nearly coincident
@@ -2692,21 +3269,8 @@ fn insert_interior_vertex(face: &TrimmedFace, triangulation: &mut FaceTriangulat
 	// improving the surface. Canonical boundary samples already satisfy the
 	// curve tolerance, so keep a scale-relative numerical exclusion zone around
 	// every trim segment.
-	let metric_extent = face.loops.iter().flat_map(|trim_loop| trim_loop.vertices.iter().map(|vertex| metric.map(vertex.uv))).fold((Point2::new(f64::INFINITY, f64::INFINITY), Point2::new(f64::NEG_INFINITY, f64::NEG_INFINITY)), |(minimum, maximum), point| (Point2::new(minimum.x.min(point.x), minimum.y.min(point.y)), Point2::new(maximum.x.max(point.x), maximum.y.max(point.y))));
-	let extent = (metric_extent.1.x - metric_extent.0.x).abs().max((metric_extent.1.y - metric_extent.0.y).abs()).max(1.0);
-	let boundary_clearance = extent * 1.0e-10;
-	let distance_to_boundary = face
-		.loops
-		.iter()
-		.filter(|trim_loop| trim_loop.vertices.len() >= 2)
-		.flat_map(|trim_loop| {
-			(0..trim_loop.vertices.len()).map(|index| {
-				let first = metric.map(trim_loop.vertices[index].uv);
-				let second = metric.map(trim_loop.vertices[(index + 1) % trim_loop.vertices.len()].uv);
-				metric_point_segment_distance(metric_position, first, second)
-			})
-		})
-		.fold(f64::INFINITY, f64::min);
+	let boundary_clearance = insertion_domain.numeric_boundary_clearance();
+	let distance_to_boundary = insertion_domain.distance_to_boundary(metric_position);
 	if distance_to_boundary <= boundary_clearance {
 		return;
 	}
@@ -2717,7 +3281,7 @@ fn insert_interior_vertex(face: &TrimmedFace, triangulation: &mut FaceTriangulat
 	// scale-relative numerical duplicate of an existing vertex; this is orders
 	// of magnitude below any supported geometric refinement spacing.
 	let location = triangulation.locate(metric_position);
-	let duplicate_tolerance = extent * 1.0e-12;
+	let duplicate_tolerance = insertion_domain.duplicate_tolerance();
 	let near_duplicate = match location {
 		PositionInTriangulation::OnVertex(_) => true,
 		PositionInTriangulation::OnEdge(edge) | PositionInTriangulation::OutsideOfConvexHull(edge) => triangulation.directed_edge(edge).vertices().into_iter().any(|vertex| metric_distance(vertex.position(), metric_position) <= duplicate_tolerance),
@@ -2766,115 +3330,113 @@ struct RefinementCandidate {
 	uv: DVec2,
 }
 
-fn refinement_candidates(face: &TrimmedFace, triangulation: &FaceTriangulation, linear: f64, angular: f64) -> Vec<RefinementCandidate> {
-	triangulation
-		.inner_faces()
-		.flat_map(|triangle| {
-			let vertices = triangle.vertices();
-			let handles = vertices.map(|vertex| vertex.fix());
-			let parametric = vertices.map(|vertex| *vertex.data());
-			let uv = parametric.map(|vertex| vertex.uv);
-			let center = (uv[0] + uv[1] + uv[2]) / 3.0;
-			if !point_in_trim(center, &face.loops) {
-				return Vec::new();
-			}
-			let samples = uv.map(|point| face.surface.evaluate(point));
-			let [Some(first), Some(second), Some(third)] = samples else {
-				return Vec::new();
-			};
-			let Some(center_sample) = face.surface.evaluate(center) else {
-				return Vec::new();
-			};
-			let samples = [first, second, third];
-			let positions = std::array::from_fn(|index| parametric[index].boundary_position.unwrap_or(samples[index].position));
-			let geometric = (positions[1] - positions[0]).cross(positions[2] - positions[0]);
-			let Some(mut geometric_normal) = geometric.try_normalize() else {
-				return Vec::new();
-			};
-			let Some(expected_normal) = center_sample.normal() else {
-				return Vec::new();
-			};
-			if geometric_normal.dot(expected_normal) < 0.0 {
-				geometric_normal = -geometric_normal;
-			}
+fn refinement_candidates(face: &TrimmedFace, triangulation: &FaceTriangulation, linear: f64, angular: f64, progress: &ffi::CancellationToken) -> Result<Vec<RefinementCandidate>, Error> {
+	const RETAINED_CANDIDATE_MULTIPLIER: usize = 4;
+	let required_capacity = MAXIMUM_REQUIRED_INSERTIONS_PER_PASS * RETAINED_CANDIDATE_MULTIPLIER;
+	let quality_capacity = MAXIMUM_QUALITY_INSERTIONS_PER_PASS * RETAINED_CANDIDATE_MULTIPLIER;
+	let mut required_candidates = Vec::with_capacity(required_capacity);
+	let mut quality_candidates = Vec::with_capacity(quality_capacity);
 
-			// A parametric midpoint is generally not the physical midpoint of a
-			// rational surface chord. Measure the exact sample against the whole
-			// approximating primitive instead, and refine at the sample that
-			// actually violates the requested tolerance most severely.
-			let mut required = Vec::with_capacity(4);
-			let center_deviation = point_triangle_distance(center_sample.position, positions);
-			push_surface_probe(&mut required, center, center_sample, center_deviation, geometric_normal, linear, angular);
-			for edge in 0..3 {
-				let next = (edge + 1) % 3;
-				if triangulation.get_edge_from_neighbors(handles[edge], handles[next]).is_some_and(|edge| edge.is_constraint_edge()) {
-					continue;
-				}
-				let midpoint_uv = (uv[edge] + uv[next]) * 0.5;
-				if let Some(midpoint) = face.surface.evaluate(midpoint_uv) {
-					let deviation = point_segment_distance(midpoint.position, positions[edge], positions[next]);
-					push_surface_probe(&mut required, midpoint_uv, midpoint, deviation, geometric_normal, linear, angular);
-				}
-			}
-			if !required.is_empty() {
-				return required;
-			}
+	for (triangle_index, triangle) in triangulation.inner_faces().enumerate() {
+		if triangle_index.is_multiple_of(256) && progress.is_cancelled() {
+			return Err(Error::Cancelled);
+		}
+		let vertices = triangle.vertices();
+		let handles = vertices.map(|vertex| vertex.fix());
+		let parametric = vertices.map(|vertex| *vertex.data());
+		let uv = parametric.map(|vertex| vertex.uv);
+		let center = (uv[0] + uv[1] + uv[2]) / 3.0;
+		if !point_in_trim(center, &face.loops) {
+			continue;
+		}
+		let [Some(first), Some(second), Some(third)] = uv.map(|point| face.surface.evaluate(point)) else {
+			continue;
+		};
+		let Some(center_sample) = face.surface.evaluate(center) else {
+			continue;
+		};
+		let samples = [first, second, third];
+		let positions = std::array::from_fn(|index| parametric[index].boundary_position.unwrap_or(samples[index].position));
+		let Some(mut geometric_normal) = (positions[1] - positions[0]).cross(positions[2] - positions[0]).try_normalize() else {
+			continue;
+		};
+		let Some(expected_normal) = center_sample.normal() else {
+			continue;
+		};
+		if geometric_normal.dot(expected_normal) < 0.0 {
+			geometric_normal = -geometric_normal;
+		}
 
-			let aspect = triangle_aspect(positions);
-			// Leave a small relative dead band around the quality threshold. The
-			// same physical triangle translated far from the origin can differ by
-			// a few ULPs after coordinate subtraction; that must not change the
-			// refinement topology.
-			if aspect > MAXIMUM_PHYSICAL_ASPECT * (1.0 + 1.0e-9) {
-				let circumcenter = triangle.circumcenter();
-				let barycentric = triangle.barycentric_interpolation(circumcenter);
-				// Circumcenters are the right Delaunay insertion for acute
-				// triangles. For an obtuse sliver the circumcenter lies beyond the
-				// longest edge; repeatedly inserting it can converge toward an
-				// unrelated vertex or constraint and create the tiny near-duplicate
-				// cells that quality refinement is intended to remove. Split the
-				// longest unconstrained interior edge in that case. The subsequent
-				// Delaunay legalization improves both incident triangles together.
-				let candidate_uv = uv[0] * barycentric[0] + uv[1] * barycentric[1] + uv[2] * barycentric[2];
-				// With immutable exact trim segments, an obtuse triangle whose
-				// circumcenter lies outside itself may be encroaching a boundary
-				// segment. Splitting that segment locally would crack the adjacent
-				// face, while repeatedly inserting interior off-centers converges
-				// toward it. The metric lattice supplies the boundary collar; only
-				// perform the usual safe circumcenter insertion for an acute cell.
-				if barycentric.iter().all(|weight| *weight >= 0.05) && candidate_uv.is_finite() && point_in_trim(candidate_uv, &face.loops) {
-					return vec![RefinementCandidate {
-							required: false,
-							score: aspect / TARGET_PHYSICAL_ASPECT,
-							// A CDT circumcenter improves neighboring cells together.
-							// Unlike a centroid, it does not create three progressively
-							// skinnier triangles around an already-poor cell.
-							uv: candidate_uv,
-						}];
-				} else {
-					// An obtuse sliver has an exterior circumcenter, so it cannot be
-					// repaired by the usual Delaunay insertion. Split its longest
-					// unconstrained physical edge instead. This preserves immutable
-					// canonical trim segments and lets edge legalization improve both
-					// incident cells rather than creating a still-thinner centroid fan.
-					let longest_interior_edge = (0..3)
-						.filter_map(|edge| {
-							let next = (edge + 1) % 3;
-							let constrained = triangulation.get_edge_from_neighbors(handles[edge], handles[next]).is_some_and(|edge| edge.is_constraint_edge());
-							(!constrained).then_some((positions[edge].distance_squared(positions[next]), edge, next))
-						})
-						.max_by(|first, second| first.0.total_cmp(&second.0));
-					if let Some((_, edge, next)) = longest_interior_edge {
-						let midpoint = (uv[edge] + uv[next]) * 0.5;
-						if midpoint.is_finite() && point_in_trim(midpoint, &face.loops) {
-							return vec![RefinementCandidate { required: false, score: aspect / TARGET_PHYSICAL_ASPECT, uv: midpoint }];
-						}
-					}
-				}
+		// Retain the worst mandatory probe per triangle. Refining every center
+		// and midpoint from a single cell in one pass creates redundant sites;
+		// selecting its maximum error provides the same convergence path while
+		// keeping the work queue strictly proportional to the triangle count.
+		let mut required = Vec::with_capacity(4);
+		let center_deviation = point_triangle_distance(center_sample.position, positions);
+		push_surface_probe(&mut required, center, center_sample, center_deviation, geometric_normal, linear, angular);
+		for edge in 0..3 {
+			let next = (edge + 1) % 3;
+			if triangulation.get_edge_from_neighbors(handles[edge], handles[next]).is_some_and(|edge| edge.is_constraint_edge()) {
+				continue;
 			}
-			Vec::new()
-		})
-		.collect()
+			let midpoint_uv = (uv[edge] + uv[next]) * 0.5;
+			if let Some(midpoint) = face.surface.evaluate(midpoint_uv) {
+				let deviation = point_segment_distance(midpoint.position, positions[edge], positions[next]);
+				push_surface_probe(&mut required, midpoint_uv, midpoint, deviation, geometric_normal, linear, angular);
+			}
+		}
+		if let Some(candidate) = required.into_iter().min_by(refinement_candidate_order) {
+			push_bounded_candidate(&mut required_candidates, candidate, required_capacity);
+			continue;
+		}
+
+		let aspect = triangle_aspect(positions);
+		if aspect <= MAXIMUM_PHYSICAL_ASPECT * (1.0 + 1.0e-9) {
+			continue;
+		}
+		let circumcenter = triangle.circumcenter();
+		let barycentric = triangle.barycentric_interpolation(circumcenter);
+		let candidate_uv = uv[0] * barycentric[0] + uv[1] * barycentric[1] + uv[2] * barycentric[2];
+		let quality = if barycentric.iter().all(|weight| *weight >= 0.05) && candidate_uv.is_finite() && point_in_trim(candidate_uv, &face.loops) {
+			Some(RefinementCandidate { required: false, score: aspect / TARGET_PHYSICAL_ASPECT, uv: candidate_uv })
+		} else {
+			// An obtuse sliver has an exterior circumcenter. Split its longest
+			// unconstrained physical edge so Delaunay legalization can improve
+			// both incident cells without touching an exact trim segment.
+			(0..3)
+				.filter_map(|edge| {
+					let next = (edge + 1) % 3;
+					let constrained = triangulation.get_edge_from_neighbors(handles[edge], handles[next]).is_some_and(|edge| edge.is_constraint_edge());
+					(!constrained).then_some((positions[edge].distance_squared(positions[next]), edge, next))
+				})
+				.max_by(|first, second| first.0.total_cmp(&second.0))
+				.and_then(|(_, edge, next)| {
+					let midpoint = (uv[edge] + uv[next]) * 0.5;
+					(midpoint.is_finite() && point_in_trim(midpoint, &face.loops)).then_some(RefinementCandidate { required: false, score: aspect / TARGET_PHYSICAL_ASPECT, uv: midpoint })
+				})
+		};
+		if let Some(candidate) = quality {
+			push_bounded_candidate(&mut quality_candidates, candidate, quality_capacity);
+		}
+	}
+
+	let mut candidates = if required_candidates.is_empty() { quality_candidates } else { required_candidates };
+	candidates.sort_by(refinement_candidate_order);
+	let capacity = if candidates.first().is_some_and(|candidate| candidate.required) { required_capacity } else { quality_capacity };
+	candidates.truncate(capacity);
+	Ok(candidates)
+}
+
+fn refinement_candidate_order(first: &RefinementCandidate, second: &RefinementCandidate) -> std::cmp::Ordering {
+	second.score.total_cmp(&first.score).then_with(|| first.uv.x.total_cmp(&second.uv.x)).then_with(|| first.uv.y.total_cmp(&second.uv.y))
+}
+
+fn push_bounded_candidate(candidates: &mut Vec<RefinementCandidate>, candidate: RefinementCandidate, capacity: usize) {
+	candidates.push(candidate);
+	if candidates.len() > capacity * 2 {
+		candidates.sort_by(refinement_candidate_order);
+		candidates.truncate(capacity);
+	}
 }
 
 fn push_surface_probe(candidates: &mut Vec<RefinementCandidate>, uv: DVec2, sample: SurfaceSample, deviation: f64, geometric_normal: DVec3, linear: f64, angular: f64) {
@@ -3043,7 +3605,17 @@ fn build_face_mesh(face: &TrimmedFace, triangulation: &FaceTriangulation) -> Res
 		indices.extend(triangle.map(|index| remap[index]));
 	}
 	fill_singular_normals(face, &uvs, &vertices, &indices, &mut normals)?;
-	Ok(MeshedFace { index: face.index, tshape_id: face.tshape_id, vertices, uvs, normals, indices, refined_edges: BTreeMap::new(), boundary_refinements: Vec::new() })
+	Ok(MeshedFace {
+		index: face.index,
+		tshape_id: face.tshape_id,
+		vertices,
+		uvs,
+		normals,
+		indices,
+		refined_edges: BTreeMap::new(),
+		boundary_refinements: Vec::new(),
+		quality_exempt_vertices: BTreeSet::new(),
+	})
 }
 
 fn triangle_shares_boundary_occurrence(vertices: [ParametricVertex; 3]) -> bool {
@@ -3381,17 +3953,9 @@ pub(super) struct BoundaryRunProvenance {
 
 #[cfg(feature = "test-support")]
 pub(super) fn boundary_occurrence_metadata_overflow_is_rejected() -> bool {
-	let mut vertex = ParametricVertex {
-		uv: DVec2::ZERO,
-		metric: Point2::new(0.0, 0.0),
-		boundary_position: None,
-		boundary_occurrences: [None, None],
-	};
+	let mut vertex = ParametricVertex { uv: DVec2::ZERO, metric: Point2::new(0.0, 0.0), boundary_position: None, boundary_occurrences: [None, None] };
 	let occurrence = |loop_index| BoundaryOccurrence { loop_index, edge_index: 7, occurrence_index: loop_index };
-	vertex.add_boundary_occurrence(occurrence(0)).is_ok()
-		&& vertex.add_boundary_occurrence(occurrence(0)).is_ok()
-		&& vertex.add_boundary_occurrence(occurrence(1)).is_ok()
-		&& vertex.add_boundary_occurrence(occurrence(2)).is_err()
+	vertex.add_boundary_occurrence(occurrence(0)).is_ok() && vertex.add_boundary_occurrence(occurrence(0)).is_ok() && vertex.add_boundary_occurrence(occurrence(1)).is_ok() && vertex.add_boundary_occurrence(occurrence(2)).is_err()
 }
 
 #[cfg(feature = "test-support")]

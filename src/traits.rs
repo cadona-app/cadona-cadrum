@@ -117,23 +117,25 @@ use glam::{DMat3, DQuat, DVec2, DVec3};
 pub struct Tessellation {
 	/// Linear (chord) deflection: max distance between the facet/segment and the
 	/// true surface/curve. When `relative_linear` is true this is a fraction of
-	/// the edge's bounding-box size rather than an absolute distance.
+	/// a characteristic length rather than an absolute distance. Solid meshes
+	/// use a rigid-transform-invariant scale derived from exact surface area;
+	/// standalone edge approximations use the edge bounds.
 	pub deflection_linear: f64,
 	/// Angular deflection in radians: max angle between adjacent facet/segment
 	/// directions. Controls smoothness of curves independently of scale.
 	pub deflection_angular: f64,
-	/// Interpret `deflection_linear` as relative to the local feature size
-	/// (each edge's bounding-box max dimension) instead of an absolute distance.
+	/// Interpret `deflection_linear` relative to the tessellated geometry's
+	/// characteristic length instead of as an absolute distance.
 	pub relative_linear: bool,
 	/// Include ordered topological edge polylines in the returned mesh.
 	pub include_edges: bool,
-	/// Allow OCCT to parallelize triangulation internally.
+	/// Allow the Rust tessellator to process independent B-rep faces in parallel.
 	pub parallel: bool,
 }
 
 impl Default for Tessellation {
 	fn default() -> Self {
-		// Relative 0.2% linear + 0.5 rad angular: scale-independent and "just
+		// Relative 0.4% linear + 0.5 rad angular: scale-independent and "just
 		// right" for most shapes without over-tessellating.
 		Self { deflection_linear: 0.004, deflection_angular: 0.5, relative_linear: true, include_edges: true, parallel: false }
 	}

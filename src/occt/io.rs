@@ -5,6 +5,7 @@ use super::compound::CompoundShape;
 use super::ffi;
 use super::ffi::{RustReader, RustWriter};
 use super::solid::Solid;
+use super::tessellation;
 use crate::common::error::Error;
 use std::io::{Read, Write};
 
@@ -211,11 +212,8 @@ pub(super) fn mesh<'a>(solids: impl IntoIterator<Item = &'a Solid>, options: cra
 
 	let compound = CompoundShape::new(solids);
 	let progress = ffi::CancellationToken::new();
-	ffi::begin_operation();
-	let data = ffi::mesh_shape(compound.inner(), options.deflection_linear, options.deflection_angular, options.relative_linear, options.parallel, options.include_edges, &progress);
-	if !data.success {
-		return Err(ffi::operation_error(Error::TriangulationFailed, "mesh shape", "mesh"));
-	}
+	let data = custom_mesh_data(compound.inner(), &[], options, &progress)?;
+	validate_flat_mesh_data(&data)?;
 	let vertex_count = data.vertices.len() / 3;
 	let vertices: Vec<DVec3> = (0..vertex_count).map(|i| DVec3::new(data.vertices[i * 3], data.vertices[i * 3 + 1], data.vertices[i * 3 + 2])).collect();
 	let normals: Vec<DVec3> = (0..vertex_count).map(|i| DVec3::new(data.normals[i * 3], data.normals[i * 3 + 1], data.normals[i * 3 + 2])).collect();
@@ -223,9 +221,9 @@ pub(super) fn mesh<'a>(solids: impl IntoIterator<Item = &'a Solid>, options: cra
 	let edge_chunks = decode_edge_chunks(&data, options.include_edges)?;
 	let face_ids = data.face_tshape_ids;
 
-	// Topological edge polylines, NaN-separated. These are read from the same
-	// OCCT polygons-on-triangulation as the surface mesh, so outlines cannot
-	// acquire a different segment count or phase from adjacent face boundaries.
+	// Topological edge polylines, NaN-separated. Every edge is sampled once
+	// from its exact curve and the same canonical sequence anchors every
+	// incident face, so outlines and surface boundaries remain coincident.
 	let mut edges: Vec<DVec3> = Vec::new();
 	for edge in edge_chunks {
 		if !edges.is_empty() {
@@ -263,11 +261,7 @@ pub(super) fn mesh_chunks<'a>(solids: impl IntoIterator<Item = &'a Solid>, optio
 pub(super) fn mesh_chunks_cancelable<'a>(solids: impl IntoIterator<Item = &'a Solid>, options: crate::traits::Tessellation, progress: &ffi::CancellationToken) -> Result<crate::common::mesh::MeshChunks, Error> {
 	let solids = solids.into_iter().collect::<Vec<_>>();
 	let compound = CompoundShape::new(solids.iter().copied());
-	ffi::begin_operation();
-	let data = ffi::mesh_shape(compound.inner(), options.deflection_linear, options.deflection_angular, options.relative_linear, options.parallel, options.include_edges, progress);
-	if progress.is_cancelled() {
-		return Err(Error::Cancelled);
-	}
+	let data = custom_mesh_data(compound.inner(), &[], options, progress)?;
 	decode_mesh_chunks(data, options)
 }
 
@@ -276,12 +270,41 @@ pub(super) fn mesh_face_chunks(solid: &Solid, face_indices: &[u32], options: cra
 }
 
 pub(super) fn mesh_face_chunks_cancelable(solid: &Solid, face_indices: &[u32], options: crate::traits::Tessellation, progress: &ffi::CancellationToken) -> Result<Vec<crate::common::mesh::FaceMeshChunk>, Error> {
+	let data = custom_mesh_data(solid.inner(), face_indices, options, progress)?;
+	Ok(decode_mesh_chunks(data, crate::traits::Tessellation { include_edges: false, ..options })?.faces)
+}
+
+fn custom_mesh_data(shape: &ffi::TopoDS_Shape, face_indices: &[u32], options: crate::traits::Tessellation, progress: &ffi::CancellationToken) -> Result<ffi::MeshData, Error> {
+	if !options.deflection_linear.is_finite() || options.deflection_linear <= 0.0 {
+		return Err(Error::InvalidInput("tessellation linear deflection must be finite and greater than zero".into()));
+	}
+	if !options.deflection_angular.is_finite() || options.deflection_angular <= 0.0 {
+		return Err(Error::InvalidInput("tessellation angular deflection must be finite and greater than zero".into()));
+	}
+	if face_indices.iter().copied().collect::<std::collections::BTreeSet<_>>().len() != face_indices.len() {
+		return Err(Error::InvalidInput("tessellation face selection contains duplicate indices".into()));
+	}
 	ffi::begin_operation();
-	let data = ffi::mesh_shape_faces(solid.inner(), face_indices, options.deflection_linear, options.deflection_angular, options.relative_linear, options.parallel, progress);
+	let source = ffi::extract_brep_mesh_source(shape, face_indices, options.deflection_linear, options.deflection_angular, options.relative_linear, progress);
 	if progress.is_cancelled() {
 		return Err(Error::Cancelled);
 	}
-	Ok(decode_mesh_chunks(data, crate::traits::Tessellation { include_edges: false, ..options })?.faces)
+	if !source.success {
+		return Err(ffi::operation_error(Error::TriangulationFailed, "extract B-rep tessellation source", "extract"));
+	}
+	tessellation::mesh_brep_source(source, options, progress)
+}
+
+fn validate_flat_mesh_data(data: &ffi::MeshData) -> Result<(), Error> {
+	let vertex_count = data.vertices.len() / 3;
+	if !data.success || !data.vertices.len().is_multiple_of(3) || data.normals.len() != data.vertices.len() || !data.indices.len().is_multiple_of(3) || data.face_tshape_ids.len() != data.indices.len() / 3 || data.indices.iter().any(|index| *index as usize >= vertex_count) || data.vertices.iter().any(|value| !value.is_finite()) || data.normals.iter().any(|value| !value.is_finite()) {
+		return Err(Error::TriangulationFailed);
+	}
+	Ok(())
+}
+
+fn valid_ffi_offsets(offsets: &[u32], segment_count: usize, item_count: usize) -> bool {
+	segment_count.checked_add(1).is_some_and(|offset_count| offsets.len() == offset_count) && offsets.first() == Some(&0) && offsets.last().is_some_and(|offset| *offset as usize == item_count) && offsets.windows(2).all(|pair| pair[0] <= pair[1])
 }
 
 pub(super) fn edge_polyline_chunks(solid: &Solid, options: crate::traits::Tessellation) -> Result<Vec<crate::common::mesh::EdgePolylineChunk>, Error> {
@@ -301,7 +324,7 @@ fn decode_edge_chunks(data: &ffi::MeshData, include_edges: bool) -> Result<Vec<c
 		return Ok(Vec::new());
 	}
 	let edge_count = data.chunk_edge_indices.len();
-	if !data.edge_points.len().is_multiple_of(3) || data.edge_point_offsets.len() != edge_count + 1 || data.edge_point_offsets.first() != Some(&0) {
+	if !data.edge_points.len().is_multiple_of(3) || !valid_ffi_offsets(&data.edge_point_offsets, edge_count, data.edge_points.len() / 3) || data.chunk_edge_indices.iter().copied().collect::<std::collections::BTreeSet<_>>().len() != edge_count || data.edge_points.iter().any(|value| !value.is_finite()) {
 		return Err(Error::TriangulationFailed);
 	}
 	let points = data.edge_points.chunks_exact(3).map(|point| DVec3::new(point[0], point[1], point[2])).collect::<Vec<_>>();
@@ -325,7 +348,8 @@ fn decode_mesh_chunks(data: ffi::MeshData, options: crate::traits::Tessellation)
 	use glam::DVec3;
 
 	let face_count = data.chunk_face_tshape_ids.len();
-	if !data.success || !data.vertices.len().is_multiple_of(3) || data.normals.len() != data.vertices.len() || data.chunk_face_indices.len() != face_count || data.face_vertex_offsets.len() != face_count + 1 || data.face_index_offsets.len() != face_count + 1 {
+	let vertex_count = data.vertices.len() / 3;
+	if validate_flat_mesh_data(&data).is_err() || data.chunk_face_indices.len() != face_count || data.chunk_face_indices.iter().copied().collect::<std::collections::BTreeSet<_>>().len() != face_count || !valid_ffi_offsets(&data.face_vertex_offsets, face_count, vertex_count) || !valid_ffi_offsets(&data.face_index_offsets, face_count, data.indices.len()) {
 		return Err(ffi::operation_error(Error::TriangulationFailed, "mesh shape", "mesh"));
 	}
 	let vertices = data.vertices.chunks_exact(3).map(|point| DVec3::new(point[0], point[1], point[2])).collect::<Vec<_>>();
@@ -336,7 +360,7 @@ fn decode_mesh_chunks(data: ffi::MeshData, options: crate::traits::Tessellation)
 		let vertex_end = data.face_vertex_offsets[face_index + 1] as usize;
 		let index_start = data.face_index_offsets[face_index] as usize;
 		let index_end = data.face_index_offsets[face_index + 1] as usize;
-		if vertex_start > vertex_end || vertex_end > vertices.len() || index_start > index_end || index_end > data.indices.len() || !(index_end - index_start).is_multiple_of(3) || data.indices[index_start..index_end].iter().any(|index| (*index as usize) < vertex_start || (*index as usize) >= vertex_end) {
+		if vertex_start == vertex_end || index_start == index_end || !(index_end - index_start).is_multiple_of(3) || data.indices[index_start..index_end].iter().any(|index| (*index as usize) < vertex_start || (*index as usize) >= vertex_end) {
 			return Err(Error::TriangulationFailed);
 		}
 		faces.push(FaceMeshChunk {

@@ -1,19 +1,13 @@
 use cadrum::{DVec3, Error, FailureCategory, ResultTopology, Solid, Tessellation, TopologyKind};
 
 #[test]
-fn caught_occt_exceptions_keep_operation_stage_and_native_message() {
+fn invalid_tessellation_parameters_are_rejected_before_source_extraction() {
 	let cube = Solid::cube(DVec3::ZERO, DVec3::splat(10.0));
 	let error = Solid::mesh_chunks([&cube], Tessellation { deflection_linear: 0.0, ..Tessellation::default() }).expect_err("zero deflection must fail");
 
-	let Error::OperationFailed(failure) = &error else {
-		panic!("expected a structured native exception, got {error:?}");
-	};
-	assert_eq!(failure.operation, "mesh_shape");
-	assert_eq!(failure.stage, "native");
-	assert_eq!(failure.category, FailureCategory::AlgorithmFailed);
-	assert!(failure.exception_type.as_deref().is_some_and(|kind| !kind.is_empty()));
-	assert!(!failure.message.is_empty());
-	assert_eq!(error.category(), FailureCategory::AlgorithmFailed);
+	assert!(matches!(&error, Error::InvalidInput(message) if message.contains("linear deflection")));
+	assert_eq!(error.stage(), "validate_input");
+	assert_eq!(error.category(), FailureCategory::InvalidInput);
 	assert!(error.may_keep_last_valid_result());
 }
 

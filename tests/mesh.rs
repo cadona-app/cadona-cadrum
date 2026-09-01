@@ -31,6 +31,26 @@ fn sphere_normals_come_from_the_surface() {
 	}
 }
 
+#[test]
+fn mesh_rejects_non_finite_or_non_positive_deflection() {
+	let solid = Solid::sphere(5.0);
+	for deflection_linear in [f64::NAN, f64::INFINITY, 0.0, -0.1] {
+		let result = Solid::mesh([&solid], Tessellation { deflection_linear, ..Default::default() });
+		assert!(matches!(result, Err(cadrum::Error::InvalidInput(_))), "linear deflection {deflection_linear:?} must be rejected at the Rust boundary");
+	}
+	for deflection_angular in [f64::NAN, f64::INFINITY, 0.0, -0.1] {
+		let result = Solid::mesh([&solid], Tessellation { deflection_angular, ..Default::default() });
+		assert!(matches!(result, Err(cadrum::Error::InvalidInput(_))), "angular deflection {deflection_angular:?} must be rejected at the Rust boundary");
+	}
+}
+
+#[test]
+fn face_mesh_rejects_duplicate_face_selection() {
+	let solid = Solid::cube(DVec3::ZERO, DVec3::splat(5.0));
+	let result = solid.mesh_face_chunks(&[0, 0], Tessellation::default());
+	assert!(matches!(result, Err(cadrum::Error::InvalidInput(_))));
+}
+
 // ==================== SVG (Scene2D::write_svg) ====================
 
 mod svg {
@@ -185,8 +205,25 @@ mod glb {
 	/// A mesh exceeding 65535 vertices falls back to UNSIGNED_INT (5125) (issue #181).
 	#[test]
 	fn large_u32_indices() {
-		let tess = Tessellation { deflection_linear: 0.0038, relative_linear: false, ..Default::default() }; // ≈66632 verts > 65535
-		let glb = glb_to_file(&[Solid::sphere(50.0)], tess, "glb_large_u32_indices");
+		let mut mesh = Solid::mesh([&Solid::cube(DVec3::ZERO, DVec3::ONE)], Tessellation::default()).expect("seed mesh");
+		mesh.vertices.clear();
+		mesh.normals.clear();
+		mesh.indices.clear();
+		mesh.face_ids.clear();
+		mesh.edges.clear();
+		for triangle in 0..21_846 {
+			let x = f64::from(triangle % 256) * 2.0;
+			let y = f64::from(triangle / 256) * 2.0;
+			let first = mesh.vertices.len();
+			mesh.vertices.extend([DVec3::new(x, y, 0.0), DVec3::new(x + 1.0, y, 0.0), DVec3::new(x, y + 1.0, 0.0)]);
+			mesh.normals.extend([DVec3::Z; 3]);
+			mesh.indices.extend([first, first + 1, first + 2]);
+			mesh.face_ids.push(0);
+		}
+		assert!(mesh.vertices.len() > u16::MAX as usize);
+
+		let mut glb = Vec::new();
+		mesh.write_gltf_binary(&mut glb).expect("serialize large mesh");
 		assert!(glb_json(&glb).contains(r#""componentType":5125"#), "mesh with >65535 vertices must use UNSIGNED_INT index accessors");
 	}
 }

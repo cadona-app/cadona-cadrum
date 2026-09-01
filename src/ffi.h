@@ -25,6 +25,7 @@ struct OperationDiagnosticData;
 
 // Forward-declare shared structs (defined by cxx in ffi.rs.h)
 struct MeshData;
+struct BrepMeshSourceData;
 struct TopologyData;
 struct ValidationData;
 struct HistoryData;
@@ -253,21 +254,15 @@ std::unique_ptr<TopoDS_Edge> edge_ellipse(double major_radius, double minor_radi
 
 // ==================== Meshing ====================
 
-MeshData mesh_shape(
-	const TopoDS_Shape& shape,
-	double linear,
-	double angular,
-	bool relative,
-	bool parallel,
-	bool include_edges,
-	const CancellationToken& progress);
-MeshData mesh_shape_faces(
+// Extracts exact, renderer-neutral B-rep data for the Rust tessellator. An
+// empty `face_indices` slice selects every face. This path never invokes
+// OCCT's triangulation machinery.
+BrepMeshSourceData extract_brep_mesh_source(
 	const TopoDS_Shape& shape,
 	rust::Slice<const uint32_t> face_indices,
 	double linear,
 	double angular,
 	bool relative,
-	bool parallel,
 	const CancellationToken& progress);
 
 // ==================== Topology enumeration ====================

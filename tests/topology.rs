@@ -331,6 +331,33 @@ fn fillet_surface_and_edges_share_one_watertight_triangulation() {
 	}
 }
 
+#[test]
+fn doubly_periodic_torus_chart_keeps_canonical_seams_watertight() {
+	let torus = Solid::torus(8.0, 2.0, DVec3::Z);
+	let options = Tessellation { deflection_linear: 0.08, deflection_angular: 0.2, relative_linear: false, include_edges: true, parallel: false };
+	let chunks = Solid::mesh_chunks([&torus], options).expect("mesh periodic torus");
+
+	assert_eq!(chunks.faces.len(), 1, "the primitive torus should be one doubly periodic face");
+	assert!(!chunks.edges.is_empty(), "periodic seams must remain explicit topological edges");
+	let face = &chunks.faces[0];
+	let mut surface_segments = BTreeMap::new();
+	for triangle in face.indices.chunks_exact(3) {
+		for [first, second] in [[triangle[0], triangle[1]], [triangle[1], triangle[2]], [triangle[2], triangle[0]]] {
+			let key = segment_key(face.vertices[first as usize], face.vertices[second as usize]);
+			if key[0] != key[1] {
+				*surface_segments.entry(key).or_insert(0_usize) += 1;
+			}
+		}
+	}
+	assert!(surface_segments.values().all(|occurrences| occurrences.is_multiple_of(2)), "the single periodic face must close without unmatched seam segments");
+	for edge in &chunks.edges {
+		for segment in edge.points.windows(2) {
+			let key = segment_key(segment[0], segment[1]);
+			assert!(surface_segments.get(&key).is_some_and(|occurrences| occurrences.is_multiple_of(2)), "periodic edge {} segment {segment:?} must use the surface's exact boundary nodes", edge.edge_index);
+		}
+	}
+}
+
 fn segment_key(first: DVec3, second: DVec3) -> [[i64; 3]; 2] {
 	let quantize = |point: DVec3| point.to_array().map(|component| (component * 1.0e9).round() as i64);
 	let first = quantize(first);

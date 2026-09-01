@@ -1,3 +1,8 @@
+use std::{
+	thread,
+	time::{Duration, Instant},
+};
+
 use cadrum::{Boolean, CancellationToken, DVec3, Error, Solid, Tessellation};
 
 #[test]
@@ -53,4 +58,37 @@ fn cancelled_presentation_does_not_publish_partial_chunks() {
 	assert!(matches!(Solid::mesh_chunks_cancelable([&cube], Tessellation::default(), &cancellation), Err(Error::Cancelled)));
 	assert!(matches!(cube.mesh_face_chunks_cancelable(&[0, 1], Tessellation::default(), &cancellation), Err(Error::Cancelled)));
 	assert!(matches!(cube.edge_polyline_chunks_cancelable(Tessellation::default(), &cancellation), Err(Error::Cancelled)));
+	assert_eq!(Solid::mesh_chunks([&cube], Tessellation::default()).expect("later presentation").faces.len(), 6);
+}
+
+#[test]
+fn cancellation_after_source_extraction_stops_rust_refinement() {
+	let solids = (0..32).map(|index| Solid::sphere(10.0).translate(DVec3::X * f64::from(index) * 24.0)).collect::<Vec<_>>();
+	let cancellation = CancellationToken::new();
+	let monitor_token = cancellation.clone();
+	let monitor = thread::spawn(move || {
+		let deadline = Instant::now() + Duration::from_secs(10);
+		loop {
+			let progress = monitor_token.progress();
+			if progress >= 1.0 {
+				return false;
+			}
+			if progress >= 0.25 {
+				monitor_token.cancel();
+				return true;
+			}
+			if Instant::now() >= deadline {
+				monitor_token.cancel();
+				return false;
+			}
+			thread::yield_now();
+		}
+	});
+	let options = Tessellation { deflection_linear: 0.04, deflection_angular: 0.08, relative_linear: false, include_edges: false, parallel: false };
+	let result = Solid::mesh_chunks_cancelable(solids.iter(), options, &cancellation);
+
+	assert!(monitor.join().expect("cancellation monitor"), "the fixture completed before entering Rust face refinement");
+	assert!(matches!(result, Err(Error::Cancelled)));
+	let later = Solid::cube(DVec3::ZERO, DVec3::splat(10.0));
+	assert!(!Solid::mesh_chunks([&later], Tessellation::default()).expect("later tessellation").faces.is_empty());
 }
