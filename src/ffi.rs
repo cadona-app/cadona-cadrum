@@ -245,6 +245,7 @@ mod ffi_bridge {
 		fn shape_validation(shape: &TopoDS_Shape) -> ValidationData;
 		fn shared_face_indices(first: &TopoDS_Shape, second: &TopoDS_Shape) -> Vec<u32>;
 		fn topology_distance(first: &TopoDS_Shape, first_kind: u32, first_index: u32, second: &TopoDS_Shape, second_kind: u32, second_index: u32) -> TopologyDistanceData;
+		fn shape_boundary_distance(first: &TopoDS_Shape, second: &TopoDS_Shape) -> TopologyDistanceData;
 
 		fn clone_shape_handle(shape: &TopoDS_Shape) -> UniquePtr<TopoDS_Shape>;
 		fn clone_edge_handle(edge: &TopoDS_Edge) -> UniquePtr<TopoDS_Edge>;

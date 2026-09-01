@@ -83,6 +83,8 @@ std::unique_ptr<TopoDS_Shape> deep_copy(const TopoDS_Shape& shape);
 TopologyDistanceData topology_distance(
     const TopoDS_Shape& first, uint32_t first_kind, uint32_t first_index,
     const TopoDS_Shape& second, uint32_t second_kind, uint32_t second_index);
+TopologyDistanceData shape_boundary_distance(
+    const TopoDS_Shape& first, const TopoDS_Shape& second);
 
 // ==================== Builders (solid → solid with history) ====================
 //

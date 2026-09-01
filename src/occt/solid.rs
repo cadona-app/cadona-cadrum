@@ -824,6 +824,16 @@ impl Solid {
 		Ok(TopologyDistance { distance: result.distance, first_point: DVec3::new(result.first_x, result.first_y, result.first_z), second_point: DVec3::new(result.second_x, result.second_y, result.second_z) })
 	}
 
+	/// Returns the exact minimum distance between both solids' boundary faces.
+	pub fn boundary_distance(&self, other: &Self) -> Result<TopologyDistance, Error> {
+		ffi::begin_operation();
+		let result = ffi::shape_boundary_distance(&self.inner, &other.inner);
+		if !result.success {
+			return Err(ffi::operation_error(Error::TopologyQueryFailed, "boundary distance", "native"));
+		}
+		Ok(TopologyDistance { distance: result.distance, first_point: DVec3::new(result.first_x, result.first_y, result.first_z), second_point: DVec3::new(result.second_x, result.second_y, result.second_z) })
+	}
+
 	/// Run OCCT's exact B-rep analyzer and report invalid subshape counts.
 	pub fn validate(&self) -> Result<ValidationReport, Error> {
 		ffi::begin_operation();

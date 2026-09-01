@@ -463,6 +463,48 @@ TopologyDistanceData topology_distance(
     return result;
 }
 
+TopologyDistanceData shape_boundary_distance(
+    const TopoDS_Shape& first,
+    const TopoDS_Shape& second) {
+    TopologyDistanceData result{};
+    try {
+        auto boundary = [](const TopoDS_Shape& shape) {
+            TopoDS_Compound faces;
+            BRep_Builder builder;
+            builder.MakeCompound(faces);
+            for (TopExp_Explorer explorer(shape, TopAbs_FACE); explorer.More(); explorer.Next()) {
+                builder.Add(faces, explorer.Current());
+            }
+            return faces;
+        };
+        const TopoDS_Compound first_boundary = boundary(first);
+        const TopoDS_Compound second_boundary = boundary(second);
+        BRepExtrema_DistShapeShape extrema(first_boundary, second_boundary);
+        extrema.Perform();
+        if (!extrema.IsDone() || extrema.NbSolution() < 1) {
+            operation_diagnostic.operation = __func__;
+            operation_diagnostic.stage = "native";
+            operation_diagnostic.message = "OCCT found no boundary-distance solution";
+            operation_diagnostic.category = 3;
+            operation_diagnostic.present = true;
+            return result;
+        }
+        const gp_Pnt first_point = extrema.PointOnShape1(1);
+        const gp_Pnt second_point = extrema.PointOnShape2(1);
+        result.distance = extrema.Value();
+        result.first_x = first_point.X();
+        result.first_y = first_point.Y();
+        result.first_z = first_point.Z();
+        result.second_x = second_point.X();
+        result.second_y = second_point.Y();
+        result.second_z = second_point.Z();
+        result.success = std::isfinite(result.distance) && result.distance >= 0.0;
+    } catch (const Standard_Failure& failure) {
+        record_standard_failure(__func__, "native", 7, failure);
+    }
+    return result;
+}
+
 // ==================== STEP read post-processing ====================
 
 // Recover Solids from a STEP-read Compound that has disjoint shells / loose
