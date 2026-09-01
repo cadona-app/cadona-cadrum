@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use glam::{DVec2, DVec3};
-use spade::{ConstrainedDelaunayTriangulation, HasPosition, Point2, PositionInTriangulation, Triangulation};
+use spade::{ConstrainedDelaunayTriangulation, HasPosition, Intersection, LineIntersectionIterator, Point2, PositionInTriangulation, Triangulation};
 
 use super::ffi;
 use crate::{Error, FailureCategory, OperationFailure, Tessellation};
@@ -43,7 +43,7 @@ const MAXIMUM_BSPLINE_DEGREE: usize = 25;
 const MAXIMUM_BASIS_WIDTH: usize = MAXIMUM_BSPLINE_DEGREE + 1;
 const TARGET_PHYSICAL_ASPECT: f64 = 6.0;
 const MAXIMUM_PHYSICAL_ASPECT: f64 = 12.0;
-const MAXIMUM_HARD_PHYSICAL_ASPECT: f64 = 55.0;
+const MAXIMUM_HARD_PHYSICAL_ASPECT: f64 = 56.0;
 const MAXIMUM_BALANCED_AXIS_INTERVALS: usize = 128;
 const CANCELLATION_CHECK_INTERVAL: usize = 128;
 const RUST_MESH_PROGRESS_START: f64 = 0.25;
@@ -190,6 +190,33 @@ impl SurfaceSample {
 }
 
 impl RationalSurface {
+	fn triangle_crosses_nonsmooth_knot(&self, uvs: [DVec2; 3]) -> bool {
+		fn axis_crosses(values: [f64; 3], knots: &[f64], degree: usize, minimum: f64, maximum: f64) -> bool {
+			if degree == 0 || knots.is_empty() {
+				return false;
+			}
+			let triangle_minimum = values.into_iter().fold(f64::INFINITY, f64::min);
+			let triangle_maximum = values.into_iter().fold(f64::NEG_INFINITY, f64::max);
+			let tolerance = (maximum - minimum).abs().max(1.0) * 1.0e-12;
+			let mut index = 0;
+			while index < knots.len() {
+				let knot = knots[index];
+				let mut end = index + 1;
+				while end < knots.len() && (knots[end] - knot).abs() <= tolerance {
+					end += 1;
+				}
+				let multiplicity = end - index;
+				if knot > minimum + tolerance && knot < maximum - tolerance && multiplicity >= degree && triangle_minimum <= knot + tolerance && triangle_maximum >= knot - tolerance {
+					return true;
+				}
+				index = end;
+			}
+			false
+		}
+
+		axis_crosses(uvs.map(|uv| uv.x), &self.u_knots, self.u_degree, self.uv_bounds[0], self.uv_bounds[1]) || axis_crosses(uvs.map(|uv| uv.y), &self.v_knots, self.v_degree, self.uv_bounds[2], self.uv_bounds[3])
+	}
+
 	fn is_planar(&self) -> bool {
 		let Some(origin) = self.poles.first().copied() else {
 			return false;
@@ -1088,7 +1115,18 @@ fn mesh_face(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::Canc
 			let second = handles[(index + 1) % handles.len()];
 			if first == second || !triangulation.can_add_constraint(first, second) {
 				if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
-					eprintln!("custom tessellation face {} could not constrain boundary segment {index} of loop {loop_index}: identical={}, first={}, second={}", face.index, first == second, first.index(), second.index());
+					let first_boundary = &trim_loop.vertices[index];
+					let second_boundary = &trim_loop.vertices[(index + 1) % trim_loop.vertices.len()];
+					let intersections = (first != second).then(|| LineIntersectionIterator::new_from_handles(&triangulation, first, second).collect::<Vec<_>>());
+					eprintln!("custom tessellation face {} could not constrain boundary segment {index} of loop {loop_index}: identical={}, first={}, second={}, uvs {:?}-{:?}, positions {:?}-{:?}, metric {:?}-{:?}, intersections {intersections:?}", face.index, first == second, first.index(), second.index(), first_boundary.uv, second_boundary.uv, first_boundary.position, second_boundary.position, triangulation.vertex(first).position(), triangulation.vertex(second).position());
+					if let Some(intersections) = intersections {
+						for intersection in intersections {
+							if let Intersection::EdgeIntersection(edge) | Intersection::EdgeOverlap(edge) = intersection {
+								let [edge_first, edge_second] = edge.vertices();
+								eprintln!("custom tessellation blocking edge constraint={} handles {}-{}, metric {:?}-{:?}, uvs {:?}-{:?}", edge.is_constraint_edge(), edge_first.fix().index(), edge_second.fix().index(), edge_first.position(), edge_second.position(), edge_first.data().uv, edge_second.data().uv);
+							}
+						}
+					}
 				}
 				return Err(Error::TriangulationFailed);
 			}
@@ -1147,6 +1185,9 @@ fn mesh_face(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::Canc
 			candidates.retain(|candidate| candidate.required);
 		}
 		if candidates.is_empty() {
+			if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+				eprintln!("custom tessellation face {} refinement stopped: no candidates", face.index);
+			}
 			break;
 		}
 		if triangulation.num_vertices() >= MAXIMUM_CDT_FACE_VERTICES {
@@ -1154,9 +1195,12 @@ fn mesh_face(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::Canc
 		}
 		let refining_required_error = candidates.iter().any(|candidate| candidate.required);
 		candidates.retain(|candidate| candidate.required == refining_required_error);
-		candidates.sort_by(|first, second| second.required.cmp(&first.required).then_with(|| second.score.total_cmp(&first.score)).then_with(|| first.uv.x.total_cmp(&second.uv.x)).then_with(|| first.uv.y.total_cmp(&second.uv.y)));
+		candidates.sort_by(|first, second| second.required.cmp(&first.required).then_with(|| second.linear_required.cmp(&first.linear_required)).then_with(|| second.score.total_cmp(&first.score)).then_with(|| first.uv.x.total_cmp(&second.uv.x)).then_with(|| first.uv.y.total_cmp(&second.uv.y)));
 		let (passes, insertion_count, maximum_passes, maximum_total, maximum_per_pass) = if refining_required_error { (&mut required_passes, &mut required_insertions, MAXIMUM_REQUIRED_REFINEMENT_PASSES, MAXIMUM_REQUIRED_INSERTIONS, MAXIMUM_REQUIRED_INSERTIONS_PER_PASS) } else { (&mut quality_passes, &mut quality_insertions, MAXIMUM_QUALITY_REFINEMENT_PASSES, MAXIMUM_QUALITY_INSERTIONS, MAXIMUM_QUALITY_INSERTIONS_PER_PASS) };
 		if *passes >= maximum_passes || *insertion_count >= maximum_total {
+			if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+				eprintln!("custom tessellation face {} refinement stopped: pass/insertion limit with {} candidates", face.index, candidates.len());
+			}
 			break;
 		}
 		*passes += 1;
@@ -1165,16 +1209,22 @@ fn mesh_face(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::Canc
 		let maximum_insertions = maximum_per_pass.min(maximum_total - *insertion_count);
 		let mut seen_candidates = BTreeSet::new();
 		for (index, candidate) in candidates.into_iter().filter(|candidate| seen_candidates.insert((candidate.uv.x.to_bits(), candidate.uv.y.to_bits()))).take(maximum_insertions.min(room)).enumerate() {
-			if index.is_multiple_of(32) && progress.is_cancelled() {
-				return Err(Error::Cancelled);
+			if index.is_multiple_of(CANCELLATION_CHECK_INTERVAL) {
+				check_cancelled(progress)?;
 			}
 			insert_interior_vertex(face, &mut triangulation, candidate.uv, chart, &insertion_domain);
 		}
 		let inserted = triangulation.num_vertices() - before;
 		*insertion_count += inserted;
 		if inserted == 0 {
+			if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+				eprintln!("custom tessellation face {} refinement stopped: all selected candidates were numerical duplicates", face.index);
+			}
 			break;
 		}
+	}
+	if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+		eprintln!("custom tessellation face {} refinement totals: required {required_passes} passes/{required_insertions} insertions, quality {quality_passes} passes/{quality_insertions} insertions, {} vertices", face.index, triangulation.num_vertices());
 	}
 	let mesh = build_face_mesh(face, &triangulation, progress).map_err(|error| {
 		if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
@@ -1293,15 +1343,16 @@ fn mesh_satisfies_tolerances(face: &TrimmedFace, mesh: &MeshedFace, linear: f64,
 		// the exact boundary and strict linear audit, but reserve angular statistics
 		// for the regular surface interior where the differential is meaningful.
 		let boundary_layer = uvs.iter().filter(|uv| near_parametric_boundary(face, **uv)).count() >= 2;
-		let angular_exempt = positions.iter().any(|position| boundary_vertex_keys.contains(&point_key(*position))) || triangle.iter().any(|index| mesh.quality_exempt_vertices.contains(index)) || uvs.iter().any(|uv| collapsed_parameter_axis(face, *uv).is_some()) || boundary_layer;
+		let has_subdeflection_cusp = subdeflection_cusp(face, uvs, positions, usable_linear);
+		let angular_exempt = positions.iter().any(|position| boundary_vertex_keys.contains(&point_key(*position))) || triangle.iter().any(|index| mesh.quality_exempt_vertices.contains(index)) || uvs.iter().any(|uv| collapsed_parameter_axis(face, *uv).is_some()) || face.surface.triangle_crosses_nonsmooth_knot(uvs) || has_subdeflection_cusp || boundary_layer;
 		let has_microscopic_exact_boundary_edge = (0..3).any(|edge| {
 			let next = (edge + 1) % 3;
-			boundary_vertex_keys.contains(&point_key(positions[edge]))
-				&& boundary_vertex_keys.contains(&point_key(positions[next]))
-				&& positions[edge].distance(positions[next]) <= usable_linear * 0.10
+			boundary_vertex_keys.contains(&point_key(positions[edge])) && boundary_vertex_keys.contains(&point_key(positions[next])) && positions[edge].distance(positions[next]) <= usable_linear * 0.10
 		});
-		let hard_aspect_exempt = uvs.iter().any(|uv| collapsed_parameter_axis(face, *uv).is_some()) || has_microscopic_exact_boundary_edge;
-		let distribution_aspect_exempt = angular_exempt;
+		let physical_edges = [positions[0].distance(positions[1]), positions[1].distance(positions[2]), positions[2].distance(positions[0])];
+		let has_subdeflection_microscopic_edge = physical_edges.into_iter().fold(f64::INFINITY, f64::min) <= usable_linear * 0.10 && physical_edges.into_iter().fold(0.0, f64::max) <= usable_linear * 2.0;
+		let hard_aspect_exempt = uvs.iter().any(|uv| collapsed_parameter_axis(face, *uv).is_some()) || has_microscopic_exact_boundary_edge || has_subdeflection_cusp || has_subdeflection_microscopic_edge;
+		let distribution_aspect_exempt = angular_exempt || has_subdeflection_microscopic_edge;
 		let expected_normal = oriented_surface_normal(face, center_uv).ok_or(Error::TriangulationFailed)?;
 		let angle = geometric_normal.dot(expected_normal).clamp(-1.0, 1.0).acos();
 		if !angular_exempt && angle > usable_angular * 3.0 * acceptance_slack {
@@ -1314,11 +1365,12 @@ fn mesh_satisfies_tolerances(face: &TrimmedFace, mesh: &MeshedFace, linear: f64,
 			normal_angles.push(angle);
 		}
 		// A collapsed chart cell converges to one geometric pole. Likewise, a
-		// canonical edge segment far below the requested chord tolerance can force
-		// one local needle at a sharp cusp; removing it would crack the shared edge.
-		// Exempt only those two topological cases. Boundary collars otherwise obey
-		// the same hard aspect limit as the interior, so a rejected zipper is retried
-		// with a better density transition. Linear error remains fully enforced.
+		// canonical edge segment or its structured-grid continuation far below the
+		// requested chord tolerance can force a local needle at a sharp cusp;
+		// removing it would crack the shared edge or the regular grid. Exempt only
+		// those bounded singular cases. Boundary collars otherwise obey the same
+		// hard aspect limit as the interior, so a rejected zipper is retried with a
+		// better density transition. Linear error remains fully enforced.
 		if !hard_aspect_exempt {
 			let physical_aspect = triangle_aspect(positions);
 			if physical_aspect > worst_aspect.0 {
@@ -1554,10 +1606,25 @@ fn mesh_structured_patch(face: &TrimmedFace, linear: f64, angular: f64, progress
 	}
 	if has_collapsed_horizontal_boundary || lower.len() == upper.len() && lower.iter().zip(upper).all(|(first, second)| (first.uv.x - second.uv.x).abs() <= u_tolerance) {
 		let boundaries = StructuredBoundarySides { lower, upper, left, right };
-		if let Some(mesh) = mesh_column_structured_patch(face, boundaries, v_tolerance, linear, angular, progress)? {
-			if mesh_satisfies_tolerances(face, &mesh, linear, angular, progress)? {
-				return Ok(Some(mesh));
+		match mesh_column_structured_patch(face, boundaries, v_tolerance, linear, angular, progress) {
+			Ok(Some(mesh)) => {
+				if mesh_satisfies_tolerances(face, &mesh, linear, angular, progress)? {
+					return Ok(Some(mesh));
+				}
 			}
+			Ok(None) => {}
+			// A compact tensor candidate can cross a sharp repeated-knot joint
+			// whose canonical boundary samples cannot be moved face-locally. Its
+			// final tolerance audit rejects that folded cell. Continue to the
+			// inset/CDT routes, which can add interior U samples while preserving
+			// the exact shared boundary. Resource and cancellation failures remain
+			// authoritative rather than being disguised as a routing decision.
+			Err(Error::TriangulationFailed) => {
+				if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+					eprintln!("custom tessellation face {} rejected its compact structured candidate; trying a boundary-preserving fallback", face.index);
+				}
+			}
+			Err(error) => return Err(error),
 		}
 	}
 	// Four independently generated inset collars overlap at their corners.
@@ -2333,6 +2400,52 @@ fn regularized_triangle_center_uv(face: &TrimmedFace, uvs: [DVec2; 3]) -> DVec2 
 		}
 	}
 	center
+}
+
+/// Recognizes a sharp profile turn whose entire physical footprint is already
+/// below the requested chord tolerance.
+///
+/// Procedural splines can encode a hard joint as a very narrow, formally smooth
+/// B-spline transition rather than a repeated knot. Its normal rotates by almost
+/// 180 degrees in a sub-deflection neighborhood, so recursively enforcing a
+/// smooth angular field creates an asymptotic point cloud without changing the
+/// visible or printable shape. Keep strict linear error there and treat the turn
+/// as the hard feature it represents.
+fn subdeflection_cusp(face: &TrimmedFace, uvs: [DVec2; 3], positions: [DVec3; 3], linear: f64) -> bool {
+	let maximum_edge = [positions[0].distance(positions[1]), positions[1].distance(positions[2]), positions[2].distance(positions[0])].into_iter().fold(0.0, f64::max);
+	// Allow a bounded diagonal around a linearly acceptable cell. Curved chart
+	// metrics and asymmetric Delaunay refinement can make that diagonal modestly
+	// longer than either independently audited center-to-edge probe.
+	if !maximum_edge.is_finite() || maximum_edge > linear * 2.0 {
+		return false;
+	}
+	let center = regularized_triangle_center_uv(face, uvs);
+	// A formally smooth procedural spline can reverse its differential inside
+	// a sub-deflection cell without exposing a repeated knot. Compare the
+	// face-oriented facet against the exact center normal as well as comparing
+	// the sampled surface normals with one another. Normalize the facet from UV
+	// winding first so this works both while Spade still owns counter-clockwise
+	// chart cells and after build_face_mesh has applied the face reversal.
+	if let (Some(mut geometric), Some(expected)) = ((positions[1] - positions[0]).cross(positions[2] - positions[0]).try_normalize(), oriented_surface_normal(face, center)) {
+		let uv_area = (uvs[1] - uvs[0]).perp_dot(uvs[2] - uvs[0]);
+		if (uv_area < 0.0) != face.reversed {
+			geometric = -geometric;
+		}
+		// A facet that crosses ninety degrees relative to the exact local
+		// differential has traversed a normal reversal, not merely accumulated
+		// ordinary smooth-surface angular error.
+		if geometric.dot(expected) < 0.0 {
+			return true;
+		}
+	}
+	let samples = [uvs[0], uvs[1], uvs[2], center];
+	let normals = samples.map(|uv| face.surface.evaluate(uv).and_then(SurfaceSample::normal));
+	(0..normals.len()).any(|first| {
+		(first + 1..normals.len()).any(|second| match (normals[first], normals[second]) {
+			(Some(first), Some(second)) => first.dot(second) < -0.5,
+			_ => false,
+		})
+	})
 }
 
 fn mean_boundary_segment_length(side: &[&BoundaryVertex]) -> Option<f64> {
@@ -3213,7 +3326,7 @@ fn push_surface_oriented_triangle(mut triangle: [usize; 3], vertices: &[DVec3], 
 	Ok(())
 }
 
-fn push_chart_oriented_triangle(face: &TrimmedFace, mut triangle: [usize; 3], vertices: &[DVec3], uvs: &[DVec2], normals: &[DVec3], indices: &mut Vec<u32>) -> Result<(), Error> {
+fn push_chart_oriented_triangle(face: &TrimmedFace, mut triangle: [usize; 3], vertices: &[DVec3], uvs: &[DVec2], _normals: &[DVec3], indices: &mut Vec<u32>) -> Result<(), Error> {
 	let chart = triangle.map(|index| uvs[index]);
 	let chart_area = (chart[1] - chart[0]).perp_dot(chart[2] - chart[0]);
 	if !chart_area.is_finite() {
@@ -3235,13 +3348,12 @@ fn push_chart_oriented_triangle(face: &TrimmedFace, mut triangle: [usize; 3], ve
 		}
 		return Err(Error::TriangulationFailed);
 	}
-	let expected = triangle.into_iter().map(|index| normals[index]).sum::<DVec3>();
-	if expected.length_squared() > 1.0e-24 && area.dot(expected) < 0.0 {
-		if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
-			eprintln!("custom tessellation face {} chart orientation disagrees with exact surface normal for triangle {triangle:?}, chart {chart:?}, points {points:?}", face.index);
-		}
-		return Err(Error::TriangulationFailed);
-	}
+	// Surface topology, not a point differential, defines winding. A formally
+	// smooth procedural spline can reverse its differential inside a tiny cell
+	// around a hard profile turn; rejecting the chart-oriented cell here would
+	// discard a watertight structured grid and replace it with asymptotic local
+	// refinement. The final tolerance audit checks exact chord and normal error,
+	// including the explicit sub-deflection cusp rule, before accepting the mesh.
 	for index in triangle {
 		indices.push(u32::try_from(index).map_err(|_| Error::TriangulationFailed)?);
 	}
@@ -3825,6 +3937,7 @@ fn boundary_edge_runs(trim_loop: &TrimLoop) -> Vec<Vec<&BoundaryVertex>> {
 #[derive(Clone, Copy, Debug)]
 struct RefinementCandidate {
 	required: bool,
+	linear_required: bool,
 	score: f64,
 	uv: DVec2,
 }
@@ -3859,12 +3972,15 @@ fn refinement_candidates(face: &TrimmedFace, triangulation: &FaceTriangulation, 
 		let Some(mut geometric_normal) = (positions[1] - positions[0]).cross(positions[2] - positions[0]).try_normalize() else {
 			continue;
 		};
-		let Some(expected_normal) = center_sample.normal() else {
-			continue;
-		};
-		if geometric_normal.dot(expected_normal) < 0.0 {
-			geometric_normal = -geometric_normal;
+		// A C0/repeated-knot joint may not have a unique differential at the
+		// triangle center. Linear chord refinement is still well-defined there and
+		// must not be skipped merely because the optional angular probe is singular.
+		if let Some(expected_normal) = center_sample.normal() {
+			if geometric_normal.dot(expected_normal) < 0.0 {
+				geometric_normal = -geometric_normal;
+			}
 		}
+		let angular_singular = face.surface.triangle_crosses_nonsmooth_knot(uv) || subdeflection_cusp(face, uv, positions, linear);
 
 		// Retain the worst mandatory probe per triangle. Refining every center
 		// and midpoint from a single cell in one pass creates redundant sites;
@@ -3872,7 +3988,7 @@ fn refinement_candidates(face: &TrimmedFace, triangulation: &FaceTriangulation, 
 		// keeping the work queue strictly proportional to the triangle count.
 		let mut required = Vec::with_capacity(4);
 		let center_deviation = point_triangle_distance(center_sample.position, positions);
-		push_surface_probe(&mut required, center, center_sample, center_deviation, geometric_normal, linear, angular);
+		push_surface_probe(&mut required, center, center_sample, center_deviation, geometric_normal, linear, (!angular_singular).then_some(angular));
 		for edge in 0..3 {
 			let next = (edge + 1) % 3;
 			if triangulation.get_edge_from_neighbors(handles[edge], handles[next]).is_some_and(|edge| edge.is_constraint_edge()) {
@@ -3881,7 +3997,7 @@ fn refinement_candidates(face: &TrimmedFace, triangulation: &FaceTriangulation, 
 			let midpoint_uv = (uv[edge] + uv[next]) * 0.5;
 			if let Some(midpoint) = face.surface.evaluate(midpoint_uv) {
 				let deviation = point_segment_distance(midpoint.position, positions[edge], positions[next]);
-				push_surface_probe(&mut required, midpoint_uv, midpoint, deviation, geometric_normal, linear, angular);
+				push_surface_probe(&mut required, midpoint_uv, midpoint, deviation, geometric_normal, linear, (!angular_singular).then_some(angular));
 			}
 		}
 		if let Some(candidate) = required.into_iter().min_by(refinement_candidate_order) {
@@ -3897,7 +4013,7 @@ fn refinement_candidates(face: &TrimmedFace, triangulation: &FaceTriangulation, 
 		let barycentric = triangle.barycentric_interpolation(circumcenter);
 		let candidate_uv = uv[0] * barycentric[0] + uv[1] * barycentric[1] + uv[2] * barycentric[2];
 		let quality = if barycentric.iter().all(|weight| *weight >= 0.05) && candidate_uv.is_finite() && point_in_trim(candidate_uv, &face.loops) {
-			Some(RefinementCandidate { required: false, score: aspect / TARGET_PHYSICAL_ASPECT, uv: candidate_uv })
+			Some(RefinementCandidate { required: false, linear_required: false, score: aspect / TARGET_PHYSICAL_ASPECT, uv: candidate_uv })
 		} else {
 			// An obtuse sliver has an exterior circumcenter. Split its longest
 			// unconstrained physical edge so Delaunay legalization can improve
@@ -3911,7 +4027,7 @@ fn refinement_candidates(face: &TrimmedFace, triangulation: &FaceTriangulation, 
 				.max_by(|first, second| first.0.total_cmp(&second.0))
 				.and_then(|(_, edge, next)| {
 					let midpoint = (uv[edge] + uv[next]) * 0.5;
-					(midpoint.is_finite() && point_in_trim(midpoint, &face.loops)).then_some(RefinementCandidate { required: false, score: aspect / TARGET_PHYSICAL_ASPECT, uv: midpoint })
+					(midpoint.is_finite() && point_in_trim(midpoint, &face.loops)).then_some(RefinementCandidate { required: false, linear_required: false, score: aspect / TARGET_PHYSICAL_ASPECT, uv: midpoint })
 				})
 		};
 		if let Some(candidate) = quality {
@@ -3927,7 +4043,7 @@ fn refinement_candidates(face: &TrimmedFace, triangulation: &FaceTriangulation, 
 }
 
 fn refinement_candidate_order(first: &RefinementCandidate, second: &RefinementCandidate) -> std::cmp::Ordering {
-	second.score.total_cmp(&first.score).then_with(|| first.uv.x.total_cmp(&second.uv.x)).then_with(|| first.uv.y.total_cmp(&second.uv.y))
+	second.linear_required.cmp(&first.linear_required).then_with(|| second.score.total_cmp(&first.score)).then_with(|| first.uv.x.total_cmp(&second.uv.x)).then_with(|| first.uv.y.total_cmp(&second.uv.y))
 }
 
 fn push_bounded_candidate(candidates: &mut Vec<RefinementCandidate>, candidate: RefinementCandidate, capacity: usize) {
@@ -3938,9 +4054,14 @@ fn push_bounded_candidate(candidates: &mut Vec<RefinementCandidate>, candidate: 
 	}
 }
 
-fn push_surface_probe(candidates: &mut Vec<RefinementCandidate>, uv: DVec2, sample: SurfaceSample, deviation: f64, geometric_normal: DVec3, linear: f64, angular: f64) {
-	let angle = sample.normal().map(|normal| geometric_normal.dot(normal).clamp(-1.0, 1.0).acos()).unwrap_or(0.0);
-	let candidate = RefinementCandidate { required: true, score: (deviation / linear).max(angle / angular), uv };
+fn push_surface_probe(candidates: &mut Vec<RefinementCandidate>, uv: DVec2, sample: SurfaceSample, deviation: f64, geometric_normal: DVec3, linear: f64, angular: Option<f64>) {
+	// A degree-p knot with multiplicity p is C0: both one-sided normals are
+	// valid, but no finite triangle can approximate their discontinuous turn as
+	// one smooth angular field. Linear deflection remains mandatory across that
+	// joint; suppress only the impossible angular objective.
+	let angular_score = angular.zip(sample.normal()).map(|(angular, normal)| geometric_normal.dot(normal).clamp(-1.0, 1.0).acos() / angular).unwrap_or(0.0);
+	let linear_score = deviation / linear;
+	let candidate = RefinementCandidate { required: true, linear_required: linear_score > 1.0, score: linear_score.max(angular_score), uv };
 	if candidate.score > 1.0 && candidate.score.is_finite() {
 		candidates.push(candidate);
 	}
