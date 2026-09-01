@@ -262,3 +262,26 @@ fn relative_tessellation_layout_is_equivariant_across_scale_and_rigid_placement(
 		assert_finite_nondegenerate_watertight_oriented(&format!("transformed analytic fixture {index}"), &transformed_mesh);
 	}
 }
+
+#[test]
+fn straight_edge_sampling_is_equivariant_far_from_the_origin() {
+	let dimensions = DVec3::new(7.103070862459569, 7.815703681866713, 6.38144213436564);
+	let axis = DVec3::new(-0.26096176524390424, -0.8679800973557169, 0.42250385521926964);
+	let angle = -1.490266855812696;
+	let translation = DVec3::new(0.8321247452955446, 0.5499139869672733, -0.07185412447857699) * 1.0e8;
+	let source = Solid::cube(-dimensions * 0.5, dimensions * 0.5);
+	let transformed = Solid::cube(-dimensions * 0.5, dimensions * 0.5).scale(DVec3::ZERO, 0.001).located(axis, angle, translation);
+
+	let source_mesh = Solid::mesh_chunks([&source], corpus_options(false)).expect("tessellate source box");
+	let transformed_mesh = Solid::mesh_chunks([&transformed], corpus_options(false)).expect("tessellate far-translated small box");
+	let source_edge_sample_counts = source_mesh.edges.iter().map(|edge| edge.points.len()).collect::<Vec<_>>();
+	let transformed_edge_sample_counts = transformed_mesh.edges.iter().map(|edge| edge.points.len()).collect::<Vec<_>>();
+
+	assert_eq!(transformed_edge_sample_counts, source_edge_sample_counts, "straight edge sample counts changed after a scale and far rigid placement");
+	assert_eq!(transformed_mesh.faces.len(), source_mesh.faces.len(), "face count changed after a scale and far rigid placement");
+	for (face_index, (transformed_face, source_face)) in transformed_mesh.faces.iter().zip(&source_mesh.faces).enumerate() {
+		assert_eq!(transformed_face.face_index, source_face.face_index, "face {face_index}: semantic face index changed after a scale and far rigid placement");
+		assert_eq!(transformed_face.vertices.len(), source_face.vertices.len(), "face {face_index}: vertex density changed after a scale and far rigid placement");
+		assert_eq!(transformed_face.indices.len(), source_face.indices.len(), "face {face_index}: triangle density changed after a scale and far rigid placement");
+	}
+}

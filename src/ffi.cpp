@@ -1840,42 +1840,58 @@ static bool sample_brep_edge(
     }
 
     BRepAdaptor_Curve curve(edge);
-    GCPnts_TangentialDeflection discretization(
-        curve,
-        first,
-        last,
-        std::max(angular, 1.0e-3),
-        std::max(linear, Precision::Confusion()),
-        2,
-        1.0e-10,
-        std::max(linear * 1.0e-5, 1.0e-10));
-    if (discretization.NbPoints() < 2
-        || static_cast<size_t>(discretization.NbPoints())
-            > maximum_brep_edge_samples) {
-        if (discretization.NbPoints() >= 2) {
-            record_resource_failure(
-                "extract_brep_mesh_source",
-                "single-edge sample quota exceeded");
+    const bool is_straight = curve.GetType() == GeomAbs_Line;
+    if (is_straight) {
+        // A straight edge needs only its endpoints for geometric accuracy.
+        // Sampling it through a world-space deflection calculation makes the
+        // initial partition depend on a large rigid translation even though
+        // its exact curve parameterization does not change.
+        sampled.parameters = {first, last};
+        sampled.points = {curve.Value(first), curve.Value(last)};
+        for (const gp_Pnt& point : sampled.points) {
+            if (!std::isfinite(point.X()) || !std::isfinite(point.Y())
+                || !std::isfinite(point.Z())) {
+                return false;
+            }
         }
-        return false;
-    }
-    sampled.parameters.reserve(discretization.NbPoints());
-    sampled.points.reserve(discretization.NbPoints());
-    for (int index = 1; index <= discretization.NbPoints(); ++index) {
-        if (rust_progress_cancelled(progress)) return false;
-        const double parameter = discretization.Parameter(index);
-        if (!std::isfinite(parameter)) return false;
-        if (!sampled.parameters.empty()
-            && std::abs(parameter - sampled.parameters.back()) <= 1.0e-14) {
-            continue;
-        }
-        sampled.parameters.push_back(parameter);
-        const gp_Pnt point = discretization.Value(index);
-        if (!std::isfinite(point.X()) || !std::isfinite(point.Y())
-            || !std::isfinite(point.Z())) {
+    } else {
+        GCPnts_TangentialDeflection discretization(
+            curve,
+            first,
+            last,
+            std::max(angular, 1.0e-3),
+            std::max(linear, Precision::Confusion()),
+            2,
+            1.0e-10,
+            std::max(linear * 1.0e-5, 1.0e-10));
+        if (discretization.NbPoints() < 2
+            || static_cast<size_t>(discretization.NbPoints())
+                > maximum_brep_edge_samples) {
+            if (discretization.NbPoints() >= 2) {
+                record_resource_failure(
+                    "extract_brep_mesh_source",
+                    "single-edge sample quota exceeded");
+            }
             return false;
         }
-        sampled.points.push_back(point);
+        sampled.parameters.reserve(discretization.NbPoints());
+        sampled.points.reserve(discretization.NbPoints());
+        for (int index = 1; index <= discretization.NbPoints(); ++index) {
+            if (rust_progress_cancelled(progress)) return false;
+            const double parameter = discretization.Parameter(index);
+            if (!std::isfinite(parameter)) return false;
+            if (!sampled.parameters.empty()
+                && std::abs(parameter - sampled.parameters.back()) <= 1.0e-14) {
+                continue;
+            }
+            sampled.parameters.push_back(parameter);
+            const gp_Pnt point = discretization.Value(index);
+            if (!std::isfinite(point.X()) || !std::isfinite(point.Y())
+                || !std::isfinite(point.Z())) {
+                return false;
+            }
+            sampled.points.push_back(point);
+        }
     }
     if (sampled.parameters.size() < 2) return false;
     if (!budget.claim_canonical_samples(sampled.parameters.size())) {
@@ -1911,8 +1927,21 @@ static bool sample_brep_edge(
                 refined_parameters.push_back(parameter_start);
                 refined_points.push_back(point_start);
             }
+            // For a line, arc length is affine in its exact parameter. Derive
+            // the longitudinal floor from that invariant instead of subtracting
+            // two large world-space endpoints. The latter can straddle an
+            // integer subdivision boundary after a far rigid placement.
+            const double interval_length = is_straight
+                ? curve_length * (parameter_end - parameter_start)
+                    / (last - first)
+                : point_start.Distance(point_end);
+            const double subdivision_ratio = interval_length / target_length;
+            const double ratio_dead_band = std::max(
+                1.0e-10,
+                std::abs(subdivision_ratio)
+                    * std::numeric_limits<double>::epsilon() * 64.0);
             const double requested_subdivisions = std::ceil(
-                point_start.Distance(point_end) / target_length - 1.0e-10);
+                subdivision_ratio - ratio_dead_band);
             if (!std::isfinite(requested_subdivisions)) return false;
             const int subdivisions = requested_subdivisions >= 256.0
                 ? 256
