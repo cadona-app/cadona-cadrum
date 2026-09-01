@@ -21,9 +21,50 @@ mod ffi_bridge {
 		chunk_face_indices: Vec<u32>,
 		face_vertex_offsets: Vec<u32>,
 		face_index_offsets: Vec<u32>,
-		edge_points: Vec<f64>, // flat xyz, sampled from polygons on the face triangulations
+		edge_points: Vec<f64>, // flat xyz, canonical samples of exact topological edges
 		chunk_edge_indices: Vec<u32>,
 		edge_point_offsets: Vec<u32>,
+		success: bool,
+	}
+
+	/// Rust-owned input for the custom B-rep tessellator.
+	///
+	/// OCCT contributes exact topology, one canonical sample sequence per shared
+	/// edge, face p-curves at those parameters, and bounded rational B-spline
+	/// surface definitions. It contributes no triangles. Every per-face array is
+	/// parallel to `face_indices`; every offset array starts at zero, is
+	/// monotonic, and ends at the complete referenced-array length. Rust validates
+	/// those invariants before constructing any tessellator domain value. Curve
+	/// construction and parameter repair are permitted only on the detached
+	/// extraction copy, within the request's absolute linear tolerance; the
+	/// authoritative B-rep is never healed as a side effect of presentation.
+	struct BrepMeshSourceData {
+		linear_deflection: f64,
+		face_indices: Vec<u32>,
+		face_tshape_ids: Vec<u64>,
+		face_reversed: Vec<u8>,
+		face_u_degrees: Vec<u32>,
+		face_v_degrees: Vec<u32>,
+		face_u_pole_counts: Vec<u32>,
+		face_v_pole_counts: Vec<u32>,
+		face_pole_offsets: Vec<u32>,
+		poles: Vec<f64>,
+		weights: Vec<f64>,
+		face_u_knot_offsets: Vec<u32>,
+		face_v_knot_offsets: Vec<u32>,
+		u_knots: Vec<f64>,
+		v_knots: Vec<f64>,
+		face_uv_bounds: Vec<f64>,
+		// Per-face upper bound on any accepted difference between an exact
+		// topological boundary point and its exported rational-surface chart.
+		face_approximation_errors: Vec<f64>,
+		face_loop_offsets: Vec<u32>,
+		loop_vertex_offsets: Vec<u32>,
+		loop_uvs: Vec<f64>,
+		loop_edge_indices: Vec<u32>,        // canonical topological edge ordinal
+		loop_edge_sample_indices: Vec<u32>, // sample ordinal within that edge
+		edge_point_offsets: Vec<u32>,
+		edge_points: Vec<f64>,
 		success: bool,
 	}
 
@@ -232,8 +273,7 @@ mod ffi_bridge {
 
 		// ==================== Meshing ====================
 
-		fn mesh_shape(shape: &TopoDS_Shape, linear: f64, angular: f64, relative: bool, parallel: bool, include_edges: bool, progress: &CancellationToken) -> MeshData;
-		fn mesh_shape_faces(shape: &TopoDS_Shape, face_indices: &[u32], linear: f64, angular: f64, relative: bool, parallel: bool, progress: &CancellationToken) -> MeshData;
+		fn extract_brep_mesh_source(shape: &TopoDS_Shape, face_indices: &[u32], linear: f64, angular: f64, relative: bool, progress: &CancellationToken) -> BrepMeshSourceData;
 
 		// ==================== Topology enumeration ====================
 
