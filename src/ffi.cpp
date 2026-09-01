@@ -1963,6 +1963,7 @@ static bool sample_brep_edge(
     const TopoDS_Edge& edge,
     double linear,
     double angular,
+    bool bounds_curved_surface,
     BrepExtractionBudget& budget,
     const CancellationToken& progress,
     SampledBrepEdge& sampled)
@@ -2071,9 +2072,19 @@ static bool sample_brep_edge(
     // topological edge, every incident face receives the exact same samples.
     const double curve_length = GCPnts_AbscissaPoint::Length(curve, first, last);
     if (std::isfinite(curve_length) && curve_length > Precision::Confusion()) {
+        // A geometrically straight edge still bounds a two-dimensional face.
+        // When that face is curved, leaving the edge at the ordinary chordal
+        // sample rate forces a much denser interior row to collapse onto a
+        // handful of boundary sites. The resulting transition fan is valid but
+        // consists of conspicuous needle triangles. Give only edges incident to
+        // curved faces a stronger, bounded longitudinal floor. Planar boxes and
+        // polyhedral models retain the inexpensive ordinary edge distribution.
+        const double angular_fraction = bounds_curved_surface
+            ? std::clamp(angular * 0.25, 1.0 / 32.0, 0.125)
+            : std::clamp(angular, 0.02, 0.5);
         const double target_length = std::max(
             linear * 4.0,
-            curve_length * std::clamp(angular, 0.02, 0.5));
+            curve_length * angular_fraction);
         if (!std::isfinite(target_length)
             || target_length <= Precision::Confusion()) {
             return false;
@@ -3430,6 +3441,25 @@ BrepMeshSourceData extract_brep_mesh_source(
 
         std::vector<SampledBrepEdge> sampled_edges(
             static_cast<size_t>(edges.Extent()));
+        std::vector<bool> edge_bounds_curved_surface(
+            static_cast<size_t>(source_edges.Extent()), false);
+        for (int face_index = 1; face_index <= faces.Extent(); ++face_index) {
+            if (rust_progress_cancelled(progress)) return result;
+            const TopoDS_Face face = TopoDS::Face(faces(face_index));
+            BRepAdaptor_Surface surface(face, true);
+            if (surface.GetType() == GeomAbs_Plane) continue;
+            for (TopExp_Explorer explorer(face, TopAbs_EDGE);
+                 explorer.More(); explorer.Next()) {
+                const int copied_ordinal = edges.FindIndex(explorer.Current());
+                if (copied_ordinal < 1) return result;
+                const uint32_t source_index = copied_edge_to_source_index[
+                    static_cast<size_t>(copied_ordinal - 1)];
+                if (source_index >= edge_bounds_curved_surface.size()) {
+                    return result;
+                }
+                edge_bounds_curved_surface[source_index] = true;
+            }
+        }
         // A surface triangle spans both the edge direction and an interior
         // direction, so consuming the entire requested deviation on its
         // boundary can make the combined diagonal exceed that request. Give
@@ -3450,6 +3480,7 @@ BrepMeshSourceData extract_brep_mesh_source(
                     edge,
                     edge_linear,
                     edge_angular,
+                    edge_bounds_curved_surface[static_cast<size_t>(index - 1)],
                     budget,
                     progress,
                     sampled_edges[static_cast<size_t>(index - 1)])) {
