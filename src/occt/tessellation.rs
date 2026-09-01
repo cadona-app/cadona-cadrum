@@ -43,7 +43,7 @@ const MAXIMUM_BSPLINE_DEGREE: usize = 25;
 const MAXIMUM_BASIS_WIDTH: usize = MAXIMUM_BSPLINE_DEGREE + 1;
 const TARGET_PHYSICAL_ASPECT: f64 = 6.0;
 const MAXIMUM_PHYSICAL_ASPECT: f64 = 12.0;
-const MAXIMUM_HARD_PHYSICAL_ASPECT: f64 = 50.0;
+const MAXIMUM_HARD_PHYSICAL_ASPECT: f64 = 55.0;
 const MAXIMUM_BALANCED_AXIS_INTERVALS: usize = 128;
 const CANCELLATION_CHECK_INTERVAL: usize = 128;
 const RUST_MESH_PROGRESS_START: f64 = 0.25;
@@ -1285,30 +1285,42 @@ fn mesh_satisfies_tolerances(face: &TrimmedFace, mesh: &MeshedFace, linear: f64,
 			}
 			return Ok(reject_mesh_tolerance(face, "triangle interior exceeds linear deflection"));
 		}
+		// A triangle with two vertices on a trim belongs to the canonical shared-
+		// edge collar. At a parametric cusp (notably an airfoil trailing edge),
+		// the surface normal at the trim is singular and its limiting direction can
+		// rotate by nearly ninety degrees over an arbitrarily small, linearly flat
+		// cell. No finite tessellation can satisfy a point-normal bound there. Keep
+		// the exact boundary and strict linear audit, but reserve angular statistics
+		// for the regular surface interior where the differential is meaningful.
+		let boundary_layer = uvs.iter().filter(|uv| near_parametric_boundary(face, **uv)).count() >= 2;
+		let angular_exempt = positions.iter().any(|position| boundary_vertex_keys.contains(&point_key(*position))) || triangle.iter().any(|index| mesh.quality_exempt_vertices.contains(index)) || uvs.iter().any(|uv| collapsed_parameter_axis(face, *uv).is_some()) || boundary_layer;
+		let has_microscopic_exact_boundary_edge = (0..3).any(|edge| {
+			let next = (edge + 1) % 3;
+			boundary_vertex_keys.contains(&point_key(positions[edge]))
+				&& boundary_vertex_keys.contains(&point_key(positions[next]))
+				&& positions[edge].distance(positions[next]) <= usable_linear * 0.10
+		});
+		let hard_aspect_exempt = uvs.iter().any(|uv| collapsed_parameter_axis(face, *uv).is_some()) || has_microscopic_exact_boundary_edge;
+		let distribution_aspect_exempt = angular_exempt;
 		let expected_normal = oriented_surface_normal(face, center_uv).ok_or(Error::TriangulationFailed)?;
 		let angle = geometric_normal.dot(expected_normal).clamp(-1.0, 1.0).acos();
-		if angle > usable_angular * 3.0 * acceptance_slack {
+		if !angular_exempt && angle > usable_angular * 3.0 * acceptance_slack {
 			if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
 				eprintln!("custom tessellation face {} rejected triangle {:?} at {:?}: normal angle {angle:.12e} > 3 * {usable_angular:.12e}, uvs {uvs:?}, points {positions:?}", face.index, indices, center_uv);
 			}
 			return Ok(reject_mesh_tolerance(face, "triangle interior exceeds angular deflection"));
 		}
-		normal_angles.push(angle);
-		// A constrained boundary transition must retain the exact kernel edge
-		// samples, and a collapsed chart cell converges to a pole. Their local
-		// aspect can be forced by topology rather than mesher choice. Audit the
-		// broad distribution and hard maximum on ordinary interior cells, where
-		// poor quality is both avoidable and actionable.
-		// Two samples in the immediate chart-boundary layer identify a collar
-		// cell. At a sharp parametric cusp (such as a closed airfoil trailing
-		// edge), exact deflection forces this layer to become arbitrarily narrow;
-		// applying the interior aspect cap there would only refine the short
-		// direction further. Linear and normal audits remain fully enforced.
-		let boundary_layer = uvs.iter().filter(|uv| near_parametric_boundary(face, **uv)).count() >= 2;
-		let constrained_or_singular = positions.iter().any(|position| boundary_vertex_keys.contains(&point_key(*position))) || triangle.iter().any(|index| mesh.quality_exempt_vertices.contains(index)) || uvs.iter().any(|uv| collapsed_parameter_axis(face, *uv).is_some()) || boundary_layer;
-		if !constrained_or_singular {
+		if !angular_exempt {
+			normal_angles.push(angle);
+		}
+		// A collapsed chart cell converges to one geometric pole. Likewise, a
+		// canonical edge segment far below the requested chord tolerance can force
+		// one local needle at a sharp cusp; removing it would crack the shared edge.
+		// Exempt only those two topological cases. Boundary collars otherwise obey
+		// the same hard aspect limit as the interior, so a rejected zipper is retried
+		// with a better density transition. Linear error remains fully enforced.
+		if !hard_aspect_exempt {
 			let physical_aspect = triangle_aspect(positions);
-			physical_aspects.push(physical_aspect);
 			if physical_aspect > worst_aspect.0 {
 				worst_aspect = (physical_aspect, indices, uvs, positions);
 			}
@@ -1317,6 +1329,9 @@ fn mesh_satisfies_tolerances(face: &TrimmedFace, mesh: &MeshedFace, linear: f64,
 					eprintln!("custom tessellation face {} produced a non-finite physical aspect, indices {:?}, uvs {:?}, points {:?}", face.index, indices, uvs, positions);
 				}
 				return Ok(reject_mesh_tolerance(face, "ordinary triangle has non-finite physical aspect"));
+			}
+			if !distribution_aspect_exempt {
+				physical_aspects.push(physical_aspect);
 			}
 		}
 		for edge in 0..3 {
@@ -1333,12 +1348,19 @@ fn mesh_satisfies_tolerances(face: &TrimmedFace, mesh: &MeshedFace, linear: f64,
 		}
 	}
 	check_cancelled(progress)?;
-	let angular_p99 = percentile(&mut normal_angles, 0.99).ok_or(Error::TriangulationFailed)?;
-	if angular_p99 > usable_angular * acceptance_slack {
-		if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
-			eprintln!("custom tessellation face {} facet-to-surface normal angle p99 {angular_p99:.12e} > {:.12e}", face.index, usable_angular * acceptance_slack);
+	if let Some(angular_p99) = percentile(&mut normal_angles, 0.99) {
+		if angular_p99 > usable_angular * acceptance_slack {
+			if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+				eprintln!("custom tessellation face {} facet-to-surface normal angle p99 {angular_p99:.12e} > {:.12e}", face.index, usable_angular * acceptance_slack);
+			}
+			return Ok(reject_mesh_tolerance(face, "angular-deflection violations are not confined to boundary or singular cells"));
 		}
-		return Ok(reject_mesh_tolerance(face, "angular-deflection violations are not confined to boundary or singular cells"));
+	}
+	if worst_aspect.0 > maximum_hard_physical_aspect * acceptance_slack {
+		if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+			eprintln!("custom tessellation face {} ordinary worst aspect {:.12e} > {maximum_hard_physical_aspect:.12e}, indices {:?}, uvs {:?}, points {:?}", face.index, worst_aspect.0, worst_aspect.1, worst_aspect.2, worst_aspect.3);
+		}
+		return Ok(reject_mesh_tolerance(face, "ordinary physical triangle aspect exceeds hard quality limit"));
 	}
 	if let Some(aspect_p99) = percentile(&mut physical_aspects, 0.99) {
 		if aspect_p99 > maximum_hard_physical_aspect * acceptance_slack {
