@@ -1513,8 +1513,15 @@ fn mesh_structured_patch(face: &TrimmedFace, linear: f64, angular: f64, progress
 	// unstructured point cloud.
 	for transition_ring_count in [8, 16, 32, 64] {
 		check_cancelled(progress)?;
-		let Some(mesh) = mesh_inset_structured_patch(face, lower, upper, left, right, u_tolerance, v_tolerance, linear, angular, transition_ring_count, progress)? else {
-			return Ok(None);
+		let mesh = match mesh_inset_structured_patch(face, lower, upper, left, right, u_tolerance, v_tolerance, linear, angular, transition_ring_count, progress) {
+			Ok(Some(mesh)) => mesh,
+			Ok(None) => return Ok(None),
+			// A sparse boundary can force the first collar to bridge too far
+			// across a strongly curved chart. Treat that local connectivity as
+			// a rejected candidate and retry with a more gradual, still bounded
+			// collar; cancellation and resource failures remain authoritative.
+			Err(Error::TriangulationFailed) => continue,
+			Err(error) => return Err(error),
 		};
 		if mesh_satisfies_tolerances(face, &mesh, linear, angular, progress)? {
 			return Ok(Some(mesh));
