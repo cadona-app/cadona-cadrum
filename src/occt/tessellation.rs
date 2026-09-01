@@ -120,10 +120,16 @@ impl RationalSurface {
 		}
 		let u = uv.x.clamp(self.uv_bounds[0], self.uv_bounds[1]);
 		let v = uv.y.clamp(self.uv_bounds[2], self.uv_bounds[3]);
-		let u_basis = basis_and_derivative(self.u_count, self.u_degree, &self.u_knots, u)?;
-		let v_basis = basis_and_derivative(self.v_count, self.v_degree, &self.v_knots, v)?;
-		let (u_values, u_derivatives) = u_basis.components();
-		let (v_values, v_derivatives) = v_basis.components();
+		let mut u_values = [0.0; MAXIMUM_BASIS_WIDTH];
+		let mut u_derivatives = [0.0; MAXIMUM_BASIS_WIDTH];
+		let mut v_values = [0.0; MAXIMUM_BASIS_WIDTH];
+		let mut v_derivatives = [0.0; MAXIMUM_BASIS_WIDTH];
+		let u_basis = basis_and_derivative(self.u_count, self.u_degree, &self.u_knots, u, &mut u_values, &mut u_derivatives)?;
+		let v_basis = basis_and_derivative(self.v_count, self.v_degree, &self.v_knots, v, &mut v_values, &mut v_derivatives)?;
+		let u_values = &u_values[..u_basis.value_count];
+		let u_derivatives = &u_derivatives[..u_basis.value_count];
+		let v_values = &v_values[..v_basis.value_count];
+		let v_derivatives = &v_derivatives[..v_basis.value_count];
 
 		// Evaluate in a deterministic face-local frame. Rational derivative
 		// recovery subtracts two weighted positions; accumulating world-space
@@ -168,27 +174,17 @@ impl RationalSurface {
 	}
 }
 
-struct BasisWindow {
+struct BasisSupport {
 	first: usize,
 	value_count: usize,
-	values: [f64; MAXIMUM_BASIS_WIDTH],
-	derivatives: [f64; MAXIMUM_BASIS_WIDTH],
 }
 
-impl BasisWindow {
-	fn components(&self) -> (&[f64], &[f64]) {
-		(&self.values[..self.value_count], &self.derivatives[..self.value_count])
-	}
-}
-
-fn basis_and_derivative(control_count: usize, degree: usize, knots: &[f64], parameter: f64) -> Option<BasisWindow> {
+fn basis_and_derivative(control_count: usize, degree: usize, knots: &[f64], parameter: f64, values: &mut [f64; MAXIMUM_BASIS_WIDTH], derivatives: &mut [f64; MAXIMUM_BASIS_WIDTH]) -> Option<BasisSupport> {
 	let expected_knot_count = control_count.checked_add(degree)?.checked_add(1)?;
 	if degree == 0 || degree > MAXIMUM_BSPLINE_DEGREE || control_count < 2 || knots.len() != expected_knot_count {
 		return None;
 	}
 	let value_count = degree.checked_add(1)?;
-	let mut values = [0.0; MAXIMUM_BASIS_WIDTH];
-	let mut derivatives = [0.0; MAXIMUM_BASIS_WIDTH];
 	let mut lower_values = [0.0; MAXIMUM_BSPLINE_DEGREE];
 	let mut recurrence_scratch = [0.0; MAXIMUM_BASIS_WIDTH * 2];
 	let first = fill_local_basis_values(control_count, degree, knots, parameter, &mut values[..value_count], &mut recurrence_scratch[..value_count.checked_mul(2)?])?;
@@ -196,7 +192,7 @@ fn basis_and_derivative(control_count: usize, degree: usize, knots: &[f64], para
 	let lower_parameter = if parameter >= domain_end { next_down(domain_end) } else { parameter };
 	let lower_first = fill_local_basis_values(control_count.checked_add(1)?, degree - 1, knots, lower_parameter, &mut lower_values[..degree], &mut recurrence_scratch[..degree.checked_mul(2)?])?;
 	let lower_values = &lower_values[..degree];
-	for offset in 0..value_count {
+	for (offset, derivative) in derivatives.iter_mut().enumerate().take(value_count) {
 		let index = first + offset;
 		let left_denominator = knots[index + degree] - knots[index];
 		let right_denominator = knots[index + degree + 1] - knots[index + 1];
@@ -204,9 +200,9 @@ fn basis_and_derivative(control_count: usize, degree: usize, knots: &[f64], para
 		let right_basis = (index + 1).checked_sub(lower_first).and_then(|lower_offset| lower_values.get(lower_offset)).copied().unwrap_or(0.0);
 		let left = if left_denominator.abs() > f64::EPSILON { degree as f64 * left_basis / left_denominator } else { 0.0 };
 		let right = if right_denominator.abs() > f64::EPSILON { degree as f64 * right_basis / right_denominator } else { 0.0 };
-		derivatives[offset] = left - right;
+		*derivative = left - right;
 	}
-	(values[..value_count].iter().chain(&derivatives[..value_count]).all(|value| value.is_finite())).then_some(BasisWindow { first, value_count, values, derivatives })
+	(values[..value_count].iter().chain(&derivatives[..value_count]).all(|value| value.is_finite())).then_some(BasisSupport { first, value_count })
 }
 
 fn next_down(value: f64) -> f64 {
