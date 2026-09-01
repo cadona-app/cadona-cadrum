@@ -17,8 +17,9 @@ use crate::{Error, Tessellation};
 // resource ceiling without imposing the obsolete u16-sized limit that made a
 // valid high-resolution face impossible to export.
 const MAXIMUM_FACE_VERTICES: usize = 1_048_576;
-const MAXIMUM_REFINEMENT_PASSES: usize = 16;
-const MAXIMUM_INSERTIONS_PER_PASS: usize = 1_024;
+const MAXIMUM_REFINEMENT_PASSES: usize = 32;
+const MAXIMUM_REQUIRED_INSERTIONS_PER_PASS: usize = 4_096;
+const MAXIMUM_QUALITY_INSERTIONS_PER_PASS: usize = 1_024;
 // Geom_BSplineSurface::MaxDegree() is 25. The FFI extracts only OCCT surfaces,
 // so fixed storage covers every valid input without a hot-path heap allocation.
 const MAXIMUM_BSPLINE_DEGREE: usize = 25;
@@ -114,6 +115,29 @@ impl SurfaceSample {
 }
 
 impl RationalSurface {
+	fn is_planar(&self) -> bool {
+		let Some(origin) = self.poles.first().copied() else {
+			return false;
+		};
+		let scale = self.poles.iter().map(|pole| pole.distance(origin)).fold(0.0, f64::max).max(1.0);
+		let mut normal = None;
+		for first in self.poles.iter().copied().skip(1) {
+			for second in self.poles.iter().copied().skip(2) {
+				if let Some(candidate) = (first - origin).cross(second - origin).try_normalize() {
+					normal = Some(candidate);
+					break;
+				}
+			}
+			if normal.is_some() {
+				break;
+			}
+		}
+		let Some(normal) = normal else {
+			return false;
+		};
+		self.poles.iter().all(|pole| (*pole - origin).dot(normal).abs() <= scale * 1.0e-10)
+	}
+
 	fn evaluate(&self, uv: DVec2) -> Option<SurfaceSample> {
 		if !uv.is_finite() {
 			return None;
@@ -324,19 +348,72 @@ struct ParametricVertex {
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct BoundaryOccurrence {
+	loop_index: u32,
 	edge_index: u32,
 	occurrence_index: u32,
 }
 
 impl ParametricVertex {
-	fn add_boundary_occurrence(&mut self, occurrence: BoundaryOccurrence) {
+	fn add_boundary_occurrence(&mut self, occurrence: BoundaryOccurrence) -> Result<(), Error> {
 		if self.boundary_occurrences.contains(&Some(occurrence)) {
-			return;
+			return Ok(());
 		}
 		if let Some(slot) = self.boundary_occurrences.iter_mut().find(|slot| slot.is_none()) {
 			*slot = Some(occurrence);
+			Ok(())
+		} else {
+			Err(Error::TriangulationFailed)
 		}
 	}
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct BoundarySegmentId {
+	occurrence: BoundaryOccurrence,
+	canonical_segment_index: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BoundaryContractPoint {
+	uv: DVec2,
+	position: DVec3,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FaceBoundarySegment {
+	Geometric { first: BoundaryContractPoint, second: BoundaryContractPoint, expected_direction: i8 },
+	Collapsed { first: BoundaryContractPoint, second: BoundaryContractPoint },
+}
+
+impl FaceBoundarySegment {
+	fn points(self) -> [BoundaryContractPoint; 2] {
+		match self {
+			Self::Geometric { first, second, .. } | Self::Collapsed { first, second } => [first, second],
+		}
+	}
+
+	fn is_collapsed(self) -> bool {
+		matches!(self, Self::Collapsed { .. })
+	}
+
+	fn expected_direction(self) -> Option<i8> {
+		match self {
+			Self::Geometric { expected_direction, .. } => Some(expected_direction),
+			Self::Collapsed { .. } => None,
+		}
+	}
+}
+
+#[derive(Clone, Debug)]
+struct BoundaryOccurrenceRefinement {
+	occurrence: BoundaryOccurrence,
+	direction: EdgeOccurrenceDirection,
+	points: Vec<BoundaryContractPoint>,
+}
+
+#[derive(Clone, Debug)]
+struct FaceBoundaryContract {
+	segments: BTreeMap<BoundarySegmentId, FaceBoundarySegment>,
 }
 
 impl HasPosition for ParametricVertex {
@@ -360,6 +437,228 @@ struct MeshedFace {
 	/// Canonical edge sequences augmented by a face-local self-seam
 	/// refinement. Ordinary inter-face edges are never refined here.
 	refined_edges: BTreeMap<u32, Vec<DVec3>>,
+	boundary_refinements: Vec<BoundaryOccurrenceRefinement>,
+}
+
+impl FaceBoundaryContract {
+	fn from_face(face: &TrimmedFace, refinements: &[BoundaryOccurrenceRefinement]) -> Result<Self, Error> {
+		let mut segments = BTreeMap::new();
+		let mut occurrence_directions = BTreeMap::new();
+		let target_chart_direction = if face.reversed { -1 } else { 1 };
+		for (loop_index, trim_loop) in face.loops.iter().enumerate() {
+			let loop_index = u32::try_from(loop_index).map_err(|_| Error::TriangulationFailed)?;
+			let signed_area = trim_loop
+				.vertices
+				.iter()
+				.zip(trim_loop.vertices.iter().cycle().skip(1))
+				.take(trim_loop.vertices.len())
+				.map(|(first, second)| first.uv.perp_dot(second.uv))
+				.sum::<f64>();
+			if !signed_area.is_finite() || signed_area == 0.0 {
+				return Err(Error::TriangulationFailed);
+			}
+			let loop_direction = if signed_area.signum() as i8 == target_chart_direction { 1 } else { -1 };
+			for index in 0..trim_loop.vertices.len() {
+				let first = trim_loop.vertices[index];
+				let second = trim_loop.vertices[(index + 1) % trim_loop.vertices.len()];
+				let occurrence = BoundaryOccurrence { loop_index, edge_index: first.edge_index, occurrence_index: first.edge_occurrence_index };
+				match occurrence_directions.insert(occurrence, (first.edge_occurrence_direction, loop_direction)) {
+					Some(existing) if existing != (first.edge_occurrence_direction, loop_direction) => return Err(Error::TriangulationFailed),
+					_ => {}
+				}
+				let canonical_segment_index = match first.edge_occurrence_direction {
+					EdgeOccurrenceDirection::Forward => first.edge_sample_index,
+					EdgeOccurrenceDirection::Reversed => first.edge_sample_index.checked_sub(1).ok_or(Error::TriangulationFailed)?,
+				};
+				let id = BoundarySegmentId { occurrence, canonical_segment_index };
+				let first = BoundaryContractPoint { uv: first.uv, position: first.position };
+				let second = BoundaryContractPoint { uv: second.uv, position: second.position };
+				let segment = if point_key(first.position) == point_key(second.position) { FaceBoundarySegment::Collapsed { first, second } } else { FaceBoundarySegment::Geometric { first, second, expected_direction: loop_direction } };
+				if segments.insert(id, segment).is_some() {
+					return Err(Error::TriangulationFailed);
+				}
+			}
+		}
+
+		let mut refined_edge_sequences = BTreeMap::<u32, Vec<PointKey>>::new();
+		for refinement in refinements {
+			if refinement.points.len() < 2 || refinement.points.iter().any(|point| !point.uv.is_finite() || !point.position.is_finite()) {
+				return Err(Error::TriangulationFailed);
+			}
+			let source_ids = segments.keys().filter(|id| id.occurrence == refinement.occurrence).copied().collect::<Vec<_>>();
+			if source_ids.is_empty() {
+				return Err(Error::TriangulationFailed);
+			}
+			let Some((source_direction, loop_direction)) = occurrence_directions.get(&refinement.occurrence).copied() else {
+				return Err(Error::TriangulationFailed);
+			};
+			if source_direction != refinement.direction {
+				return Err(Error::TriangulationFailed);
+			}
+			let expected_direction = loop_direction * if refinement.direction == EdgeOccurrenceDirection::Forward { 1 } else { -1 };
+			let source_points = source_ids.iter().flat_map(|id| segments[id].points()).map(|point| point_key(point.position)).collect::<BTreeSet<_>>();
+			if source_points.iter().any(|source| !refinement.points.iter().any(|point| point_key(point.position) == *source)) {
+				return Err(Error::TriangulationFailed);
+			}
+			for id in source_ids {
+				segments.remove(&id);
+			}
+			for (index, points) in refinement.points.windows(2).enumerate() {
+				let canonical_segment_index = u32::try_from(index).map_err(|_| Error::TriangulationFailed)?;
+				let id = BoundarySegmentId { occurrence: refinement.occurrence, canonical_segment_index };
+				let [first, second] = [points[0], points[1]];
+				let segment = if point_key(first.position) == point_key(second.position) { FaceBoundarySegment::Collapsed { first, second } } else { FaceBoundarySegment::Geometric { first, second, expected_direction } };
+				if segments.insert(id, segment).is_some() {
+					return Err(Error::TriangulationFailed);
+				}
+			}
+
+			let sequence = refinement.points.iter().map(|point| point_key(point.position)).collect::<Vec<_>>();
+			match refined_edge_sequences.get(&refinement.occurrence.edge_index) {
+				Some(existing) if existing != &sequence => return Err(Error::TriangulationFailed),
+				Some(_) => {}
+				None => {
+					refined_edge_sequences.insert(refinement.occurrence.edge_index, sequence);
+				}
+			}
+		}
+		Ok(Self { segments })
+	}
+
+	fn audit(&self, mesh: &MeshedFace) -> Result<(), Error> {
+		#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+		struct ParameterKey(u64, u64);
+
+		#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+		struct BoundaryPointKey {
+			parameter: ParameterKey,
+			position: PointKey,
+		}
+
+		fn parameter_key(uv: DVec2) -> ParameterKey {
+			fn coordinate_key(value: f64) -> u64 {
+				if value == 0.0 { 0 } else { value.to_bits() }
+			}
+			ParameterKey(coordinate_key(uv.x), coordinate_key(uv.y))
+		}
+
+		fn boundary_point_key(point: BoundaryContractPoint) -> BoundaryPointKey {
+			BoundaryPointKey { parameter: parameter_key(point.uv), position: point_key(point.position) }
+		}
+
+		fn ordered_pair<T: Ord>(first: T, second: T) -> (T, T) {
+			if first <= second { (first, second) } else { (second, first) }
+		}
+
+		let mut segment_lookup = BTreeMap::<(BoundaryPointKey, BoundaryPointKey), Vec<BoundarySegmentId>>::new();
+		let mut endpoints_by_position = BTreeMap::<PointKey, BTreeSet<BoundaryPointKey>>::new();
+		let mut collapsed_positions = BTreeSet::new();
+		for (id, segment) in &self.segments {
+			let [first, second] = segment.points().map(boundary_point_key);
+			segment_lookup.entry(ordered_pair(first, second)).or_default().push(*id);
+			endpoints_by_position.entry(first.position).or_default().insert(first);
+			endpoints_by_position.entry(second.position).or_default().insert(second);
+			if segment.is_collapsed() {
+				collapsed_positions.insert(first.position);
+				collapsed_positions.insert(second.position);
+			}
+		}
+
+		let endpoint_keys = endpoints_by_position.values().flat_map(BTreeSet::iter).copied().collect::<BTreeSet<_>>();
+		let aliases = mesh
+			.vertices
+			.iter()
+			.zip(&mesh.uvs)
+			.map(|(position, uv)| {
+				let position = point_key(*position);
+				let exact = BoundaryPointKey { parameter: parameter_key(*uv), position };
+				let mut aliases = BTreeSet::new();
+				if endpoint_keys.contains(&exact) {
+					aliases.insert(exact);
+				}
+				if collapsed_positions.contains(&position) {
+					aliases.extend(endpoints_by_position.get(&position).into_iter().flatten().copied());
+				}
+				aliases
+			})
+			.collect::<Vec<_>>();
+
+		#[derive(Clone, Copy, Default)]
+		struct DirectedEdgeUse {
+			incidence: usize,
+			balance: i8,
+		}
+
+		let mut edge_uses = BTreeMap::<(u32, u32), DirectedEdgeUse>::new();
+		for triangle in mesh.indices.chunks_exact(3) {
+			for edge in 0..3 {
+				let directed = (triangle[edge], triangle[(edge + 1) % 3]);
+				let local_edge = ordered_pair(directed.0, directed.1);
+				if local_edge.0 == local_edge.1 {
+					return Err(Error::TriangulationFailed);
+				}
+				let edge_use = edge_uses.entry(local_edge).or_default();
+				edge_use.incidence += 1;
+				edge_use.balance = edge_use.balance.checked_add(if directed == local_edge { 1 } else { -1 }).ok_or(Error::TriangulationFailed)?;
+			}
+		}
+
+		let mut segment_uses = BTreeMap::<BoundarySegmentId, usize>::new();
+		for ((first, second), edge_use) in edge_uses {
+			let first_aliases = aliases.get(first as usize).ok_or(Error::TriangulationFailed)?;
+			let second_aliases = aliases.get(second as usize).ok_or(Error::TriangulationFailed)?;
+			let matches = first_aliases
+				.iter()
+				.flat_map(|first| second_aliases.iter().map(move |second| ordered_pair(*first, *second)))
+				.filter_map(|points| segment_lookup.get(&points))
+				.flatten()
+				.copied()
+				.collect::<BTreeSet<_>>();
+			if matches.is_empty() && edge_use.incidence == 2 && edge_use.balance == 0 {
+				continue;
+			}
+			let Some(id) = matches.first().copied().filter(|_| matches.len() == 1) else {
+				if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+					eprintln!("custom tessellation face {} boundary contract rejected local edge {first}-{second}: incidence {}, directed balance {}, typed matches {matches:?}, uvs {:?}-{:?}, points {:?}-{:?}", mesh.index, edge_use.incidence, edge_use.balance, mesh.uvs[first as usize], mesh.uvs[second as usize], mesh.vertices[first as usize], mesh.vertices[second as usize]);
+				}
+				return Err(Error::TriangulationFailed);
+			};
+			let segment = self.segments[&id];
+			if edge_use.incidence != 1 || edge_use.balance.abs() != 1 || segment.is_collapsed() {
+				if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+					eprintln!("custom tessellation face {} boundary contract rejected typed segment {id:?} on local edge {first}-{second}: incidence {}, directed balance {}, segment {segment:?}", mesh.index, edge_use.incidence, edge_use.balance);
+				}
+				return Err(Error::TriangulationFailed);
+			}
+			let [segment_first, segment_second] = segment.points().map(boundary_point_key);
+			let local_order = if first_aliases.contains(&segment_first) && second_aliases.contains(&segment_second) {
+				1
+			} else if first_aliases.contains(&segment_second) && second_aliases.contains(&segment_first) {
+				-1
+			} else {
+				return Err(Error::TriangulationFailed);
+			};
+			if segment.expected_direction().is_some_and(|expected| edge_use.balance * local_order != expected) {
+				if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+					eprintln!("custom tessellation face {} boundary contract rejected orientation of segment {id:?} on local edge {first}-{second}: directed balance {}, local endpoint order {local_order}, expected {:?}", mesh.index, edge_use.balance, segment.expected_direction());
+				}
+				return Err(Error::TriangulationFailed);
+			}
+			*segment_uses.entry(id).or_default() += 1;
+		}
+
+		for (id, segment) in &self.segments {
+			let expected = usize::from(!segment.is_collapsed());
+			let actual = segment_uses.get(id).copied().unwrap_or(0);
+			if actual != expected {
+				if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+					eprintln!("custom tessellation face {} boundary contract rejected segment {id:?}: expected {expected} local uses, found {actual}, segment {segment:?}", mesh.index);
+				}
+				return Err(Error::TriangulationFailed);
+			}
+		}
+		Ok(())
+	}
 }
 
 pub(super) fn mesh_brep_source(data: ffi::BrepMeshSourceData, options: Tessellation, progress: &ffi::CancellationToken) -> Result<ffi::MeshData, Error> {
@@ -405,15 +704,16 @@ fn mesh_face(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::Canc
 	}
 	let metric = MetricMap::from_face(face);
 	let mut triangulation = FaceTriangulation::new();
-	for trim_loop in &face.loops {
+	for (loop_index, trim_loop) in face.loops.iter().enumerate() {
+		let loop_index = u32::try_from(loop_index).map_err(|_| Error::TriangulationFailed)?;
 		let mut handles = Vec::with_capacity(trim_loop.vertices.len());
 		for (index, boundary) in trim_loop.vertices.iter().enumerate() {
 			let metric_position = metric.map(boundary.uv);
-			let boundary_occurrences = boundary_vertex_occurrences(trim_loop, index);
+			let boundary_occurrences = boundary_vertex_occurrences(loop_index, trim_loop, index);
 			let handle = if let Some(existing) = triangulation.locate_vertex(metric_position) {
 				let existing = existing.fix();
 				for occurrence in boundary_occurrences.into_iter().flatten() {
-					triangulation.vertex_data_mut(existing).add_boundary_occurrence(occurrence);
+					triangulation.vertex_data_mut(existing).add_boundary_occurrence(occurrence)?;
 				}
 				existing
 			} else {
@@ -435,6 +735,9 @@ fn mesh_face(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::Canc
 	}
 
 	seed_structured_patch(face, metric, &mut triangulation);
+	if !face.surface.is_planar() {
+		seed_boundary_collar(face, metric, &mut triangulation);
+	}
 	seed_metric_lattice(face, metric, linear, &mut triangulation);
 
 	// Seed broad trimmed regions before exact-error refinement. A boundary-only
@@ -455,13 +758,24 @@ fn mesh_face(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::Canc
 			return Err(Error::Cancelled);
 		}
 		let mut candidates = refinement_candidates(face, &triangulation, usable_linear, angular.max(1.0e-3));
+		if face.surface.is_planar() {
+			candidates.retain(|candidate| candidate.required);
+		}
 		if candidates.is_empty() || triangulation.num_vertices() >= MAXIMUM_FACE_VERTICES {
 			break;
 		}
+		let refining_required_error = candidates.iter().any(|candidate| candidate.required);
+		candidates.retain(|candidate| candidate.required == refining_required_error);
 		candidates.sort_by(|first, second| second.required.cmp(&first.required).then_with(|| second.score.total_cmp(&first.score)).then_with(|| first.uv.x.total_cmp(&second.uv.x)).then_with(|| first.uv.y.total_cmp(&second.uv.y)));
 		let before = triangulation.num_vertices();
 		let room = MAXIMUM_FACE_VERTICES - before;
-		for candidate in candidates.into_iter().take(MAXIMUM_INSERTIONS_PER_PASS.min(room)) {
+		let maximum_insertions = if refining_required_error { MAXIMUM_REQUIRED_INSERTIONS_PER_PASS } else { MAXIMUM_QUALITY_INSERTIONS_PER_PASS };
+		let mut seen_candidates = BTreeSet::new();
+		for candidate in candidates
+			.into_iter()
+			.filter(|candidate| seen_candidates.insert((candidate.uv.x.to_bits(), candidate.uv.y.to_bits())))
+			.take(maximum_insertions.min(room))
+		{
 			insert_interior_vertex(face, &mut triangulation, candidate.uv, metric);
 		}
 		if triangulation.num_vertices() == before {
@@ -479,11 +793,11 @@ fn mesh_face(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::Canc
 	Ok(mesh)
 }
 
-fn boundary_vertex_occurrences(trim_loop: &TrimLoop, index: usize) -> [Option<BoundaryOccurrence>; 2] {
+fn boundary_vertex_occurrences(loop_index: u32, trim_loop: &TrimLoop, index: usize) -> [Option<BoundaryOccurrence>; 2] {
 	let current = &trim_loop.vertices[index];
 	let previous = &trim_loop.vertices[(index + trim_loop.vertices.len() - 1) % trim_loop.vertices.len()];
-	let current = BoundaryOccurrence { edge_index: current.edge_index, occurrence_index: current.edge_occurrence_index };
-	let previous = BoundaryOccurrence { edge_index: previous.edge_index, occurrence_index: previous.edge_occurrence_index };
+	let current = BoundaryOccurrence { loop_index, edge_index: current.edge_index, occurrence_index: current.edge_occurrence_index };
+	let previous = BoundaryOccurrence { loop_index, edge_index: previous.edge_index, occurrence_index: previous.edge_occurrence_index };
 	if current == previous {
 		[Some(current), None]
 	} else {
@@ -515,6 +829,7 @@ fn mesh_satisfies_tolerances(face: &TrimmedFace, mesh: &MeshedFace, linear: f64,
 	if mesh.vertices.iter().any(|point| !point.is_finite()) || mesh.uvs.iter().any(|uv| !uv.is_finite()) || mesh.normals.iter().any(|normal| !normal.is_finite()) {
 		return Err(Error::TriangulationFailed);
 	}
+	FaceBoundaryContract::from_face(face, &mesh.boundary_refinements)?.audit(mesh)?;
 
 	let usable_linear = (linear - face.surface.approximation_error).max(linear * 0.20).max(1.0e-10);
 	let usable_angular = angular.max(1.0e-3);
@@ -525,7 +840,6 @@ fn mesh_satisfies_tolerances(face: &TrimmedFace, mesh: &MeshedFace, linear: f64,
 	// uses the strict requested tolerance.
 	let acceptance_slack = 1.05;
 	let boundary_vertex_keys = face.loops.iter().flat_map(|trim_loop| trim_loop.vertices.iter().map(|vertex| point_key(vertex.position))).chain(mesh.refined_edges.values().flatten().copied().map(point_key)).collect::<BTreeSet<_>>();
-	let mut edge_counts = BTreeMap::<(PointKey, PointKey), usize>::new();
 	let mut normal_angles = Vec::with_capacity(mesh.indices.len() / 3);
 	let mut physical_aspects = Vec::with_capacity(mesh.indices.len() / 3);
 	let mut worst_aspect = (0.0, [0_usize; 3], [DVec2::ZERO; 3], [DVec3::ZERO; 3]);
@@ -585,62 +899,6 @@ fn mesh_satisfies_tolerances(face: &TrimmedFace, mesh: &MeshedFace, linear: f64,
 				}
 				return Ok(reject_mesh_tolerance(face, "triangle edge exceeds linear deflection"));
 			}
-			let edge_key = ordered_edge_key(positions[edge], positions[next]);
-			if edge_key.0 != edge_key.1 {
-				*edge_counts.entry(edge_key).or_default() += 1;
-			}
-		}
-	}
-
-	let mut boundary_edges = BTreeSet::new();
-	for trim_loop in &face.loops {
-		for index in 0..trim_loop.vertices.len() {
-			let edge_index = trim_loop.vertices[index].edge_index;
-			if mesh.refined_edges.contains_key(&edge_index) {
-				continue;
-			}
-			let first = trim_loop.vertices[index].position;
-			let second = trim_loop.vertices[(index + 1) % trim_loop.vertices.len()].position;
-			let key = ordered_edge_key(first, second);
-			if key.0 != key.1 {
-				boundary_edges.insert(key);
-			}
-		}
-	}
-	for points in mesh.refined_edges.values() {
-		for pair in points.windows(2) {
-			let key = ordered_edge_key(pair[0], pair[1]);
-			if key.0 != key.1 {
-				boundary_edges.insert(key);
-			}
-		}
-	}
-	for boundary in &boundary_edges {
-		if !edge_counts.contains_key(boundary) {
-			if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
-				let incident = mesh
-					.indices
-					.chunks_exact(3)
-					.flat_map(|triangle| [(triangle[0], triangle[1]), (triangle[1], triangle[2]), (triangle[2], triangle[0])])
-					.filter_map(|(first, second)| {
-						let first = mesh.vertices[first as usize];
-						let second = mesh.vertices[second as usize];
-						let key = ordered_edge_key(first, second);
-						(key.0 == boundary.0 || key.1 == boundary.0 || key.0 == boundary.1 || key.1 == boundary.1).then_some((first, second))
-					})
-					.take(12)
-					.collect::<Vec<_>>();
-				eprintln!("custom tessellation face {} missing canonical boundary edge {boundary:?}; incident {incident:?}", face.index);
-			}
-			return Err(Error::TriangulationFailed);
-		}
-	}
-	for (edge, count) in edge_counts {
-		if count > 2 || (count == 1 && !boundary_edges.contains(&edge)) {
-			if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
-				eprintln!("custom tessellation face {} has invalid edge incidence {count} for {edge:?}", face.index);
-			}
-			return Err(Error::TriangulationFailed);
 		}
 	}
 	let angular_p99 = percentile(&mut normal_angles, 0.99).ok_or(Error::TriangulationFailed)?;
@@ -676,16 +934,6 @@ fn reject_mesh_tolerance(face: &TrimmedFace, reason: &str) -> bool {
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct PointKey(u64, u64, u64);
-
-fn ordered_edge_key(first: DVec3, second: DVec3) -> (PointKey, PointKey) {
-	let first = point_key(first);
-	let second = point_key(second);
-	if first <= second {
-		(first, second)
-	} else {
-		(second, first)
-	}
-}
 
 fn point_key(point: DVec3) -> PointKey {
 	fn coordinate_key(value: f64) -> u64 {
@@ -784,6 +1032,15 @@ fn mesh_structured_patch(face: &TrimmedFace, linear: f64, angular: f64) -> Resul
 				return Ok(Some(mesh));
 			}
 		}
+	}
+	// Four independently generated inset collars overlap at their corners.
+	// Exact duplicate welding closes the coincident radial edges, but it cannot
+	// turn the two different corner diagonals into one valid planar cavity.  A
+	// planar face needs no structured surface-error control, so let the canonical
+	// constrained Delaunay route fill it as one domain instead of accepting or
+	// concealing an incidence-one corner seam.
+	if face.surface.is_planar() {
+		return Ok(None);
 	}
 
 	let Some(mesh) = mesh_inset_structured_patch(face, lower, upper, left, right, u_tolerance, v_tolerance, linear, angular)? else {
@@ -917,7 +1174,8 @@ fn mesh_singular_row_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVert
 		eprintln!("custom tessellation face {} graded singular rows {:?}: {} vertices, {} triangles", face.index, row_sizes, vertices.len(), indices.len() / 3);
 	}
 	let refined_edges = BTreeMap::from([(seam_edge_index, refined_seam_points)]);
-	Ok(Some(MeshedFace { index: face.index, tshape_id: face.tshape_id, vertices, uvs, normals, indices, refined_edges }))
+	let boundary_refinements = self_seam_boundary_refinements(left, right, &v_coordinates, &refined_edges[&seam_edge_index])?;
+	Ok(Some(MeshedFace { index: face.index, tshape_id: face.tshape_id, vertices, uvs, normals, indices, refined_edges, boundary_refinements }))
 }
 
 fn surface_polyline_length(face: &TrimmedFace, u_coordinates: &[f64], v: f64) -> Result<f64, Error> {
@@ -1042,7 +1300,20 @@ fn mesh_column_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], u
 		let mut column_indices = Vec::with_capacity(column_coordinates.len());
 		for (v_index, v) in column_coordinates.iter().copied().enumerate() {
 			let u = u_coordinates[u_index];
-			let sample = face.surface.evaluate(DVec2::new(u, v)).ok_or(Error::TriangulationFailed)?;
+			// Opposite canonical boundaries can differ by a few chart ULPs even
+			// when their physical samples correspond one-for-one.  The tensor
+			// interior uses their averaged coordinate, but a boundary vertex must
+			// retain the exact UV owned by that occurrence.  Otherwise the mesh
+			// silently loses its typed boundary-segment identity and a discarded
+			// collinear chart cell appears as an incidence-one interior edge.
+			let uv = if v_index == 0 && !lower_collapsed {
+				lower.get(u_index).map(|vertex| vertex.uv).unwrap_or(DVec2::new(u, v))
+			} else if v_index + 1 == column_coordinates.len() && !upper_collapsed {
+				upper.get(u_index).map(|vertex| vertex.uv).unwrap_or(DVec2::new(u, v))
+			} else {
+				DVec2::new(u, v)
+			};
+			let sample = face.surface.evaluate(uv).ok_or(Error::TriangulationFailed)?;
 			let position = if let Some(column) = boundary_column {
 				if let Some(points) = refined_seam_points.as_ref() {
 					points[v_index]
@@ -1056,10 +1327,10 @@ fn mesh_column_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], u
 			} else {
 				sample.position
 			};
-			let normal = oriented_surface_normal(face, DVec2::new(u, v)).unwrap_or(DVec3::ZERO);
+			let normal = oriented_surface_normal(face, uv).unwrap_or(DVec3::ZERO);
 			let index = vertices.len();
 			vertices.push(position);
-			uvs.push(DVec2::new(u, v));
+			uvs.push(uv);
 			normals.push(normal);
 			column_indices.push((v, index));
 		}
@@ -1074,8 +1345,12 @@ fn mesh_column_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], u
 		return Err(Error::TriangulationFailed);
 	}
 	fill_singular_normals(face, &uvs, &vertices, &indices, &mut normals)?;
-	let refined_edges = self_seam_edge.zip(refined_seam_points).into_iter().collect();
-	Ok(Some(MeshedFace { index: face.index, tshape_id: face.tshape_id, vertices, uvs, normals, indices, refined_edges }))
+	let refined_edges = self_seam_edge.zip(refined_seam_points).into_iter().collect::<BTreeMap<_, _>>();
+	let boundary_refinements = match self_seam_edge {
+		Some(edge_index) => self_seam_boundary_refinements(left, right, &v_coordinates, &refined_edges[&edge_index])?,
+		None => Vec::new(),
+	};
+	Ok(Some(MeshedFace { index: face.index, tshape_id: face.tshape_id, vertices, uvs, normals, indices, refined_edges, boundary_refinements }))
 }
 
 fn subdivide_axis_intervals(coordinates: &[f64], maximum_step: f64) -> Vec<f64> {
@@ -1149,6 +1424,49 @@ fn boundary_vertices_collapsed(boundary: &[&BoundaryVertex]) -> bool {
 		return false;
 	};
 	boundary.iter().all(|vertex| vertex.position.distance(first.position) <= 1.0e-10)
+}
+
+fn self_seam_boundary_refinements(left: &[&BoundaryVertex], right: &[&BoundaryVertex], coordinates: &[f64], positions: &[DVec3]) -> Result<Vec<BoundaryOccurrenceRefinement>, Error> {
+	fn refinement_for_occurrence(boundary: &[&BoundaryVertex], coordinates: &[f64], positions: &[DVec3]) -> Result<BoundaryOccurrenceRefinement, Error> {
+		let edge_index = dominant_boundary_edge_index(boundary).ok_or(Error::TriangulationFailed)?;
+		let mut occurrence_counts = BTreeMap::<u32, usize>::new();
+		for vertex in boundary.iter().filter(|vertex| vertex.edge_index == edge_index) {
+			*occurrence_counts.entry(vertex.edge_occurrence_index).or_default() += 1;
+		}
+		let occurrence_index = occurrence_counts.into_iter().max_by_key(|(occurrence, count)| (*count, Reverse(*occurrence))).map(|(occurrence, _)| occurrence).ok_or(Error::TriangulationFailed)?;
+		let occurrence_vertices = boundary.iter().enumerate().filter(|(_, vertex)| vertex.edge_index == edge_index && vertex.edge_occurrence_index == occurrence_index).collect::<Vec<_>>();
+		let first = occurrence_vertices.first().ok_or(Error::TriangulationFailed)?;
+		if occurrence_vertices.iter().any(|(_, vertex)| vertex.edge_occurrence_direction != first.1.edge_occurrence_direction) {
+			return Err(Error::TriangulationFailed);
+		}
+		let canonical_ascending = match occurrence_vertices.as_slice() {
+			[(_, first), .., (_, last)] if first.edge_sample_index != last.edge_sample_index => first.edge_sample_index < last.edge_sample_index,
+			[(index, vertex)] => {
+				let traversal_ascending = *index == 0;
+				match vertex.edge_occurrence_direction {
+					EdgeOccurrenceDirection::Forward => traversal_ascending,
+					EdgeOccurrenceDirection::Reversed => !traversal_ascending,
+				}
+			}
+			_ => return Err(Error::TriangulationFailed),
+		};
+		let u = first.1.uv.x;
+		let mut points = coordinates.iter().copied().zip(positions.iter().copied()).map(|(v, position)| BoundaryContractPoint { uv: DVec2::new(u, v), position }).collect::<Vec<_>>();
+		if !canonical_ascending {
+			points.reverse();
+		}
+		Ok(BoundaryOccurrenceRefinement { occurrence: BoundaryOccurrence { loop_index: 0, edge_index, occurrence_index }, direction: first.1.edge_occurrence_direction, points })
+	}
+
+	if coordinates.len() != positions.len() || coordinates.len() < 2 {
+		return Err(Error::TriangulationFailed);
+	}
+	let left = refinement_for_occurrence(left, coordinates, positions)?;
+	let right = refinement_for_occurrence(right, coordinates, positions)?;
+	if left.occurrence.edge_index != right.occurrence.edge_index || left.occurrence == right.occurrence {
+		return Err(Error::TriangulationFailed);
+	}
+	Ok(vec![left, right])
 }
 
 fn dominant_boundary_edge_index(boundary: &[&BoundaryVertex]) -> Option<u32> {
@@ -1265,6 +1583,7 @@ fn mesh_inset_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], up
 	let mut upper_indices = append_boundary_side(face, upper, true, &mut vertices, &mut uvs, &mut normals)?;
 	let mut left_indices = append_boundary_side(face, left, false, &mut vertices, &mut uvs, &mut normals)?;
 	let mut right_indices = append_boundary_side(face, right, false, &mut vertices, &mut uvs, &mut normals)?;
+	weld_exact_boundary_corners([&mut lower_indices, &mut upper_indices, &mut left_indices, &mut right_indices], &vertices, &uvs)?;
 	let mut columns = Vec::<Vec<(f64, usize)>>::with_capacity(u_coordinates.len());
 	for u in u_coordinates.iter().copied() {
 		let mut column = Vec::with_capacity(v_coordinates.len());
@@ -1299,11 +1618,12 @@ fn mesh_inset_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], up
 	triangulate_transition_rings(face, &upper_indices, &upper_rings, &top_inner, true, &vertices, &uvs, &normals, linear, angular, &mut indices)?;
 	triangulate_transition_rings(face, &left_indices, &left_rings, &left_inner, true, &vertices, &uvs, &normals, linear, angular, &mut indices)?;
 	triangulate_transition_rings(face, &right_indices, &right_rings, &right_inner, false, &vertices, &uvs, &normals, linear, angular, &mut indices)?;
+	weld_exact_mesh_vertex_indices(&vertices, &uvs, &mut indices)?;
 	if indices.is_empty() {
 		return Err(Error::TriangulationFailed);
 	}
 	fill_singular_normals(face, &uvs, &vertices, &indices, &mut normals)?;
-	Ok(Some(MeshedFace { index: face.index, tshape_id: face.tshape_id, vertices, uvs, normals, indices, refined_edges: BTreeMap::new() }))
+	Ok(Some(MeshedFace { index: face.index, tshape_id: face.tshape_id, vertices, uvs, normals, indices, refined_edges: BTreeMap::new(), boundary_refinements: Vec::new() }))
 }
 
 #[derive(Clone, Copy)]
@@ -1316,17 +1636,24 @@ fn collapsed_parameter_axis(face: &TrimmedFace, uv: DVec2) -> Option<ParametricA
 	let [u_min, u_max, v_min, v_max] = face.surface.uv_bounds;
 	let u_tolerance = (u_max - u_min).abs().max(1.0) * 1.0e-10;
 	let v_tolerance = (v_max - v_min).abs().max(1.0) * 1.0e-10;
+	let origin = face.surface.poles.first().copied()?;
+	let geometric_scale = face.surface.poles.iter().map(|pole| pole.distance(origin)).fold(0.0, f64::max);
+	let collapse_tolerance = geometric_scale * 1.0e-10 + 1.0e-12;
 	if (uv.y - v_min).abs() <= v_tolerance || (uv.y - v_max).abs() <= v_tolerance {
-		let first = face.surface.evaluate(DVec2::new(u_min, uv.y))?.position;
-		let last = face.surface.evaluate(DVec2::new(u_max, uv.y))?.position;
-		if first.distance(last) <= 1.0e-10 {
+		let samples = [0.0, 0.25, 0.5, 0.75, 1.0].map(|fraction| face.surface.evaluate(DVec2::new(u_min + (u_max - u_min) * fraction, uv.y)).map(|sample| sample.position));
+		let [Some(first), Some(second), Some(middle), Some(fourth), Some(last)] = samples else {
+			return None;
+		};
+		if [second, middle, fourth, last].iter().all(|sample| first.distance(*sample) <= collapse_tolerance) {
 			return Some(ParametricAxis::U);
 		}
 	}
 	if (uv.x - u_min).abs() <= u_tolerance || (uv.x - u_max).abs() <= u_tolerance {
-		let first = face.surface.evaluate(DVec2::new(uv.x, v_min))?.position;
-		let last = face.surface.evaluate(DVec2::new(uv.x, v_max))?.position;
-		if first.distance(last) <= 1.0e-10 {
+		let samples = [0.0, 0.25, 0.5, 0.75, 1.0].map(|fraction| face.surface.evaluate(DVec2::new(uv.x, v_min + (v_max - v_min) * fraction)).map(|sample| sample.position));
+		let [Some(first), Some(second), Some(middle), Some(fourth), Some(last)] = samples else {
+			return None;
+		};
+		if [second, middle, fourth, last].iter().all(|sample| first.distance(*sample) <= collapse_tolerance) {
 			return Some(ParametricAxis::V);
 		}
 	}
@@ -1570,6 +1897,60 @@ fn append_boundary_side(face: &TrimmedFace, vertices_on_side: &[&BoundaryVertex]
 		.collect()
 }
 
+fn weld_exact_boundary_corners(sides: [&mut Vec<(f64, usize)>; 4], vertices: &[DVec3], uvs: &[DVec2]) -> Result<(), Error> {
+	fn coordinate_key(value: f64) -> u64 {
+		if value == 0.0 { 0 } else { value.to_bits() }
+	}
+
+	let mut canonical = BTreeMap::<(u64, u64, PointKey), usize>::new();
+	for side in sides {
+		if side.len() < 2 {
+			return Err(Error::TriangulationFailed);
+		}
+		for endpoint in [0, side.len() - 1] {
+			let index = side[endpoint].1;
+			let uv = *uvs.get(index).ok_or(Error::TriangulationFailed)?;
+			let position = *vertices.get(index).ok_or(Error::TriangulationFailed)?;
+			let key = (coordinate_key(uv.x), coordinate_key(uv.y), point_key(position));
+			match canonical.get(&key).copied() {
+				Some(existing) => side[endpoint].1 = existing,
+				None => {
+					canonical.insert(key, index);
+				}
+			}
+		}
+	}
+	Ok(())
+}
+
+fn weld_exact_mesh_vertex_indices(vertices: &[DVec3], uvs: &[DVec2], indices: &mut Vec<u32>) -> Result<(), Error> {
+	fn coordinate_key(value: f64) -> u64 {
+		if value == 0.0 { 0 } else { value.to_bits() }
+	}
+
+	if vertices.len() != uvs.len() || !indices.len().is_multiple_of(3) {
+		return Err(Error::TriangulationFailed);
+	}
+	let mut canonical = BTreeMap::<(u64, u64, PointKey), u32>::new();
+	let mut replacements = Vec::with_capacity(vertices.len());
+	for (index, (position, uv)) in vertices.iter().zip(uvs).enumerate() {
+		let index = u32::try_from(index).map_err(|_| Error::TriangulationFailed)?;
+		let key = (coordinate_key(uv.x), coordinate_key(uv.y), point_key(*position));
+		let canonical = *canonical.entry(key).or_insert(index);
+		replacements.push(canonical);
+	}
+	for index in indices.iter_mut() {
+		*index = *replacements.get(*index as usize).ok_or(Error::TriangulationFailed)?;
+	}
+	*indices = indices
+		.chunks_exact(3)
+		.filter(|triangle| triangle[0] != triangle[1] && triangle[1] != triangle[2] && triangle[2] != triangle[0])
+		.flatten()
+		.copied()
+		.collect();
+	Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum PatchSide {
 	Lower,
@@ -1652,7 +2033,7 @@ fn transition_key_stages(boundary: &[f64], inner: &[f64]) -> Result<Vec<Vec<f64>
 	// canonical trim intervals. With only a handful of rings, an adaptively
 	// sampled curved boundary can be joined to a distant interior row by long,
 	// needle-like cells even when the monotone connectivity is optimal.
-	const TRANSITION_RING_COUNT: usize = 24;
+	const TRANSITION_RING_COUNT: usize = 16;
 	if boundary.len() < 2 || inner.len() < 2 || !strictly_increasing(boundary) || !strictly_increasing(inner) {
 		return Err(Error::TriangulationFailed);
 	}
@@ -2083,6 +2464,78 @@ fn seed_structured_patch(face: &TrimmedFace, metric: MetricMap, triangulation: &
 	}
 }
 
+/// Seeds a face-local inward front that follows the exact trim density.
+///
+/// Exact edge sampling is intentionally immutable while a face is meshed: two
+/// adjacent faces must consume the same canonical boundary vertices. A regular
+/// interior lattice alone cannot grade gracefully from a highly non-uniform
+/// curved trim, however, and Delaunay refinement then tends to create a chain
+/// of progressively thinner cells beside the boundary. This front mirrors
+/// each usable boundary sample at one and two local edge lengths into the
+/// chart. The samples are unconstrained, so Delaunay still owns connectivity,
+/// while their spacing supplies the boundary-size field that a patch-aware
+/// mesher needs.
+fn seed_boundary_collar(face: &TrimmedFace, metric: MetricMap, triangulation: &mut FaceTriangulation) {
+	for trim_loop in &face.loops {
+		if trim_loop.vertices.len() < 3 {
+			continue;
+		}
+		let points = trim_loop.vertices.iter().map(|vertex| metric.map(vertex.uv)).collect::<Vec<_>>();
+		let signed_area = (0..points.len())
+			.map(|index| {
+				let first = points[index];
+				let second = points[(index + 1) % points.len()];
+				first.x * second.y - first.y * second.x
+			})
+			.sum::<f64>();
+		if !signed_area.is_finite() || signed_area.abs() <= 1.0e-24 {
+			continue;
+		}
+		for index in 0..points.len() {
+			let previous = points[(index + points.len() - 1) % points.len()];
+			let current = points[index];
+			let next = points[(index + 1) % points.len()];
+			let incoming = Point2::new(current.x - previous.x, current.y - previous.y);
+			let outgoing = Point2::new(next.x - current.x, next.y - current.y);
+			let incoming_length = (incoming.x * incoming.x + incoming.y * incoming.y).sqrt();
+			let outgoing_length = (outgoing.x * outgoing.x + outgoing.y * outgoing.y).sqrt();
+			let local_length = incoming_length.min(outgoing_length);
+			if !local_length.is_finite() || local_length <= 1.0e-12 {
+				continue;
+			}
+			let incoming_normal = Point2::new(-incoming.y / incoming_length, incoming.x / incoming_length);
+			let outgoing_normal = Point2::new(-outgoing.y / outgoing_length, outgoing.x / outgoing_length);
+			let bisector = Point2::new(incoming_normal.x + outgoing_normal.x, incoming_normal.y + outgoing_normal.y);
+			let bisector_length = (bisector.x * bisector.x + bisector.y * bisector.y).sqrt();
+			let direction = if bisector_length > 1.0e-12 { Point2::new(bisector.x / bisector_length, bisector.y / bisector_length) } else { outgoing_normal };
+
+			for layer in [0.8, 1.6] {
+				let mut distance = local_length * layer;
+				let mut inserted = false;
+				for _ in 0..6 {
+					for sign in [1.0, -1.0] {
+						let candidate = Point2::new(current.x + direction.x * distance * sign, current.y + direction.y * distance * sign);
+						if let Some(uv) = metric.unmap(candidate) {
+							if point_in_trim(uv, &face.loops) {
+								insert_interior_vertex(face, triangulation, uv, metric);
+								inserted = true;
+								break;
+							}
+						}
+					}
+					if inserted {
+						break;
+					}
+					distance *= 0.5;
+				}
+				if !inserted {
+					break;
+				}
+			}
+		}
+	}
+}
+
 /// Seeds arbitrary trimmed charts with a coherent triangular lattice in the
 /// local first-fundamental-form metric.
 ///
@@ -2188,7 +2641,24 @@ fn insert_interior_vertex(face: &TrimmedFace, triangulation: &mut FaceTriangulat
 	if distance_to_boundary <= boundary_clearance {
 		return;
 	}
-	match triangulation.locate(metric_position) {
+	// Independent structured, lattice, and adaptive probes can describe the
+	// same interior point with adjacent floating-point values.  Spade correctly
+	// treats those as distinct coordinates, but their two zero-width cells are
+	// later removed and leave a real incidence-one cavity.  Reject only a
+	// scale-relative numerical duplicate of an existing vertex; this is orders
+	// of magnitude below any supported geometric refinement spacing.
+	let location = triangulation.locate(metric_position);
+	let duplicate_tolerance = extent * 1.0e-12;
+	let near_duplicate = match location {
+		PositionInTriangulation::OnVertex(_) => true,
+		PositionInTriangulation::OnEdge(edge) | PositionInTriangulation::OutsideOfConvexHull(edge) => triangulation.directed_edge(edge).vertices().into_iter().any(|vertex| metric_distance(vertex.position(), metric_position) <= duplicate_tolerance),
+		PositionInTriangulation::OnFace(face_handle) => triangulation.face(face_handle).vertices().into_iter().any(|vertex| metric_distance(vertex.position(), metric_position) <= duplicate_tolerance),
+		PositionInTriangulation::NoTriangulation => false,
+	};
+	if near_duplicate {
+		return;
+	}
+	match location {
 		PositionInTriangulation::OnVertex(_) => {}
 		PositionInTriangulation::OnEdge(edge) if triangulation.directed_edge(edge).is_constraint_edge() => {}
 		_ => {
@@ -2230,25 +2700,31 @@ struct RefinementCandidate {
 fn refinement_candidates(face: &TrimmedFace, triangulation: &FaceTriangulation, linear: f64, angular: f64) -> Vec<RefinementCandidate> {
 	triangulation
 		.inner_faces()
-		.filter_map(|triangle| {
+		.flat_map(|triangle| {
 			let vertices = triangle.vertices();
 			let handles = vertices.map(|vertex| vertex.fix());
 			let parametric = vertices.map(|vertex| *vertex.data());
 			let uv = parametric.map(|vertex| vertex.uv);
 			let center = (uv[0] + uv[1] + uv[2]) / 3.0;
 			if !point_in_trim(center, &face.loops) {
-				return None;
+				return Vec::new();
 			}
 			let samples = uv.map(|point| face.surface.evaluate(point));
 			let [Some(first), Some(second), Some(third)] = samples else {
-				return None;
+				return Vec::new();
 			};
-			let center_sample = face.surface.evaluate(center)?;
+			let Some(center_sample) = face.surface.evaluate(center) else {
+				return Vec::new();
+			};
 			let samples = [first, second, third];
 			let positions = std::array::from_fn(|index| parametric[index].boundary_position.unwrap_or(samples[index].position));
 			let geometric = (positions[1] - positions[0]).cross(positions[2] - positions[0]);
-			let mut geometric_normal = geometric.try_normalize()?;
-			let expected_normal = center_sample.normal()?;
+			let Some(mut geometric_normal) = geometric.try_normalize() else {
+				return Vec::new();
+			};
+			let Some(expected_normal) = center_sample.normal() else {
+				return Vec::new();
+			};
 			if geometric_normal.dot(expected_normal) < 0.0 {
 				geometric_normal = -geometric_normal;
 			}
@@ -2257,9 +2733,9 @@ fn refinement_candidates(face: &TrimmedFace, triangulation: &FaceTriangulation, 
 			// rational surface chord. Measure the exact sample against the whole
 			// approximating primitive instead, and refine at the sample that
 			// actually violates the requested tolerance most severely.
-			let mut best = None;
+			let mut required = Vec::with_capacity(4);
 			let center_deviation = point_triangle_distance(center_sample.position, positions);
-			consider_surface_probe(&mut best, center, center_sample, center_deviation, geometric_normal, linear, angular);
+			push_surface_probe(&mut required, center, center_sample, center_deviation, geometric_normal, linear, angular);
 			for edge in 0..3 {
 				let next = (edge + 1) % 3;
 				if triangulation.get_edge_from_neighbors(handles[edge], handles[next]).is_some_and(|edge| edge.is_constraint_edge()) {
@@ -2268,8 +2744,11 @@ fn refinement_candidates(face: &TrimmedFace, triangulation: &FaceTriangulation, 
 				let midpoint_uv = (uv[edge] + uv[next]) * 0.5;
 				if let Some(midpoint) = face.surface.evaluate(midpoint_uv) {
 					let deviation = point_segment_distance(midpoint.position, positions[edge], positions[next]);
-					consider_surface_probe(&mut best, midpoint_uv, midpoint, deviation, geometric_normal, linear, angular);
+					push_surface_probe(&mut required, midpoint_uv, midpoint, deviation, geometric_normal, linear, angular);
 				}
+			}
+			if !required.is_empty() {
+				return required;
 			}
 
 			let aspect = triangle_aspect(positions);
@@ -2295,17 +2774,14 @@ fn refinement_candidates(face: &TrimmedFace, triangulation: &FaceTriangulation, 
 				// toward it. The metric lattice supplies the boundary collar; only
 				// perform the usual safe circumcenter insertion for an acute cell.
 				if barycentric.iter().all(|weight| *weight >= 0.05) && candidate_uv.is_finite() && point_in_trim(candidate_uv, &face.loops) {
-					retain_worse_candidate(
-						&mut best,
-						RefinementCandidate {
+					return vec![RefinementCandidate {
 							required: false,
 							score: aspect / TARGET_PHYSICAL_ASPECT,
 							// A CDT circumcenter improves neighboring cells together.
 							// Unlike a centroid, it does not create three progressively
 							// skinnier triangles around an already-poor cell.
 							uv: candidate_uv,
-						},
-					);
+						}];
 				} else {
 					// An obtuse sliver has an exterior circumcenter, so it cannot be
 					// repaired by the usual Delaunay insertion. Split its longest
@@ -2322,28 +2798,21 @@ fn refinement_candidates(face: &TrimmedFace, triangulation: &FaceTriangulation, 
 					if let Some((_, edge, next)) = longest_interior_edge {
 						let midpoint = (uv[edge] + uv[next]) * 0.5;
 						if midpoint.is_finite() && point_in_trim(midpoint, &face.loops) {
-							retain_worse_candidate(&mut best, RefinementCandidate { required: false, score: aspect / TARGET_PHYSICAL_ASPECT, uv: midpoint });
+							return vec![RefinementCandidate { required: false, score: aspect / TARGET_PHYSICAL_ASPECT, uv: midpoint }];
 						}
 					}
 				}
 			}
-			best
+			Vec::new()
 		})
 		.collect()
 }
 
-fn consider_surface_probe(best: &mut Option<RefinementCandidate>, uv: DVec2, sample: SurfaceSample, deviation: f64, geometric_normal: DVec3, linear: f64, angular: f64) {
+fn push_surface_probe(candidates: &mut Vec<RefinementCandidate>, uv: DVec2, sample: SurfaceSample, deviation: f64, geometric_normal: DVec3, linear: f64, angular: f64) {
 	let angle = sample.normal().map(|normal| geometric_normal.dot(normal).clamp(-1.0, 1.0).acos()).unwrap_or(0.0);
 	let candidate = RefinementCandidate { required: true, score: (deviation / linear).max(angle / angular), uv };
 	if candidate.score > 1.0 && candidate.score.is_finite() {
-		retain_worse_candidate(best, candidate);
-	}
-}
-
-fn retain_worse_candidate(best: &mut Option<RefinementCandidate>, candidate: RefinementCandidate) {
-	let replace = best.is_none_or(|current| candidate.required > current.required || candidate.required == current.required && (candidate.score > current.score || candidate.score == current.score && (candidate.uv.x, candidate.uv.y) < (current.uv.x, current.uv.y)));
-	if replace {
-		*best = Some(candidate);
+		candidates.push(candidate);
 	}
 }
 
@@ -2464,6 +2933,9 @@ fn build_face_mesh(face: &TrimmedFace, triangulation: &FaceTriangulation) -> Res
 			// It contributes no surface area. Discard it and let the mandatory
 			// exact boundary-segment and edge-incidence audit below prove that no
 			// actual trim segment or interior region was lost.
+			if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+				eprintln!("custom tessellation face {} discarded zero-area CDT triangle {handles:?}, uvs {uv:?}, points {positions:?}", face.index);
+			}
 			continue;
 		}
 		let uv_area = (uv[1] - uv[0]).perp_dot(uv[2] - uv[0]);
@@ -2502,7 +2974,7 @@ fn build_face_mesh(face: &TrimmedFace, triangulation: &FaceTriangulation) -> Res
 		indices.extend(triangle.map(|index| remap[index]));
 	}
 	fill_singular_normals(face, &uvs, &vertices, &indices, &mut normals)?;
-	Ok(MeshedFace { index: face.index, tshape_id: face.tshape_id, vertices, uvs, normals, indices, refined_edges: BTreeMap::new() })
+	Ok(MeshedFace { index: face.index, tshape_id: face.tshape_id, vertices, uvs, normals, indices, refined_edges: BTreeMap::new(), boundary_refinements: Vec::new() })
 }
 
 fn triangle_shares_boundary_occurrence(vertices: [ParametricVertex; 3]) -> bool {
@@ -2836,6 +3308,21 @@ pub(super) struct BoundaryRunProvenance {
 	pub edge_occurrence_index: u32,
 	pub reversed: bool,
 	pub sample_ordinals: Vec<u32>,
+}
+
+#[cfg(feature = "test-support")]
+pub(super) fn boundary_occurrence_metadata_overflow_is_rejected() -> bool {
+	let mut vertex = ParametricVertex {
+		uv: DVec2::ZERO,
+		metric: Point2::new(0.0, 0.0),
+		boundary_position: None,
+		boundary_occurrences: [None, None],
+	};
+	let occurrence = |loop_index| BoundaryOccurrence { loop_index, edge_index: 7, occurrence_index: loop_index };
+	vertex.add_boundary_occurrence(occurrence(0)).is_ok()
+		&& vertex.add_boundary_occurrence(occurrence(0)).is_ok()
+		&& vertex.add_boundary_occurrence(occurrence(1)).is_ok()
+		&& vertex.add_boundary_occurrence(occurrence(2)).is_err()
 }
 
 #[cfg(feature = "test-support")]

@@ -49,6 +49,13 @@ pub fn tessellation_rejects_invalid_boundary_direction(solid: &Solid, options: T
 	Ok(tessellation::decode_boundary_run_provenance(source).is_err())
 }
 
+/// Confirm that a vertex shared by more boundary occurrences than the fixed
+/// metadata representation can encode fails explicitly instead of dropping
+/// provenance.
+pub fn tessellation_rejects_boundary_metadata_overflow() -> bool {
+	tessellation::boundary_occurrence_metadata_overflow_is_rejected()
+}
+
 fn extract_tessellation_source(solid: &Solid, options: Tessellation) -> Result<ffi::BrepMeshSourceData, Error> {
 	if !options.deflection_linear.is_finite() || options.deflection_linear <= 0.0 {
 		return Err(Error::InvalidInput("tessellation linear deflection must be finite and greater than zero".into()));

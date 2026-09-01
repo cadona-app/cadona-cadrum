@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use cadrum::{
-	occt::test_support::{tessellation_boundary_runs, tessellation_rejects_invalid_boundary_direction, BoundaryDirection, BoundaryRun},
+	occt::test_support::{tessellation_boundary_runs, tessellation_rejects_boundary_metadata_overflow, tessellation_rejects_invalid_boundary_direction, BoundaryDirection, BoundaryRun},
 	DVec3, Edge, ProfileOrient, Solid, Tessellation, TopologyQueryOptions,
 };
 
@@ -29,8 +29,15 @@ fn decoder_rejects_invalid_occurrence_direction_metadata() {
 }
 
 #[test]
+fn boundary_occurrence_metadata_overflow_is_rejected_explicitly() {
+	assert!(tessellation_rejects_boundary_metadata_overflow());
+}
+
+#[test]
 fn ordinary_shared_edge_retains_one_oppositely_directed_occurrence_per_face() {
 	let cube = Solid::cube(DVec3::ZERO, DVec3::splat(10.0));
+	let chunks = Solid::mesh_chunks([&cube], options()).expect("mesh ordinary shared-edge contract");
+	assert!(!chunks.faces.is_empty());
 	let topology = cube.topology_snapshot().expect("snapshot cube topology");
 	let edge_index = 0;
 	let expected_faces = topology.edge_faces(edge_index).expect("query shared-edge incidence").iter().copied().collect::<BTreeSet<_>>();
@@ -49,6 +56,8 @@ fn ordinary_shared_edge_retains_one_oppositely_directed_occurrence_per_face() {
 #[test]
 fn periodic_self_seam_retains_two_distinct_occurrences_on_one_face_loop() {
 	let cylinder = Solid::cylinder(8.0, DVec3::Z * 20.0);
+	let chunks = Solid::mesh_chunks([&cylinder], options()).expect("mesh periodic self-seam contract");
+	assert!(!chunks.faces.is_empty());
 	let topology = cylinder.topology_snapshot_with_options(TopologyQueryOptions::SEMANTIC_IDENTITY).expect("snapshot cylinder topology");
 	let seam_edge = (0..topology.edge_ids().len() as u32).find(|edge| topology.edge_facts(*edge).is_some_and(|facts| facts.seam)).expect("primitive cylinder must retain an explicit periodic seam");
 	let seam_face = *topology.edge_faces(seam_edge).expect("query seam incidence").first().expect("seam must have an incident face");
@@ -63,6 +72,15 @@ fn periodic_self_seam_retains_two_distinct_occurrences_on_one_face_loop() {
 	for run in seam_runs {
 		assert_run_is_ordered(run);
 	}
+}
+
+#[test]
+fn collapsed_cone_pole_contract_meshes_without_a_phantom_boundary_segment() {
+	let cone = Solid::cone(8.0, 0.0, DVec3::Z * 20.0);
+	let cone_options = Tessellation { deflection_angular: 0.15, parallel: true, ..options() };
+	let chunks = Solid::mesh_chunks([&cone], cone_options).expect("mesh collapsed pole contract");
+	assert!(!chunks.faces.is_empty());
+	assert!(chunks.faces.iter().all(|face| !face.indices.is_empty()));
 }
 
 #[test]
