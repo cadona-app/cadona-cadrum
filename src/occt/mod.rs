@@ -8,3 +8,7 @@ mod ffi;
 pub use ffi::CancellationToken;
 pub mod io;
 pub mod solid;
+mod tessellation;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod test_support;

@@ -63,6 +63,13 @@ mod ffi_bridge {
 		loop_uvs: Vec<f64>,
 		loop_edge_indices: Vec<u32>,        // canonical topological edge ordinal
 		loop_edge_sample_indices: Vec<u32>, // sample ordinal within that edge
+		// Edge-use ordinal within one face loop. Repeated occurrences of the
+		// same topological edge (notably periodic self-seams) therefore remain
+		// distinct even when their canonical samples are bit-identical.
+		loop_edge_occurrence_indices: Vec<u32>,
+		// Direction of the edge occurrence relative to its canonical sample
+		// sequence: 0 = forward, 1 = reversed.
+		loop_edge_occurrence_directions: Vec<u8>,
 		edge_point_offsets: Vec<u32>,
 		edge_points: Vec<f64>,
 		success: bool,

@@ -81,6 +81,7 @@
 #include <BRepAdaptor_Curve2d.hxx>
 #include <GCPnts_QuasiUniformDeflection.hxx>
 #include <ShapeAnalysis_FreeBounds.hxx>
+#include <ShapeAnalysis_Surface.hxx>
 #include <TopTools_HSequenceOfShape.hxx>
 #include <BRepTools_WireExplorer.hxx>
 #include <BRepTools.hxx>
@@ -212,6 +213,47 @@ static void record_resource_failure(const char* operation, const char* message) 
     operation_diagnostic.status = 0;
     operation_diagnostic.present = true;
 }
+
+static void record_stage_failure(
+    const char* operation,
+    const char* stage,
+    const char* message) {
+    if (operation_diagnostic.present) return;
+    operation_diagnostic.operation = operation;
+    operation_diagnostic.stage = stage;
+    operation_diagnostic.message = message;
+    operation_diagnostic.category = 7;
+    operation_diagnostic.status = 0;
+    operation_diagnostic.present = true;
+}
+
+class ScopedFailureDiagnostic final {
+public:
+    ScopedFailureDiagnostic(
+        const char* operation,
+        const char*& stage,
+        bool& success,
+        const CancellationToken& progress)
+        : operation_(operation),
+          stage_(stage),
+          success_(success),
+          progress_(progress) {}
+
+    ~ScopedFailureDiagnostic() {
+        if (!success_ && !rust_progress_cancelled(progress_)) {
+            record_stage_failure(
+                operation_,
+                stage_,
+                "operation returned without completing its current stage");
+        }
+    }
+
+private:
+    const char* operation_;
+    const char*& stage_;
+    bool& success_;
+    const CancellationToken& progress_;
+};
 
 OperationDiagnosticData take_operation_diagnostic() {
     OperationDiagnosticData result;
@@ -2462,8 +2504,13 @@ static bool map_to_bspline_chart(
     const BrepSurfaceChart& chart,
     const gp_Pnt2d& original_uv,
     BrepChartMapState& state,
+    double geometric_tolerance,
     gp_Pnt2d& spline_uv)
 {
+    if (!std::isfinite(geometric_tolerance)
+        || geometric_tolerance < Precision::Confusion()) {
+        return false;
+    }
     const double parameter_tolerance = Precision::PConfusion() * 10.0;
     const bool on_u_min = std::abs(original_uv.X() - chart.original_u_min)
         <= parameter_tolerance;
@@ -2508,7 +2555,7 @@ static bool map_to_bspline_chart(
         chart.spline->Value(normalized_uv.X(), normalized_uv.Y());
     const double normalized_error = original_point.Distance(normalized_point);
     if (std::isfinite(normalized_error)
-        && normalized_error <= Precision::Confusion() * 10.0) {
+        && normalized_error <= geometric_tolerance) {
         spline_uv = normalized_uv;
         state.has_previous = true;
         state.original_uv = original_uv;
@@ -2516,23 +2563,44 @@ static bool map_to_bspline_chart(
         return true;
     }
 
-    // A collapsed pole has infinitely many valid U parameters, so projecting
-    // the pole itself loses the authored coordinate around that boundary.
-    // Probe the same U on a regular latitude, then restore the exact pole V.
-    const double probe_v = (on_v_min || on_v_max)
-        ? (chart.original_v_min + chart.original_v_max) * 0.5
+    // A collapsed pole has infinitely many valid parameters along the
+    // collapsed direction, so projecting the pole itself loses the authored
+    // coordinate. Only move the probe into the chart when the relevant
+    // boundary is geometrically collapsed. Treating every V boundary as a
+    // pole projected an ordinary tiny sweep's end ellipse from its mid-span
+    // instead, producing an error comparable to the part itself.
+    const auto collapsed = [geometric_tolerance](
+                               const gp_Pnt& first,
+                               const gp_Pnt& middle,
+                               const gp_Pnt& last) {
+        return first.Distance(middle) <= geometric_tolerance
+            && first.Distance(last) <= geometric_tolerance
+            && middle.Distance(last) <= geometric_tolerance;
+    };
+    const double original_u_middle =
+        (chart.original_u_min + chart.original_u_max) * 0.5;
+    const double original_v_middle =
+        (chart.original_v_min + chart.original_v_max) * 0.5;
+    const bool u_boundary_collapsed = (on_u_min || on_u_max)
+        && collapsed(
+            chart.original->Value(
+                original_uv.X(), chart.original_v_min),
+            chart.original->Value(original_uv.X(), original_v_middle),
+            chart.original->Value(
+                original_uv.X(), chart.original_v_max));
+    const bool v_boundary_collapsed = (on_v_min || on_v_max)
+        && collapsed(
+            chart.original->Value(
+                chart.original_u_min, original_uv.Y()),
+            chart.original->Value(original_u_middle, original_uv.Y()),
+            chart.original->Value(
+                chart.original_u_max, original_uv.Y()));
+    const double probe_u = u_boundary_collapsed
+        ? original_u_middle
+        : original_uv.X();
+    const double probe_v = v_boundary_collapsed
+        ? original_v_middle
         : original_uv.Y();
-    const gp_Pnt exact_point = chart.original->Value(original_uv.X(), probe_v);
-    GeomAPI_ProjectPointOnSurf projection(
-        exact_point,
-        chart.spline,
-        chart.spline_u_min,
-        chart.spline_u_max,
-        chart.spline_v_min,
-        chart.spline_v_max,
-        Precision::Confusion());
-    if (!projection.IsDone() || projection.NbPoints() < 1) return false;
-
     double expected_u_fraction = original_u_fraction;
     double expected_v_fraction = original_v_fraction;
     if (state.has_previous) {
@@ -2553,49 +2621,132 @@ static bool map_to_bspline_chart(
         expected_v_fraction = previous_spline_v_fraction
             + original_v_fraction - previous_original_v_fraction;
     }
-    double minimum_distance = std::numeric_limits<double>::infinity();
-    for (int index = 1; index <= projection.NbPoints(); ++index) {
-        const double distance = projection.Distance(index);
-        if (std::isfinite(distance)) {
-            minimum_distance = std::min(minimum_distance, distance);
+    const gp_Pnt2d expected_uv(
+        chart.spline_u_min
+            + expected_u_fraction
+                * (chart.spline_u_max - chart.spline_u_min),
+        chart.spline_v_min
+            + expected_v_fraction
+                * (chart.spline_v_max - chart.spline_v_min));
+    const gp_Pnt exact_point = chart.original->Value(probe_u, probe_v);
+
+    // GeomConvert may reparameterize an analytical surface non-linearly. A
+    // global closest-point query on a closed conversion can then choose the
+    // other copy of a periodic seam even though the previous trim sample
+    // proves which local branch is intended. Seed OCCT's continuity-aware
+    // surface analyzer with that expected branch before falling back to the
+    // exhaustive projector.
+    ShapeAnalysis_Surface analysis(chart.spline);
+    analysis.SetDomain(
+        chart.spline_u_min,
+        chart.spline_u_max,
+        chart.spline_v_min,
+        chart.spline_v_max);
+    const gp_Pnt2d local_uv = analysis.NextValueOfUV(
+        expected_uv,
+        exact_point,
+        Precision::Confusion(),
+        geometric_tolerance);
+    const double local_distance = analysis.Gap();
+    const bool local_in_domain = std::isfinite(local_uv.X())
+        && std::isfinite(local_uv.Y())
+        && local_uv.X() >= chart.spline_u_min - parameter_tolerance
+        && local_uv.X() <= chart.spline_u_max + parameter_tolerance
+        && local_uv.Y() >= chart.spline_v_min - parameter_tolerance
+        && local_uv.Y() <= chart.spline_v_max + parameter_tolerance;
+    if (local_in_domain && std::isfinite(local_distance)
+        && local_distance <= geometric_tolerance) {
+        spline_uv = local_uv;
+    } else {
+        GeomAPI_ProjectPointOnSurf projection(
+            exact_point,
+            chart.spline,
+            chart.spline_u_min,
+            chart.spline_u_max,
+            chart.spline_v_min,
+            chart.spline_v_max,
+            Precision::Confusion());
+        if (!projection.IsDone() || projection.NbPoints() < 1) {
+            record_stage_failure(
+                "extract_brep_mesh_source",
+                "extract_face_trim_loops/map_chart/project",
+                "surface projection found no B-spline chart coordinate");
+            return false;
         }
-    }
-    if (!std::isfinite(minimum_distance)) return false;
-    const double distance_window = std::max(
-        Precision::Confusion(), minimum_distance * 1.0e-6);
-    double best_score = std::numeric_limits<double>::infinity();
-    bool found = false;
-    for (int index = 1; index <= projection.NbPoints(); ++index) {
-        const double distance = projection.Distance(index);
-        if (!std::isfinite(distance)
-            || distance > minimum_distance + distance_window) {
-            continue;
+
+        double minimum_distance = std::numeric_limits<double>::infinity();
+        for (int index = 1; index <= projection.NbPoints(); ++index) {
+            const double distance = projection.Distance(index);
+            if (std::isfinite(distance)) {
+                minimum_distance = std::min(minimum_distance, distance);
+            }
         }
-        double u = 0.0;
-        double v = 0.0;
-        projection.Parameters(index, u, v);
-        if (!std::isfinite(u) || !std::isfinite(v)) continue;
-        const double u_fraction = (u - chart.spline_u_min)
-            / (chart.spline_u_max - chart.spline_u_min);
-        const double v_fraction = (v - chart.spline_v_min)
-            / (chart.spline_v_max - chart.spline_v_min);
-        const double absolute_score =
-            (u_fraction - original_u_fraction) * (u_fraction - original_u_fraction)
-            + (v_fraction - original_v_fraction) * (v_fraction - original_v_fraction);
-        const double continuity_score =
-            (u_fraction - expected_u_fraction) * (u_fraction - expected_u_fraction)
-            + (v_fraction - expected_v_fraction) * (v_fraction - expected_v_fraction);
-        const double score = state.has_previous
-            ? continuity_score * 4.0 + absolute_score
-            : absolute_score;
-        if (!found || score < best_score) {
-            spline_uv.SetCoord(u, v);
-            best_score = score;
-            found = true;
+        if (!std::isfinite(minimum_distance)) {
+            record_stage_failure(
+                "extract_brep_mesh_source",
+                "extract_face_trim_loops/map_chart/distance",
+                "surface projection returned no finite distance");
+            return false;
         }
-    }
-    if (!found || minimum_distance > Precision::Confusion() * 10.0) {
-        return false;
+        const double distance_window = std::max(
+            Precision::Confusion(), minimum_distance * 1.0e-6);
+        double best_score = std::numeric_limits<double>::infinity();
+        bool found = false;
+        for (int index = 1; index <= projection.NbPoints(); ++index) {
+            const double distance = projection.Distance(index);
+            if (!std::isfinite(distance)
+                || distance > minimum_distance + distance_window) {
+                continue;
+            }
+            double u = 0.0;
+            double v = 0.0;
+            projection.Parameters(index, u, v);
+            if (!std::isfinite(u) || !std::isfinite(v)) continue;
+            const double u_fraction = (u - chart.spline_u_min)
+                / (chart.spline_u_max - chart.spline_u_min);
+            const double v_fraction = (v - chart.spline_v_min)
+                / (chart.spline_v_max - chart.spline_v_min);
+            const double absolute_score =
+                (u_fraction - original_u_fraction) * (u_fraction - original_u_fraction)
+                + (v_fraction - original_v_fraction) * (v_fraction - original_v_fraction);
+            const double continuity_score =
+                (u_fraction - expected_u_fraction) * (u_fraction - expected_u_fraction)
+                + (v_fraction - expected_v_fraction) * (v_fraction - expected_v_fraction);
+            const double score = state.has_previous
+                ? continuity_score * 4.0 + absolute_score
+                : absolute_score;
+            if (!found || score < best_score) {
+                spline_uv.SetCoord(u, v);
+                best_score = score;
+                found = true;
+            }
+        }
+        if (!found || minimum_distance > geometric_tolerance) {
+            const std::string message =
+                "surface projection distance " + std::to_string(minimum_distance)
+                + " exceeds chart-mapping tolerance "
+                + std::to_string(geometric_tolerance)
+                + "; normalized-map error " + std::to_string(normalized_error)
+                + "; original UV (" + std::to_string(original_uv.X())
+                + ", " + std::to_string(original_uv.Y()) + ")"
+                + "; projected UV (" + std::to_string(spline_uv.X())
+                + ", " + std::to_string(spline_uv.Y()) + ")"
+                + "; original bounds ["
+                + std::to_string(chart.original_u_min) + ", "
+                + std::to_string(chart.original_u_max) + ", "
+                + std::to_string(chart.original_v_min) + ", "
+                + std::to_string(chart.original_v_max) + "]"
+                + "; spline bounds ["
+                + std::to_string(chart.spline_u_min) + ", "
+                + std::to_string(chart.spline_u_max) + ", "
+                + std::to_string(chart.spline_v_min) + ", "
+                + std::to_string(chart.spline_v_max) + "]";
+            record_stage_failure(
+                "extract_brep_mesh_source",
+                "extract_face_trim_loops/map_chart/accuracy",
+                message.c_str());
+            return false;
+        }
     }
     if (on_u_min) spline_uv.SetX(chart.spline_u_min);
     if (on_u_max) spline_uv.SetX(chart.spline_u_max);
@@ -2605,6 +2756,10 @@ static bool map_to_bspline_chart(
         || spline_uv.X() > chart.spline_u_max + parameter_tolerance
         || spline_uv.Y() < chart.spline_v_min - parameter_tolerance
         || spline_uv.Y() > chart.spline_v_max + parameter_tolerance) {
+        record_stage_failure(
+            "extract_brep_mesh_source",
+            "extract_face_trim_loops/map_chart/domain",
+            "surface projection lies outside the bounded B-spline chart");
         return false;
     }
     if (state.has_previous) {
@@ -2628,6 +2783,10 @@ static bool map_to_bspline_chart(
         if (!std::isfinite(original_step) || !std::isfinite(spline_step)
             || (original_step < 0.25
                 && spline_step > std::max(0.35, original_step * 8.0 + 0.02))) {
+            record_stage_failure(
+                "extract_brep_mesh_source",
+                "extract_face_trim_loops/map_chart/continuity",
+                "surface projection switched to a discontinuous periodic branch");
             return false;
         }
     }
@@ -2641,6 +2800,7 @@ static bool append_face_trim_loops(
     const TopoDS_Face& face,
     const BrepSurfaceChart& chart,
     const NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher>& edges,
+    const std::vector<uint32_t>& copied_edge_to_source_index,
     const std::vector<SampledBrepEdge>& sampled_edges,
     double linear,
     double& maximum_boundary_error,
@@ -2648,6 +2808,16 @@ static bool append_face_trim_loops(
     BrepExtractionBudget& budget,
     const CancellationToken& progress)
 {
+    const auto fail = [](const char* stage, const char* message) {
+        record_stage_failure("extract_brep_mesh_source", stage, message);
+        return false;
+    };
+    if (copied_edge_to_source_index.size()
+        != static_cast<size_t>(edges.Extent())) {
+        return fail(
+            "extract_face_trim_loops/map_edges",
+            "detached edge map does not match the source edge map");
+    }
     maximum_boundary_error = 0.0;
     const double maximum_allowed_boundary_error =
         std::max(linear * 0.10, Precision::Confusion() * 100.0);
@@ -2657,10 +2827,13 @@ static bool append_face_trim_loops(
         const TopoDS_Wire wire = TopoDS::Wire(wire_iterator.Current());
         if (wire.Orientation() != TopAbs_FORWARD
             && wire.Orientation() != TopAbs_REVERSED) {
-            return false;
+            return fail(
+                "extract_face_trim_loops/wire_orientation",
+                "face wire has no traversable orientation");
         }
         BRepTools_WireExplorer explorer(wire, face);
         const size_t loop_start = result.loop_edge_indices.size();
+        uint32_t edge_occurrence_index = 0;
         gp_Pnt2d previous;
         bool has_previous = false;
         gp_Pnt first_edge_start;
@@ -2670,14 +2843,30 @@ static bool append_face_trim_loops(
             if (rust_progress_cancelled(progress)) return false;
             const TopoDS_Edge edge_use = explorer.Current();
             const int mapped_index = edges.FindIndex(edge_use);
-            if (mapped_index < 1) return false;
-            const uint32_t edge_index = static_cast<uint32_t>(mapped_index - 1);
+            if (mapped_index < 1) {
+                return fail(
+                    "extract_face_trim_loops/map_edge_occurrence",
+                    "face-loop edge occurrence is absent from detached topology");
+            }
+            const uint32_t edge_index = copied_edge_to_source_index[
+                static_cast<size_t>(mapped_index - 1)];
+            if (edge_index >= sampled_edges.size()) {
+                return fail(
+                    "extract_face_trim_loops/map_edge_occurrence",
+                    "face-loop edge occurrence maps outside canonical samples");
+            }
             const auto& sampled = sampled_edges[edge_index];
-            if (sampled.parameters.size() < 2) return false;
+            if (sampled.parameters.size() < 2) {
+                return fail(
+                    "extract_face_trim_loops/canonical_samples",
+                    "canonical edge occurrence has fewer than two samples");
+            }
 
             if (edge_use.Orientation() != TopAbs_FORWARD
                 && edge_use.Orientation() != TopAbs_REVERSED) {
-                return false;
+                return fail(
+                    "extract_face_trim_loops/edge_orientation",
+                    "face-loop edge occurrence has no traversal direction");
             }
 
             BRepAdaptor_Curve2d pcurve(edge_use, face);
@@ -2685,16 +2874,21 @@ static bool append_face_trim_loops(
             const double pcurve_last = pcurve.LastParameter();
             if (!std::isfinite(pcurve_first) || !std::isfinite(pcurve_last)
                 || pcurve_last <= pcurve_first) {
-                return false;
+                return fail(
+                    "extract_face_trim_loops/pcurve_domain",
+                    "edge pcurve has an invalid parameter interval");
             }
             if (!parameter_intervals_match(
                     sampled.parameters.front(),
                     sampled.parameters.back(),
                     pcurve_first,
                     pcurve_last)) {
-                return false;
+                return fail(
+                    "extract_face_trim_loops/pcurve_domain",
+                    "edge and pcurve parameter intervals disagree");
             }
             const bool reversed = edge_use.Orientation() == TopAbs_REVERSED;
+            const uint8_t occurrence_direction = reversed ? 1 : 0;
             const size_t oriented_start_index = reversed
                 ? sampled.points.size() - 1
                 : 0;
@@ -2711,7 +2905,9 @@ static bool append_face_trim_loops(
                     previous_edge_end.Distance(edge_start);
                 if (!std::isfinite(connection_error)
                     || connection_error > maximum_allowed_boundary_error) {
-                    return false;
+                    return fail(
+                        "extract_face_trim_loops/connect_edges",
+                        "consecutive canonical edge occurrences do not meet within tolerance");
                 }
                 maximum_boundary_error =
                     std::max(maximum_boundary_error, connection_error);
@@ -2732,10 +2928,21 @@ static bool append_face_trim_loops(
                 gp_Pnt2d uv;
                 if (!std::isfinite(original_uv.X())
                     || !std::isfinite(original_uv.Y())
-                    || !map_to_bspline_chart(chart, original_uv, map_state, uv)) {
-                    return false;
+                    || !map_to_bspline_chart(
+                        chart,
+                        original_uv,
+                        map_state,
+                        maximum_allowed_boundary_error,
+                        uv)) {
+                    return fail(
+                        "extract_face_trim_loops/map_chart",
+                        "edge pcurve could not be mapped into the bounded B-spline chart");
                 }
-                if (!std::isfinite(uv.X()) || !std::isfinite(uv.Y())) return false;
+                if (!std::isfinite(uv.X()) || !std::isfinite(uv.Y())) {
+                    return fail(
+                        "extract_face_trim_loops/map_chart",
+                        "mapped edge pcurve contains a non-finite coordinate");
+                }
                 const gp_Pnt original_surface_point =
                     chart.original->Value(original_uv.X(), original_uv.Y());
                 const gp_Pnt spline_surface_point =
@@ -2751,7 +2958,9 @@ static bool append_face_trim_loops(
                     std::max({original_error, spline_error, conversion_error});
                 if (!std::isfinite(boundary_error)
                     || boundary_error > maximum_allowed_boundary_error) {
-                    return false;
+                    return fail(
+                        "extract_face_trim_loops/validate_boundary",
+                        "surface chart and canonical edge disagree beyond tolerance");
                 }
                 maximum_boundary_error =
                     std::max(maximum_boundary_error, boundary_error);
@@ -2774,7 +2983,15 @@ static bool append_face_trim_loops(
                     || !budget.reserve_serialized_append(
                         result.loop_edge_sample_indices,
                         1,
-                        "serialized trim-sample byte quota exceeded")) {
+                        "serialized trim-sample byte quota exceeded")
+                    || !budget.reserve_serialized_append(
+                        result.loop_edge_occurrence_indices,
+                        1,
+                        "serialized trim-occurrence byte quota exceeded")
+                    || !budget.reserve_serialized_append(
+                        result.loop_edge_occurrence_directions,
+                        1,
+                        "serialized trim-direction byte quota exceeded")) {
                     return false;
                 }
                 result.loop_uvs.push_back(uv.X());
@@ -2782,12 +2999,25 @@ static bool append_face_trim_loops(
                 result.loop_edge_indices.push_back(edge_index);
                 if (sample_index
                     > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
-                    return false;
+                    return fail(
+                        "extract_face_trim_loops/serialize_sample",
+                        "canonical edge sample ordinal exceeds u32 range");
                 }
                 result.loop_edge_sample_indices.push_back(static_cast<uint32_t>(sample_index));
+                result.loop_edge_occurrence_indices.push_back(
+                    edge_occurrence_index);
+                result.loop_edge_occurrence_directions.push_back(
+                    occurrence_direction);
                 previous = uv;
                 has_previous = true;
             }
+            if (edge_occurrence_index
+                == std::numeric_limits<uint32_t>::max()) {
+                return fail(
+                    "extract_face_trim_loops/serialize_occurrence",
+                    "face-loop edge occurrence ordinal exceeds u32 range");
+            }
+            ++edge_occurrence_index;
             previous_edge_end = edge_end;
         }
         const double closure_error = has_edge
@@ -2796,7 +3026,9 @@ static bool append_face_trim_loops(
         if (!std::isfinite(closure_error)
             || closure_error > maximum_allowed_boundary_error
             || result.loop_edge_indices.size() - loop_start < 3) {
-            return false;
+            return fail(
+                "extract_face_trim_loops/close_loop",
+                "face-loop boundary does not close with at least three distinct vertices");
         }
         maximum_boundary_error =
             std::max(maximum_boundary_error, closure_error);
@@ -2825,6 +3057,9 @@ BrepMeshSourceData extract_brep_mesh_source(
 {
     BrepMeshSourceData result;
     result.success = false;
+    const char* failure_stage = "validate_input";
+    ScopedFailureDiagnostic failure_diagnostic(
+        __func__, failure_stage, result.success, progress);
     result.face_pole_offsets.push_back(0);
     result.face_u_knot_offsets.push_back(0);
     result.face_v_knot_offsets.push_back(0);
@@ -2832,9 +3067,12 @@ BrepMeshSourceData extract_brep_mesh_source(
     result.loop_vertex_offsets.push_back(0);
     result.edge_point_offsets.push_back(0);
     try {
-        if (rust_progress_cancelled(progress) || shape.IsNull()
-            || !std::isfinite(linear) || linear <= 0.0
+        if (rust_progress_cancelled(progress)) return result;
+        if (shape.IsNull() || !std::isfinite(linear) || linear <= 0.0
             || !std::isfinite(angular) || angular <= 0.0) {
+            record_input_failure(
+                __func__,
+                "shape and tessellation tolerances must be valid");
             return result;
         }
         if (face_indices.size() > maximum_brep_faces) {
@@ -2843,6 +3081,7 @@ BrepMeshSourceData extract_brep_mesh_source(
             return result;
         }
         BrepExtractionBudget budget;
+        failure_stage = "map_source_topology";
         NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> source_faces;
         NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> source_edges;
         NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> source_vertices;
@@ -2872,6 +3111,7 @@ BrepMeshSourceData extract_brep_mesh_source(
         // deflection and the kernel's numeric floor. Boundary validation below
         // rejects any repaired representation that exceeds that same policy.
         // Existing OCCT triangulation is deliberately not copied.
+        failure_stage = "copy_shape";
         BRepBuilderAPI_Copy copier(shape, true, false);
         TopoDS_Shape extraction_shape = copier.Shape();
         if (extraction_shape.IsNull()) return result;
@@ -2903,6 +3143,7 @@ BrepMeshSourceData extract_brep_mesh_source(
         // The aggregate return may be false for legitimate degenerate pole
         // edges, which intentionally have no 3-D curve. Verify each ordinary
         // edge individually after giving the aggregate repair a chance to run.
+        failure_stage = "normalize_edges";
         BRepLib::BuildCurves3d(
             extraction_shape,
             edge_normalization_tolerance,
@@ -2946,6 +3187,7 @@ BrepMeshSourceData extract_brep_mesh_source(
             }
         }
 
+        failure_stage = "map_detached_topology";
         NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> faces;
         NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> edges;
         NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> vertices;
@@ -2973,6 +3215,7 @@ BrepMeshSourceData extract_brep_mesh_source(
                 __func__, "detached shape vertex quota exceeded");
             return result;
         }
+        failure_stage = "map_copy_identity";
         std::vector<gp_Pnt> canonical_vertex_points(
             static_cast<size_t>(vertices.Extent()));
         std::vector<bool> copied_vertex_seen(
@@ -3005,6 +3248,39 @@ BrepMeshSourceData extract_brep_mesh_source(
             != copied_vertex_seen.end()) {
             return result;
         }
+        std::vector<int> copied_edge_ordinals_by_source_index(
+            static_cast<size_t>(source_edges.Extent()), 0);
+        std::vector<uint32_t> copied_edge_to_source_index(
+            static_cast<size_t>(edges.Extent()),
+            std::numeric_limits<uint32_t>::max());
+        for (int index = 1; index <= source_edges.Extent(); ++index) {
+            if (rust_progress_cancelled(progress)) return result;
+            const TopoDS_Shape copied_edge = copier.ModifiedShape(
+                source_edges(index));
+            if (copied_edge.IsNull()
+                || copied_edge.ShapeType() != TopAbs_EDGE) {
+                return result;
+            }
+            const int copied_ordinal = edges.FindIndex(copied_edge);
+            if (copied_ordinal < 1
+                || copied_edge_to_source_index[
+                       static_cast<size_t>(copied_ordinal - 1)]
+                    != std::numeric_limits<uint32_t>::max()) {
+                return result;
+            }
+            copied_edge_ordinals_by_source_index[
+                static_cast<size_t>(index - 1)] = copied_ordinal;
+            copied_edge_to_source_index[
+                static_cast<size_t>(copied_ordinal - 1)] =
+                static_cast<uint32_t>(index - 1);
+        }
+        if (std::find(
+                copied_edge_to_source_index.begin(),
+                copied_edge_to_source_index.end(),
+                std::numeric_limits<uint32_t>::max())
+            != copied_edge_to_source_index.end()) {
+            return result;
+        }
         std::unordered_set<int> copied_face_ordinals;
         copied_face_ordinals.reserve(extraction_faces_by_source_index.size());
         for (TopoDS_Face& face : extraction_faces_by_source_index) {
@@ -3032,9 +3308,12 @@ BrepMeshSourceData extract_brep_mesh_source(
         const double edge_linear =
             std::max(absolute_linear * 0.5, Precision::Confusion());
         const double edge_angular = std::max(angular * 0.5, 1.0e-3);
-        for (int index = 1; index <= edges.Extent(); ++index) {
+        failure_stage = "sample_canonical_edges";
+        for (int index = 1; index <= source_edges.Extent(); ++index) {
             if (rust_progress_cancelled(progress)) return result;
-            const TopoDS_Edge edge = TopoDS::Edge(edges(index));
+            const int copied_ordinal = copied_edge_ordinals_by_source_index[
+                static_cast<size_t>(index - 1)];
+            const TopoDS_Edge edge = TopoDS::Edge(edges(copied_ordinal));
             if ((edge.Orientation() != TopAbs_FORWARD
                     && edge.Orientation() != TopAbs_REVERSED)
                 || !sample_brep_edge(
@@ -3055,6 +3334,7 @@ BrepMeshSourceData extract_brep_mesh_source(
         // split intervals that an earlier chart must be allowed to re-check.
         constexpr int maximum_incident_chart_passes = 8;
         bool incident_charts_stable = false;
+        failure_stage = "refine_incident_pcurves";
         for (int pass = 0; pass < maximum_incident_chart_passes; ++pass) {
             size_t sample_count_before = 0;
             for (const auto& sampled : sampled_edges) {
@@ -3094,7 +3374,8 @@ BrepMeshSourceData extract_brep_mesh_source(
                                 angular,
                                 budget,
                                 progress,
-                                sampled_edges[static_cast<size_t>(mapped_index - 1)])) {
+                                sampled_edges[copied_edge_to_source_index[
+                                    static_cast<size_t>(mapped_index - 1)]])) {
                             return result;
                         }
                     }
@@ -3137,11 +3418,14 @@ BrepMeshSourceData extract_brep_mesh_source(
                 "serialized shared-edge point byte quota exceeded")) {
             return result;
         }
-        for (int index = 1; index <= edges.Extent(); ++index) {
+        failure_stage = "serialize_edge_samples";
+        for (int index = 1; index <= source_edges.Extent(); ++index) {
             if (rust_progress_cancelled(progress)) return result;
             auto& sampled = sampled_edges[static_cast<size_t>(index - 1)];
+            const int copied_ordinal = copied_edge_ordinals_by_source_index[
+                static_cast<size_t>(index - 1)];
             if (!refresh_sampled_brep_edge_points(
-                    TopoDS::Edge(edges(index)),
+                    TopoDS::Edge(edges(copied_ordinal)),
                     vertices,
                     canonical_vertex_points,
                     progress,
@@ -3160,6 +3444,7 @@ BrepMeshSourceData extract_brep_mesh_source(
                 return result;
             }
         }
+        failure_stage = "select_faces";
         std::vector<uint32_t> selected_faces;
         if (face_indices.size() == 0) {
             selected_faces.reserve(static_cast<size_t>(faces.Extent()));
@@ -3218,6 +3503,7 @@ BrepMeshSourceData extract_brep_mesh_source(
         }
         std::unordered_set<uint32_t> unique_face_indices;
         unique_face_indices.reserve(selected_faces.size());
+        failure_stage = "extract_face_surfaces_and_trims";
         for (uint32_t face_index : selected_faces) {
             if (rust_progress_cancelled(progress)
                 || face_index >= static_cast<uint32_t>(faces.Extent())
@@ -3238,14 +3524,17 @@ BrepMeshSourceData extract_brep_mesh_source(
                 face.Orientation() == TopAbs_REVERSED ? 1 : 0);
             BrepSurfaceChart chart;
             double maximum_boundary_error = 0.0;
+            failure_stage = "extract_face_surface";
             if (!append_bounded_bspline_surface(
                     face, result, chart, budget, progress)) {
                 return result;
             }
+            failure_stage = "extract_face_trim_loops";
             if (!append_face_trim_loops(
                     face,
                     chart,
                     edges,
+                    copied_edge_to_source_index,
                     sampled_edges,
                     absolute_linear,
                     maximum_boundary_error,
@@ -3257,6 +3546,7 @@ BrepMeshSourceData extract_brep_mesh_source(
             if (result.face_approximation_errors.empty()) return result;
             result.face_approximation_errors.back() = maximum_boundary_error;
         }
+        failure_stage = "complete";
         result.success = true;
         rust_progress_set(progress, 0.25);
     } catch (const Standard_OutOfMemory& failure) {
