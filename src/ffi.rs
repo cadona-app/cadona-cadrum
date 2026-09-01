@@ -29,9 +29,10 @@ mod ffi_bridge {
 
 	/// Rust-owned input for the custom B-rep tessellator.
 	///
-	/// OCCT contributes exact topology, one canonical sample sequence per shared
-	/// edge, face p-curves at those parameters, and bounded rational B-spline
-	/// surface definitions. It contributes no triangles. Every per-face array is
+	/// OCCT contributes exact topology and canonical 3D boundary positions,
+	/// supported exact rational B-spline surface definitions, and a validated
+	/// tolerance-bounded mapping of repaired trim parameters into each surface
+	/// chart. It contributes no triangles. Every per-face array is
 	/// parallel to `face_indices`; every offset array starts at zero, is
 	/// monotonic, and ends at the complete referenced-array length. Rust validates
 	/// those invariants before constructing any tessellator domain value. Curve
@@ -55,8 +56,8 @@ mod ffi_bridge {
 		u_knots: Vec<f64>,
 		v_knots: Vec<f64>,
 		face_uv_bounds: Vec<f64>,
-		// Per-face upper bound on any accepted difference between an exact
-		// topological boundary point and its exported rational-surface chart.
+		// Per-face maximum observed difference at exported trim samples between
+		// a canonical topological boundary point and its rational-surface chart.
 		face_approximation_errors: Vec<f64>,
 		face_loop_offsets: Vec<u32>,
 		loop_vertex_offsets: Vec<u32>,
@@ -281,6 +282,7 @@ mod ffi_bridge {
 		// ==================== Meshing ====================
 
 		fn extract_brep_mesh_source(shape: &TopoDS_Shape, face_indices: &[u32], linear: f64, angular: f64, relative: bool, progress: &CancellationToken) -> BrepMeshSourceData;
+		fn test_brep_extraction_preflight_limits(shape: &TopoDS_Shape, maximum_faces: u32, maximum_edges: u32, maximum_vertices: u32, maximum_control_points: u32, maximum_knots: u32, progress: &CancellationToken) -> bool;
 
 		// ==================== Topology enumeration ====================
 

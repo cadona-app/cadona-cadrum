@@ -254,15 +254,29 @@ std::unique_ptr<TopoDS_Edge> edge_ellipse(double major_radius, double minor_radi
 
 // ==================== Meshing ====================
 
-// Extracts exact, renderer-neutral B-rep data for the Rust tessellator. An
-// empty `face_indices` slice selects every face. This path never invokes
-// OCCT's triangulation machinery.
+// Extracts renderer-neutral B-rep data for the Rust tessellator: exact
+// canonical boundary positions, supported exact surface geometry, and a
+// validated tolerance-bounded mapping of repaired trim parameters into each
+// surface chart. An empty `face_indices` slice selects every face. This path
+// never invokes OCCT's triangulation machinery.
 BrepMeshSourceData extract_brep_mesh_source(
 	const TopoDS_Shape& shape,
 	rust::Slice<const uint32_t> face_indices,
 	double linear,
 	double angular,
 	bool relative,
+	const CancellationToken& progress);
+
+// Test-support entry point for exercising the production extraction
+// preflight with small fixture-specific limits. Rust keeps the native shape
+// handle behind `Solid` and exposes this only from its hidden test module.
+bool test_brep_extraction_preflight_limits(
+	const TopoDS_Shape& shape,
+	uint32_t maximum_faces,
+	uint32_t maximum_edges,
+	uint32_t maximum_vertices,
+	uint32_t maximum_control_points,
+	uint32_t maximum_knots,
 	const CancellationToken& progress);
 
 // ==================== Topology enumeration ====================

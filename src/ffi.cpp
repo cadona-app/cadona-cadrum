@@ -1712,9 +1712,11 @@ struct SampledBrepEdge {
 constexpr size_t maximum_brep_edge_samples = 65'536;
 
 // Exact extraction is an untrusted allocation boundary: imported topology can
-// describe arbitrarily many faces, trims, and NURBS coefficients. Keep the
-// temporary native data and the Rust-owned snapshot within explicit process
-// budgets before asking either allocator to grow a large collection.
+// describe arbitrarily many faces, trims, and NURBS coefficients. Bound
+// topology-map growth incrementally and account serialized output before Rust
+// vectors reserve it. OCCT algorithms can still require temporary working
+// memory whose size is not inspectable in advance; allocation failures at that
+// boundary are retained as structured resource failures.
 constexpr size_t maximum_brep_faces = 65'536;
 constexpr size_t maximum_brep_edges = 262'144;
 constexpr size_t maximum_brep_vertices = maximum_brep_edges * 2;
@@ -1819,6 +1821,119 @@ struct BrepExtractionBudget {
         return true;
     }
 };
+
+using BrepShapeMap =
+    NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher>;
+
+static bool map_unique_brep_subshapes_bounded(
+    const TopoDS_Shape& shape,
+    TopAbs_ShapeEnum shape_kind,
+    size_t maximum,
+    const char* quota_message,
+    const CancellationToken& progress,
+    BrepShapeMap& shapes)
+{
+    for (TopExp_Explorer explorer(shape, shape_kind);
+         explorer.More(); explorer.Next()) {
+        if (rust_progress_cancelled(progress)) return false;
+        const TopoDS_Shape& current = explorer.Current();
+        if (shapes.Contains(current)) continue;
+        if (static_cast<size_t>(shapes.Extent()) >= maximum) {
+            record_resource_failure(
+                "extract_brep_mesh_source", quota_message);
+            return false;
+        }
+        shapes.Add(current);
+    }
+    return true;
+}
+
+static Handle(Geom_Surface) unwrapped_brep_surface(
+    Handle(Geom_Surface) surface)
+{
+    constexpr int maximum_wrapper_depth = 16;
+    for (int depth = 0; depth < maximum_wrapper_depth; ++depth) {
+        Handle(Geom_RectangularTrimmedSurface) trimmed =
+            Handle(Geom_RectangularTrimmedSurface)::DownCast(surface);
+        if (trimmed.IsNull()) return surface;
+        surface = trimmed->BasisSurface();
+        if (surface.IsNull()) return surface;
+    }
+    if (!Handle(Geom_RectangularTrimmedSurface)::DownCast(surface).IsNull()) {
+        record_resource_failure(
+            "extract_brep_mesh_source",
+            "surface wrapper-depth quota exceeded");
+        return Handle(Geom_Surface)();
+    }
+    return surface;
+}
+
+static bool preflight_brep_copy_surface_storage(
+    const BrepShapeMap& faces,
+    size_t maximum_control_points,
+    size_t maximum_knots,
+    const CancellationToken& progress)
+{
+    size_t control_points = 0;
+    size_t knots = 0;
+    // Count every unique face occurrence conservatively. OCCT is free to copy
+    // a shared surface once per face during deep-copy normalization, so
+    // deduplicating identical surface handles would not bound that allocation.
+    for (int index = 1; index <= faces.Extent(); ++index) {
+        if (rust_progress_cancelled(progress)) return false;
+        Handle(Geom_Surface) surface = unwrapped_brep_surface(
+            BRep_Tool::Surface(TopoDS::Face(faces(index))));
+        if (surface.IsNull()) return false;
+        Handle(Geom_BSplineSurface) spline =
+            Handle(Geom_BSplineSurface)::DownCast(surface);
+        if (spline.IsNull()) continue;
+
+        const int u_poles = spline->NbUPoles();
+        const int v_poles = spline->NbVPoles();
+        const int u_knots = spline->NbUKnots();
+        const int v_knots = spline->NbVKnots();
+        if (u_poles < 1 || v_poles < 1 || u_knots < 1 || v_knots < 1) {
+            return false;
+        }
+        size_t surface_control_points = 0;
+        size_t surface_knots = 0;
+        size_t next_control_points = 0;
+        size_t next_knots = 0;
+        if (!checked_size_multiply(
+                static_cast<size_t>(u_poles),
+                static_cast<size_t>(v_poles),
+                surface_control_points)
+            || !checked_size_add(
+                static_cast<size_t>(u_knots),
+                static_cast<size_t>(v_knots),
+                surface_knots)
+            || !checked_size_add(
+                control_points,
+                surface_control_points,
+                next_control_points)
+            || !checked_size_add(knots, surface_knots, next_knots)) {
+            record_resource_failure(
+                "extract_brep_mesh_source",
+                "surface-copy storage size arithmetic overflow");
+            return false;
+        }
+        if (next_control_points > maximum_control_points) {
+            record_resource_failure(
+                "extract_brep_mesh_source",
+                "surface-copy control-point quota exceeded");
+            return false;
+        }
+        if (next_knots > maximum_knots) {
+            record_resource_failure(
+                "extract_brep_mesh_source",
+                "surface-copy knot quota exceeded");
+            return false;
+        }
+        control_points = next_control_points;
+        knots = next_knots;
+    }
+    return true;
+}
 
 static double brep_mesh_absolute_deflection(
     const TopoDS_Shape& shape,
@@ -3087,26 +3202,39 @@ BrepMeshSourceData extract_brep_mesh_source(
         }
         BrepExtractionBudget budget;
         failure_stage = "map_source_topology";
-        NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> source_faces;
-        NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> source_edges;
-        NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> source_vertices;
-        TopExp::MapShapes(shape, TopAbs_FACE, source_faces);
-        TopExp::MapShapes(shape, TopAbs_EDGE, source_edges);
-        TopExp::MapShapes(shape, TopAbs_VERTEX, source_vertices);
-        if (source_faces.Extent() < 0
-            || static_cast<size_t>(source_faces.Extent()) > maximum_brep_faces) {
-            record_resource_failure(__func__, "shape face quota exceeded");
+        BrepShapeMap source_faces;
+        BrepShapeMap source_edges;
+        BrepShapeMap source_vertices;
+        if (!map_unique_brep_subshapes_bounded(
+                shape,
+                TopAbs_FACE,
+                maximum_brep_faces,
+                "shape face quota exceeded",
+                progress,
+                source_faces)
+            || !map_unique_brep_subshapes_bounded(
+                shape,
+                TopAbs_EDGE,
+                maximum_brep_edges,
+                "shape edge quota exceeded",
+                progress,
+                source_edges)
+            || !map_unique_brep_subshapes_bounded(
+                shape,
+                TopAbs_VERTEX,
+                maximum_brep_vertices,
+                "shape vertex quota exceeded",
+                progress,
+                source_vertices)) {
             return result;
         }
-        if (source_edges.Extent() < 0
-            || static_cast<size_t>(source_edges.Extent()) > maximum_brep_edges) {
-            record_resource_failure(__func__, "shape edge quota exceeded");
-            return result;
-        }
-        if (source_vertices.Extent() < 0
-            || static_cast<size_t>(source_vertices.Extent())
-                > maximum_brep_vertices) {
-            record_resource_failure(__func__, "shape vertex quota exceeded");
+
+        failure_stage = "preflight_copy_surface_storage";
+        if (!preflight_brep_copy_surface_storage(
+                source_faces,
+                maximum_brep_control_points,
+                maximum_brep_knots,
+                progress)) {
             return result;
         }
 
@@ -3155,19 +3283,19 @@ BrepMeshSourceData extract_brep_mesh_source(
             GeomAbs_C1,
             14,
             0);
-        NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher>
-            normalization_edges;
-        TopExp::MapShapes(extraction_shape, TopAbs_EDGE, normalization_edges);
-        if (normalization_edges.Extent() < 0
-            || static_cast<size_t>(normalization_edges.Extent())
-                > maximum_brep_edges) {
-            record_resource_failure(
-                __func__, "detached shape edge quota exceeded");
+        BrepShapeMap edges;
+        if (!map_unique_brep_subshapes_bounded(
+                extraction_shape,
+                TopAbs_EDGE,
+                maximum_brep_edges,
+                "detached shape edge quota exceeded",
+                progress,
+                edges)) {
             return result;
         }
-        for (int index = 1; index <= normalization_edges.Extent(); ++index) {
+        for (int index = 1; index <= edges.Extent(); ++index) {
             if (rust_progress_cancelled(progress)) return result;
-            const TopoDS_Edge edge = TopoDS::Edge(normalization_edges(index));
+            const TopoDS_Edge edge = TopoDS::Edge(edges(index));
             if (!BRep_Tool::Degenerated(edge)
                 && !BRepLib::BuildCurve3d(
                     edge,
@@ -3182,9 +3310,9 @@ BrepMeshSourceData extract_brep_mesh_source(
             extraction_shape,
             edge_normalization_tolerance,
             true);
-        for (int index = 1; index <= normalization_edges.Extent(); ++index) {
+        for (int index = 1; index <= edges.Extent(); ++index) {
             if (rust_progress_cancelled(progress)) return result;
-            const TopoDS_Edge edge = TopoDS::Edge(normalization_edges(index));
+            const TopoDS_Edge edge = TopoDS::Edge(edges(index));
             if (!BRep_Tool::Degenerated(edge)
                 && (!BRep_Tool::SameRange(edge)
                     || !BRep_Tool::SameParameter(edge))) {
@@ -3193,33 +3321,27 @@ BrepMeshSourceData extract_brep_mesh_source(
         }
 
         failure_stage = "map_detached_topology";
-        NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> faces;
-        NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> edges;
-        NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> vertices;
-        TopExp::MapShapes(extraction_shape, TopAbs_FACE, faces);
-        TopExp::MapShapes(extraction_shape, TopAbs_EDGE, edges);
-        TopExp::MapShapes(extraction_shape, TopAbs_VERTEX, vertices);
+        BrepShapeMap faces;
+        BrepShapeMap vertices;
+        if (!map_unique_brep_subshapes_bounded(
+                extraction_shape,
+                TopAbs_FACE,
+                maximum_brep_faces,
+                "detached shape face quota exceeded",
+                progress,
+                faces)
+            || !map_unique_brep_subshapes_bounded(
+                extraction_shape,
+                TopAbs_VERTEX,
+                maximum_brep_vertices,
+                "detached shape vertex quota exceeded",
+                progress,
+                vertices)) {
+            return result;
+        }
         if (faces.Extent() != source_faces.Extent()) return result;
+        if (edges.Extent() != source_edges.Extent()) return result;
         if (vertices.Extent() != source_vertices.Extent()) return result;
-        if (faces.Extent() < 0
-            || static_cast<size_t>(faces.Extent()) > maximum_brep_faces) {
-            record_resource_failure(
-                __func__, "detached shape face quota exceeded");
-            return result;
-        }
-        if (edges.Extent() < 0
-            || static_cast<size_t>(edges.Extent()) > maximum_brep_edges) {
-            record_resource_failure(
-                __func__, "detached shape edge quota exceeded");
-            return result;
-        }
-        if (vertices.Extent() < 0
-            || static_cast<size_t>(vertices.Extent())
-                > maximum_brep_vertices) {
-            record_resource_failure(
-                __func__, "detached shape vertex quota exceeded");
-            return result;
-        }
         failure_stage = "map_copy_identity";
         std::vector<gp_Pnt> canonical_vertex_points(
             static_cast<size_t>(vertices.Extent()));
@@ -3572,6 +3694,79 @@ BrepMeshSourceData extract_brep_mesh_source(
         return result;
     }
     return result;
+}
+
+bool test_brep_extraction_preflight_limits(
+    const TopoDS_Shape& shape,
+    uint32_t maximum_faces,
+    uint32_t maximum_edges,
+    uint32_t maximum_vertices,
+    uint32_t maximum_control_points,
+    uint32_t maximum_knots,
+    const CancellationToken& progress)
+{
+    bool success = false;
+    const char* failure_stage = "map_source_topology";
+    ScopedFailureDiagnostic failure_diagnostic(
+        "extract_brep_mesh_source", failure_stage, success, progress);
+    try {
+        if (shape.IsNull()) {
+            record_input_failure(
+                "extract_brep_mesh_source", "shape must not be null");
+            return false;
+        }
+        BrepShapeMap faces;
+        BrepShapeMap edges;
+        BrepShapeMap vertices;
+        if (!map_unique_brep_subshapes_bounded(
+                shape,
+                TopAbs_FACE,
+                maximum_faces,
+                "shape face quota exceeded",
+                progress,
+                faces)
+            || !map_unique_brep_subshapes_bounded(
+                shape,
+                TopAbs_EDGE,
+                maximum_edges,
+                "shape edge quota exceeded",
+                progress,
+                edges)
+            || !map_unique_brep_subshapes_bounded(
+                shape,
+                TopAbs_VERTEX,
+                maximum_vertices,
+                "shape vertex quota exceeded",
+                progress,
+                vertices)) {
+            return false;
+        }
+        failure_stage = "preflight_copy_surface_storage";
+        if (!preflight_brep_copy_surface_storage(
+                faces,
+                maximum_control_points,
+                maximum_knots,
+                progress)) {
+            return false;
+        }
+        success = true;
+        return true;
+    } catch (const Standard_OutOfMemory& failure) {
+        record_standard_failure(
+            "extract_brep_mesh_source", "resource_limit", 5, failure);
+    } catch (const std::bad_alloc&) {
+        record_resource_failure(
+            "extract_brep_mesh_source",
+            "native extraction preflight allocation failed");
+    } catch (const std::length_error&) {
+        record_resource_failure(
+            "extract_brep_mesh_source",
+            "native extraction preflight container limit exceeded");
+    } catch (const Standard_Failure& failure) {
+        record_standard_failure(
+            "extract_brep_mesh_source", "preflight", 7, failure);
+    }
+    return false;
 }
 
 

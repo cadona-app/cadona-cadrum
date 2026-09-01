@@ -86,6 +86,20 @@ pub fn tessellation_rejects_corrupted_source_contracts(solid: &Solid, options: T
 	Ok(malformed_offsets_rejected && non_finite_weight_rejected && invalid_boundary_reference_rejected && excessive_approximation_rejected && duplicate_face_rejected)
 }
 
+/// Exercise the native extraction preflight with fixture-sized limits.
+///
+/// This keeps the OCCT shape private while allowing integration tests to prove
+/// that topology maps and direct B-spline storage stop before crossing their
+/// configured quotas.
+pub fn tessellation_extraction_preflight_with_limits(solid: &Solid, maximum_faces: u32, maximum_edges: u32, maximum_vertices: u32, maximum_control_points: u32, maximum_knots: u32) -> Result<(), Error> {
+	ffi::begin_operation();
+	let progress = ffi::CancellationToken::new();
+	if ffi::test_brep_extraction_preflight_limits(solid.inner(), maximum_faces, maximum_edges, maximum_vertices, maximum_control_points, maximum_knots, &progress) {
+		return Ok(());
+	}
+	Err(ffi::operation_error(Error::TriangulationFailed, "preflight B-rep tessellation extraction", "preflight"))
+}
+
 fn extract_tessellation_source(solid: &Solid, options: Tessellation) -> Result<ffi::BrepMeshSourceData, Error> {
 	if !options.deflection_linear.is_finite() || options.deflection_linear <= 0.0 {
 		return Err(Error::InvalidInput("tessellation linear deflection must be finite and greater than zero".into()));
