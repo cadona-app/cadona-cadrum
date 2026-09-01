@@ -45,6 +45,25 @@ const TARGET_PHYSICAL_ASPECT: f64 = 6.0;
 const MAXIMUM_PHYSICAL_ASPECT: f64 = 12.0;
 const MAXIMUM_HARD_PHYSICAL_ASPECT: f64 = 50.0;
 const MAXIMUM_BALANCED_AXIS_INTERVALS: usize = 128;
+const CANCELLATION_CHECK_INTERVAL: usize = 128;
+const RUST_MESH_PROGRESS_START: f64 = 0.25;
+const RUST_MESH_PROGRESS_STARTED_SPAN: f64 = 0.05;
+const RUST_MESH_PROGRESS_COMPLETED_SPAN: f64 = 0.65;
+
+fn check_cancelled(progress: &ffi::CancellationToken) -> Result<(), Error> {
+	if progress.is_cancelled() {
+		Err(Error::Cancelled)
+	} else {
+		Ok(())
+	}
+}
+
+fn cancellation_checkpoint(progress: &ffi::CancellationToken, ordinal: usize) -> Result<(), Error> {
+	if ordinal.is_multiple_of(CANCELLATION_CHECK_INTERVAL) {
+		check_cancelled(progress)?;
+	}
+	Ok(())
+}
 
 fn resource_limit(message: impl Into<String>) -> Error {
 	Error::OperationFailed(OperationFailure { operation: "tessellate B-rep".into(), stage: "resource_limit".into(), exception_type: None, message: message.into(), category: FailureCategory::ResourceLimit, status: None })
@@ -638,6 +657,50 @@ struct RequestMeshBudget {
 	totals: Mutex<RequestMeshTotals>,
 }
 
+#[derive(Default)]
+struct RustMeshProgressState {
+	started_faces: usize,
+	completed_faces: usize,
+}
+
+struct RustMeshProgress {
+	total_faces: usize,
+	state: Mutex<RustMeshProgressState>,
+}
+
+impl RustMeshProgress {
+	fn new(total_faces: usize) -> Self {
+		Self { total_faces, state: Mutex::new(RustMeshProgressState::default()) }
+	}
+
+	fn face_started(&self, progress: &ffi::CancellationToken) -> Result<(), Error> {
+		check_cancelled(progress)?;
+		let mut state = self.state.lock().map_err(|_| Error::TriangulationFailed)?;
+		state.started_faces = state.started_faces.saturating_add(1).min(self.total_faces);
+		self.publish(&state, progress);
+		Ok(())
+	}
+
+	fn face_completed(&self, progress: &ffi::CancellationToken) -> Result<(), Error> {
+		check_cancelled(progress)?;
+		let mut state = self.state.lock().map_err(|_| Error::TriangulationFailed)?;
+		state.completed_faces = state.completed_faces.saturating_add(1).min(state.started_faces);
+		self.publish(&state, progress);
+		Ok(())
+	}
+
+	fn publish(&self, state: &RustMeshProgressState, progress: &ffi::CancellationToken) {
+		if self.total_faces == 0 {
+			return;
+		}
+		let total = self.total_faces as f64;
+		let completed = RUST_MESH_PROGRESS_START + RUST_MESH_PROGRESS_STARTED_SPAN * state.started_faces as f64 / total + RUST_MESH_PROGRESS_COMPLETED_SPAN * state.completed_faces as f64 / total;
+		// All calls are serialized by `state`, including the store, so parallel
+		// face completion cannot publish an older value after a newer one.
+		ffi::rust_progress_set(progress, completed);
+	}
+}
+
 impl RequestMeshBudget {
 	fn admit(&self, face: &MeshedFace) -> Result<(), Error> {
 		let triangles = face.indices.len() / 3;
@@ -667,16 +730,22 @@ impl RequestMeshBudget {
 }
 
 impl FaceBoundaryContract {
-	fn from_face(face: &TrimmedFace, refinements: &[BoundaryOccurrenceRefinement]) -> Result<Self, Error> {
+	fn from_face(face: &TrimmedFace, refinements: &[BoundaryOccurrenceRefinement], progress: &ffi::CancellationToken) -> Result<Self, Error> {
 		let mut segments = BTreeMap::new();
 		let mut occurrence_directions = BTreeMap::new();
 		for (loop_index, trim_loop) in face.loops.iter().enumerate() {
+			cancellation_checkpoint(progress, loop_index)?;
 			let loop_index = u32::try_from(loop_index).map_err(|_| Error::TriangulationFailed)?;
-			let signed_area = trim_loop.vertices.iter().zip(trim_loop.vertices.iter().cycle().skip(1)).take(trim_loop.vertices.len()).map(|(first, second)| first.uv.perp_dot(second.uv)).sum::<f64>();
+			let mut signed_area = 0.0;
+			for (vertex_index, (first, second)) in trim_loop.vertices.iter().zip(trim_loop.vertices.iter().cycle().skip(1)).take(trim_loop.vertices.len()).enumerate() {
+				cancellation_checkpoint(progress, vertex_index)?;
+				signed_area += first.uv.perp_dot(second.uv);
+			}
 			if !signed_area.is_finite() || signed_area == 0.0 {
 				return Err(Error::TriangulationFailed);
 			}
 			for index in 0..trim_loop.vertices.len() {
+				cancellation_checkpoint(progress, index)?;
 				let first = trim_loop.vertices[index];
 				let second = trim_loop.vertices[(index + 1) % trim_loop.vertices.len()];
 				let occurrence = BoundaryOccurrence { loop_index, edge_index: first.edge_index, occurrence_index: first.edge_occurrence_index };
@@ -703,7 +772,8 @@ impl FaceBoundaryContract {
 		}
 
 		let mut refined_edge_sequences = BTreeMap::<u32, Vec<PointKey>>::new();
-		for refinement in refinements {
+		for (refinement_index, refinement) in refinements.iter().enumerate() {
+			cancellation_checkpoint(progress, refinement_index)?;
 			if refinement.points.len() < 2 || refinement.points.iter().any(|point| !point.uv.is_finite() || !point.position.is_finite()) {
 				return Err(Error::TriangulationFailed);
 			}
@@ -750,7 +820,7 @@ impl FaceBoundaryContract {
 		Ok(Self { segments })
 	}
 
-	fn audit(&self, mesh: &MeshedFace) -> Result<(), Error> {
+	fn audit(&self, mesh: &MeshedFace, progress: &ffi::CancellationToken) -> Result<(), Error> {
 		#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 		struct ParameterKey(u64, u64);
 
@@ -786,7 +856,8 @@ impl FaceBoundaryContract {
 		let mut segment_lookup = BTreeMap::<(BoundaryPointKey, BoundaryPointKey), Vec<BoundarySegmentId>>::new();
 		let mut endpoints_by_position = BTreeMap::<PointKey, BTreeSet<BoundaryPointKey>>::new();
 		let mut collapsed_positions = BTreeSet::new();
-		for (id, segment) in &self.segments {
+		for (segment_index, (id, segment)) in self.segments.iter().enumerate() {
+			cancellation_checkpoint(progress, segment_index)?;
 			let [first, second] = segment.points().map(boundary_point_key);
 			segment_lookup.entry(ordered_pair(first, second)).or_default().push(*id);
 			endpoints_by_position.entry(first.position).or_default().insert(first);
@@ -802,7 +873,9 @@ impl FaceBoundaryContract {
 			.vertices
 			.iter()
 			.zip(&mesh.uvs)
-			.map(|(position, uv)| {
+			.enumerate()
+			.map(|(index, (position, uv))| {
+				cancellation_checkpoint(progress, index)?;
 				let position = point_key(*position);
 				let exact = BoundaryPointKey { parameter: parameter_key(*uv), position };
 				let mut aliases = BTreeSet::new();
@@ -812,9 +885,9 @@ impl FaceBoundaryContract {
 				if collapsed_positions.contains(&position) {
 					aliases.extend(endpoints_by_position.get(&position).into_iter().flatten().copied());
 				}
-				aliases
+				Ok(aliases)
 			})
-			.collect::<Vec<_>>();
+			.collect::<Result<Vec<_>, Error>>()?;
 
 		#[derive(Clone, Copy, Default)]
 		struct DirectedEdgeUse {
@@ -823,7 +896,8 @@ impl FaceBoundaryContract {
 		}
 
 		let mut edge_uses = BTreeMap::<(u32, u32), DirectedEdgeUse>::new();
-		for triangle in mesh.indices.chunks_exact(3) {
+		for (triangle_index, triangle) in mesh.indices.chunks_exact(3).enumerate() {
+			cancellation_checkpoint(progress, triangle_index)?;
 			for edge in 0..3 {
 				let directed = (triangle[edge], triangle[(edge + 1) % 3]);
 				let local_edge = ordered_pair(directed.0, directed.1);
@@ -837,7 +911,8 @@ impl FaceBoundaryContract {
 		}
 
 		let mut segment_uses = BTreeMap::<BoundarySegmentId, usize>::new();
-		for ((first, second), edge_use) in edge_uses {
+		for (edge_index, ((first, second), edge_use)) in edge_uses.into_iter().enumerate() {
+			cancellation_checkpoint(progress, edge_index)?;
 			let first_aliases = aliases.get(first as usize).ok_or(Error::TriangulationFailed)?;
 			let second_aliases = aliases.get(second as usize).ok_or(Error::TriangulationFailed)?;
 			let matches = first_aliases.iter().flat_map(|first| second_aliases.iter().map(move |second| ordered_pair(*first, *second))).filter_map(|points| segment_lookup.get(&points)).flatten().copied().collect::<BTreeSet<_>>();
@@ -874,7 +949,8 @@ impl FaceBoundaryContract {
 			*segment_uses.entry(id).or_default() += 1;
 		}
 
-		for (id, segment) in &self.segments {
+		for (segment_index, (id, segment)) in self.segments.iter().enumerate() {
+			cancellation_checkpoint(progress, segment_index)?;
 			let expected = usize::from(!segment.is_collapsed());
 			let actual = segment_uses.get(id).copied().unwrap_or(0);
 			if actual != expected {
@@ -893,24 +969,24 @@ pub(super) fn mesh_brep_source(data: ffi::BrepMeshSourceData, options: Tessellat
 		return Err(Error::TriangulationFailed);
 	}
 	let source = decode_source(data)?;
-	if progress.is_cancelled() {
-		return Err(Error::Cancelled);
-	}
+	check_cancelled(progress)?;
 	let absolute_linear = source.linear_deflection;
 	let faces = mesh_faces(&source.faces, absolute_linear, options.deflection_angular, options.parallel, progress)?;
-	if progress.is_cancelled() {
-		return Err(Error::Cancelled);
-	}
-	let result = assemble_mesh_data(faces, &source.edges, options.include_edges)?;
+	check_cancelled(progress)?;
+	let result = assemble_mesh_data(faces, &source.edges, options.include_edges, progress)?;
+	check_cancelled(progress)?;
 	ffi::rust_progress_set(progress, 1.0);
 	Ok(result)
 }
 
 fn mesh_faces(faces: &[TrimmedFace], linear: f64, angular: f64, parallel: bool, progress: &ffi::CancellationToken) -> Result<Vec<MeshedFace>, Error> {
 	let budget = RequestMeshBudget::default();
+	let rust_progress = RustMeshProgress::new(faces.len());
 	let mesh_and_admit = |face: &TrimmedFace| {
+		rust_progress.face_started(progress)?;
 		let mesh = mesh_face(face, linear, angular, progress)?;
 		budget.admit(&mesh)?;
+		rust_progress.face_completed(progress)?;
 		Ok(mesh)
 	};
 	#[cfg(not(target_arch = "wasm32"))]
@@ -922,11 +998,9 @@ fn mesh_faces(faces: &[TrimmedFace], linear: f64, angular: f64, parallel: bool, 
 }
 
 fn mesh_face(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::CancellationToken) -> Result<MeshedFace, Error> {
-	if progress.is_cancelled() {
-		return Err(Error::Cancelled);
-	}
+	check_cancelled(progress)?;
 	if !face.surface.is_planar() {
-		let structured_mesh = mesh_structured_patch(face, linear, angular).map_err(|error| {
+		let structured_mesh = mesh_structured_patch(face, linear, angular, progress).map_err(|error| {
 			if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
 				eprintln!("custom tessellation face {} could not build its structured patch: {error:?}", face.index);
 			}
@@ -1004,7 +1078,7 @@ fn mesh_face(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::Canc
 	})?;
 
 	if face.surface.is_planar() {
-		triangulation = seed_best_planar_lattice(face, chart, linear, &insertion_domain, triangulation)?;
+		triangulation = seed_best_planar_lattice(face, chart, linear, &insertion_domain, triangulation, progress)?;
 	} else {
 		seed_structured_patch(face, chart, &insertion_domain, &mut triangulation)?;
 		seed_boundary_collar(face, chart, &insertion_domain, &mut triangulation)?;
@@ -1074,13 +1148,13 @@ fn mesh_face(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::Canc
 			break;
 		}
 	}
-	let mesh = build_face_mesh(face, &triangulation).map_err(|error| {
+	let mesh = build_face_mesh(face, &triangulation, progress).map_err(|error| {
 		if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
 			eprintln!("custom tessellation face {} could not build its trimmed CDT mesh: {error:?}", face.index);
 		}
 		error
 	})?;
-	let satisfies_tolerances = mesh_satisfies_tolerances(face, &mesh, linear, angular).map_err(|error| {
+	let satisfies_tolerances = mesh_satisfies_tolerances(face, &mesh, linear, angular, progress).map_err(|error| {
 		if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
 			eprintln!("custom tessellation face {} could not validate its trimmed CDT mesh tolerances: {error:?}", face.index);
 		}
@@ -1134,14 +1208,18 @@ fn diagnose_meshed_face(mesh: &MeshedFace) {
 	eprintln!("custom tessellation face {} worst aspect: {:.12}, triangle {}, indices {:?}, uvs {:?}, points {:?}", mesh.index, worst_aspect.0, worst_aspect.1, worst_aspect.2, worst_aspect.2.map(|index| mesh.uvs[index as usize]), worst_aspect.2.map(|index| mesh.vertices[index as usize]));
 }
 
-fn mesh_satisfies_tolerances(face: &TrimmedFace, mesh: &MeshedFace, linear: f64, angular: f64) -> Result<bool, Error> {
+fn mesh_satisfies_tolerances(face: &TrimmedFace, mesh: &MeshedFace, linear: f64, angular: f64, progress: &ffi::CancellationToken) -> Result<bool, Error> {
+	check_cancelled(progress)?;
 	if mesh.vertices.len() != mesh.uvs.len() || mesh.vertices.len() != mesh.normals.len() || mesh.indices.is_empty() || !mesh.indices.len().is_multiple_of(3) {
 		return Err(Error::TriangulationFailed);
 	}
-	if mesh.vertices.iter().any(|point| !point.is_finite()) || mesh.uvs.iter().any(|uv| !uv.is_finite()) || mesh.normals.iter().any(|normal| !normal.is_finite()) {
-		return Err(Error::TriangulationFailed);
+	for (vertex_index, ((point, uv), normal)) in mesh.vertices.iter().zip(&mesh.uvs).zip(&mesh.normals).enumerate() {
+		cancellation_checkpoint(progress, vertex_index)?;
+		if !point.is_finite() || !uv.is_finite() || !normal.is_finite() {
+			return Err(Error::TriangulationFailed);
+		}
 	}
-	FaceBoundaryContract::from_face(face, &mesh.boundary_refinements)?.audit(mesh)?;
+	FaceBoundaryContract::from_face(face, &mesh.boundary_refinements, progress)?.audit(mesh, progress)?;
 
 	let usable_linear = (linear - face.surface.approximation_error).max(linear * 0.20).max(1.0e-10);
 	let usable_angular = angular.max(1.0e-3);
@@ -1161,7 +1239,8 @@ fn mesh_satisfies_tolerances(face: &TrimmedFace, mesh: &MeshedFace, linear: f64,
 	let mut normal_angles = Vec::with_capacity(mesh.indices.len() / 3);
 	let mut physical_aspects = Vec::with_capacity(mesh.indices.len() / 3);
 	let mut worst_aspect = (0.0, [0_usize; 3], [DVec2::ZERO; 3], [DVec3::ZERO; 3]);
-	for triangle in mesh.indices.chunks_exact(3) {
+	for (triangle_index, triangle) in mesh.indices.chunks_exact(3).enumerate() {
+		cancellation_checkpoint(progress, triangle_index)?;
 		if triangle.iter().any(|index| *index as usize >= mesh.vertices.len()) {
 			return Err(Error::TriangulationFailed);
 		}
@@ -1219,6 +1298,7 @@ fn mesh_satisfies_tolerances(face: &TrimmedFace, mesh: &MeshedFace, linear: f64,
 			}
 		}
 	}
+	check_cancelled(progress)?;
 	let angular_p99 = percentile(&mut normal_angles, 0.99).ok_or(Error::TriangulationFailed)?;
 	if angular_p99 > usable_angular * acceptance_slack {
 		if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
@@ -1234,6 +1314,7 @@ fn mesh_satisfies_tolerances(face: &TrimmedFace, mesh: &MeshedFace, linear: f64,
 			return Ok(reject_mesh_tolerance(face, "ordinary physical triangle aspect p95 exceeds quality limit"));
 		}
 	}
+	check_cancelled(progress)?;
 	Ok(true)
 }
 
@@ -1329,7 +1410,8 @@ struct StructuredBoundarySides<'a> {
 /// Tessellates an untrimmed four-sided surface chart as a coherent tensor
 /// grid. This covers the regular charts used by most analytic and swept CAD
 /// faces, including periodic seams and collapsed sphere/cone poles.
-fn mesh_structured_patch(face: &TrimmedFace, linear: f64, angular: f64) -> Result<Option<MeshedFace>, Error> {
+fn mesh_structured_patch(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::CancellationToken) -> Result<Option<MeshedFace>, Error> {
+	check_cancelled(progress)?;
 	let Some(trim_loop) = face.loops.first().filter(|_| face.loops.len() == 1) else {
 		return Ok(None);
 	};
@@ -1400,16 +1482,16 @@ fn mesh_structured_patch(face: &TrimmedFace, linear: f64, angular: f64) -> Resul
 		eprintln!("custom tessellation face {} singular routing: periodic seam={}, left edge={left_edge:?}, right edge={right_edge:?}", face.index, sides_are_one_periodic_seam);
 	}
 	if has_collapsed_horizontal_boundary && sides_are_one_periodic_seam {
-		if let Some(mesh) = mesh_singular_row_structured_patch(face, lower, upper, left, right, u_tolerance, v_tolerance, linear, angular)? {
-			if mesh_satisfies_tolerances(face, &mesh, linear, angular)? {
+		if let Some(mesh) = mesh_singular_row_structured_patch(face, lower, upper, left, right, u_tolerance, v_tolerance, linear, angular, progress)? {
+			if mesh_satisfies_tolerances(face, &mesh, linear, angular, progress)? {
 				return Ok(Some(mesh));
 			}
 		}
 	}
 	if has_collapsed_horizontal_boundary || lower.len() == upper.len() && lower.iter().zip(upper).all(|(first, second)| (first.uv.x - second.uv.x).abs() <= u_tolerance) {
 		let boundaries = StructuredBoundarySides { lower, upper, left, right };
-		if let Some(mesh) = mesh_column_structured_patch(face, boundaries, v_tolerance, linear, angular)? {
-			if mesh_satisfies_tolerances(face, &mesh, linear, angular)? {
+		if let Some(mesh) = mesh_column_structured_patch(face, boundaries, v_tolerance, linear, angular, progress)? {
+			if mesh_satisfies_tolerances(face, &mesh, linear, angular, progress)? {
 				return Ok(Some(mesh));
 			}
 		}
@@ -1430,10 +1512,11 @@ fn mesh_structured_patch(face: &TrimmedFace, linear: f64, angular: f64) -> Resul
 	// deterministic structured refinement path instead of falling back to an
 	// unstructured point cloud.
 	for transition_ring_count in [8, 16, 32, 64] {
-		let Some(mesh) = mesh_inset_structured_patch(face, lower, upper, left, right, u_tolerance, v_tolerance, linear, angular, transition_ring_count)? else {
+		check_cancelled(progress)?;
+		let Some(mesh) = mesh_inset_structured_patch(face, lower, upper, left, right, u_tolerance, v_tolerance, linear, angular, transition_ring_count, progress)? else {
 			return Ok(None);
 		};
-		if mesh_satisfies_tolerances(face, &mesh, linear, angular)? {
+		if mesh_satisfies_tolerances(face, &mesh, linear, angular, progress)? {
 			return Ok(Some(mesh));
 		}
 	}
@@ -1447,14 +1530,15 @@ fn mesh_structured_patch(face: &TrimmedFace, linear: f64, angular: f64) -> Resul
 /// graded rows retain the exact non-collapsed boundary, use one geometric pole
 /// vertex, and zipper adjacent rings with deterministic minimax connectivity.
 #[allow(clippy::too_many_arguments)]
-fn mesh_singular_row_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], upper: &[&BoundaryVertex], left: &[&BoundaryVertex], right: &[&BoundaryVertex], u_tolerance: f64, v_tolerance: f64, linear: f64, angular: f64) -> Result<Option<MeshedFace>, Error> {
+fn mesh_singular_row_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], upper: &[&BoundaryVertex], left: &[&BoundaryVertex], right: &[&BoundaryVertex], u_tolerance: f64, v_tolerance: f64, linear: f64, angular: f64, progress: &ffi::CancellationToken) -> Result<Option<MeshedFace>, Error> {
+	check_cancelled(progress)?;
 	let lower_collapsed = boundary_vertices_collapsed(lower);
 	let upper_collapsed = boundary_vertices_collapsed(upper);
 	if !lower_collapsed && !upper_collapsed {
 		return Ok(None);
 	}
 	let [u_min, u_max, _, _] = face.surface.uv_bounds;
-	let mut reference_u = adaptive_axis_coordinates(face, ParametricAxis::U, [lower, upper], AxisSampling { target_length: f64::INFINITY, linear: linear * 0.5, angular: angular * 0.5, coordinate_tolerance: u_tolerance })?;
+	let mut reference_u = adaptive_axis_coordinates(face, ParametricAxis::U, [lower, upper], AxisSampling { target_length: f64::INFINITY, linear: linear * 0.5, angular: angular * 0.5, coordinate_tolerance: u_tolerance }, progress)?;
 	reference_u.sort_by(f64::total_cmp);
 	reference_u.dedup_by(|first, second| (*first - *second).abs() <= u_tolerance);
 	if reference_u.len() < 4 {
@@ -1471,17 +1555,17 @@ fn mesh_singular_row_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVert
 	// shared by both occurrences of this self-seam.
 	let canonical_seam = if left.len() >= right.len() { left } else { right };
 	let seam_edge_index = dominant_boundary_edge_index(canonical_seam).ok_or(Error::TriangulationFailed)?;
-	let mut v_coordinates = adaptive_axis_coordinates(face, ParametricAxis::V, [canonical_seam, canonical_seam], AxisSampling { target_length: f64::INFINITY, linear: linear * 0.5, angular: angular * 0.5, coordinate_tolerance: v_tolerance })?;
+	let mut v_coordinates = adaptive_axis_coordinates(face, ParametricAxis::V, [canonical_seam, canonical_seam], AxisSampling { target_length: f64::INFINITY, linear: linear * 0.5, angular: angular * 0.5, coordinate_tolerance: v_tolerance }, progress)?;
 	v_coordinates.sort_by(f64::total_cmp);
 	v_coordinates.dedup_by(|first, second| (*first - *second).abs() <= v_tolerance);
-	if !refine_compact_patch_v_coordinates(face, &reference_u, &mut v_coordinates, v_tolerance, linear * 0.5)? || !strictly_increasing(&v_coordinates) {
+	if !refine_compact_patch_v_coordinates(face, &reference_u, &mut v_coordinates, v_tolerance, linear * 0.5, progress)? || !strictly_increasing(&v_coordinates) {
 		if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
 			eprintln!("custom tessellation face {} graded singular rejected self-seam refinement: {}x{}", face.index, reference_u.len(), v_coordinates.len());
 		}
 		return Ok(None);
 	}
 
-	let ring_lengths = v_coordinates.iter().copied().map(|v| surface_polyline_length(face, &reference_u, v)).collect::<Result<Vec<_>, _>>()?;
+	let ring_lengths = v_coordinates.iter().copied().map(|v| surface_polyline_length(face, &reference_u, v, progress)).collect::<Result<Vec<_>, _>>()?;
 	let maximum_ring_length = ring_lengths.iter().copied().fold(0.0_f64, f64::max);
 	if !maximum_ring_length.is_finite() || maximum_ring_length <= 1.0e-12 {
 		return Ok(None);
@@ -1491,6 +1575,7 @@ fn mesh_singular_row_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVert
 	let mut planned_row_sizes = Vec::with_capacity(v_coordinates.len());
 	let mut planned_vertex_count = 0usize;
 	for (v_index, _) in v_coordinates.iter().enumerate() {
+		cancellation_checkpoint(progress, v_index)?;
 		let is_lower = v_index == 0;
 		let is_upper = v_index + 1 == v_coordinates.len();
 		let row_size = if is_lower && lower_collapsed || is_upper && upper_collapsed {
@@ -1528,6 +1613,7 @@ fn mesh_singular_row_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVert
 	let mut refined_seam_points = Vec::with_capacity(v_coordinates.len());
 
 	for (v_index, v) in v_coordinates.iter().copied().enumerate() {
+		cancellation_checkpoint(progress, v_index)?;
 		let is_lower = v_index == 0;
 		let is_upper = v_index + 1 == v_coordinates.len();
 		let collapsed = is_lower && lower_collapsed || is_upper && upper_collapsed;
@@ -1541,7 +1627,7 @@ fn mesh_singular_row_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVert
 		}
 		if is_lower && !lower_collapsed || is_upper && !upper_collapsed {
 			let boundary = if is_lower { lower } else { upper };
-			let mut row = append_boundary_side(face, boundary, true, &mut vertices, &mut uvs, &mut normals)?;
+			let mut row = append_boundary_side(face, boundary, true, &mut vertices, &mut uvs, &mut normals, progress)?;
 			let u_range = u_max - u_min;
 			for (coordinate, _) in &mut row {
 				*coordinate = (*coordinate - u_min) / u_range;
@@ -1561,6 +1647,7 @@ fn mesh_singular_row_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVert
 		refined_seam_points.push(seam_position);
 		let mut row = Vec::with_capacity(intervals + 1);
 		for u_index in 0..=intervals {
+			cancellation_checkpoint(progress, u_index)?;
 			let fraction = u_index as f64 / intervals as f64;
 			let u = u_min + (u_max - u_min) * fraction;
 			let boundary_position = (u_index == 0 || u_index == intervals).then_some(seam_position);
@@ -1574,17 +1661,18 @@ fn mesh_singular_row_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVert
 	let planned_index_count = checked_mul_resource(planned_vertex_count, 6, "tessellation singular structured index count overflowed")?;
 	let mut indices = Vec::new();
 	reserve_exact(&mut indices, planned_index_count, "tessellation singular structured index allocation failed")?;
-	for pair in rows.windows(2) {
+	for (row_index, pair) in rows.windows(2).enumerate() {
+		cancellation_checkpoint(progress, row_index)?;
 		match (pair[0].as_slice(), pair[1].as_slice()) {
-			([(_, pole)], ring) => push_pole_fan(*pole, ring, &vertices, &normals, &mut indices)?,
-			(ring, [(_, pole)]) => push_pole_fan(*pole, ring, &vertices, &normals, &mut indices)?,
-			(first, second) => triangulate_monotone_strip(face, first, second, &vertices, &uvs, &normals, 1.0e-10, linear, angular, &mut indices)?,
+			([(_, pole)], ring) => push_pole_fan(*pole, ring, &vertices, &normals, &mut indices, progress)?,
+			(ring, [(_, pole)]) => push_pole_fan(*pole, ring, &vertices, &normals, &mut indices, progress)?,
+			(first, second) => triangulate_monotone_strip(face, first, second, &vertices, &uvs, &normals, 1.0e-10, linear, angular, &mut indices, progress)?,
 		}
 	}
 	if indices.is_empty() {
 		return Ok(None);
 	}
-	fill_singular_normals(face, &uvs, &vertices, &indices, &mut normals)?;
+	fill_singular_normals(face, &uvs, &vertices, &indices, &mut normals, progress)?;
 	if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
 		let row_sizes = rows.iter().map(Vec::len).collect::<Vec<_>>();
 		eprintln!("custom tessellation face {} graded singular rows {:?}: {} vertices, {} triangles", face.index, row_sizes, vertices.len(), indices.len() / 3);
@@ -1594,10 +1682,11 @@ fn mesh_singular_row_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVert
 	Ok(Some(MeshedFace { index: face.index, tshape_id: face.tshape_id, vertices, uvs, normals, indices, refined_edges, boundary_refinements, quality_exempt_vertices: BTreeSet::new() }))
 }
 
-fn surface_polyline_length(face: &TrimmedFace, u_coordinates: &[f64], v: f64) -> Result<f64, Error> {
+fn surface_polyline_length(face: &TrimmedFace, u_coordinates: &[f64], v: f64, progress: &ffi::CancellationToken) -> Result<f64, Error> {
 	let mut previous: Option<DVec3> = None;
 	let mut length = 0.0;
-	for u in u_coordinates {
+	for (index, u) in u_coordinates.iter().enumerate() {
+		cancellation_checkpoint(progress, index)?;
 		let position = face.surface.evaluate(DVec2::new(*u, v)).ok_or(Error::TriangulationFailed)?.position;
 		if let Some(previous) = previous {
 			length += position.distance(previous);
@@ -1607,17 +1696,19 @@ fn surface_polyline_length(face: &TrimmedFace, u_coordinates: &[f64], v: f64) ->
 	Ok(length)
 }
 
-fn push_pole_fan(pole: usize, ring: &[(f64, usize)], vertices: &[DVec3], normals: &[DVec3], indices: &mut Vec<u32>) -> Result<(), Error> {
+fn push_pole_fan(pole: usize, ring: &[(f64, usize)], vertices: &[DVec3], normals: &[DVec3], indices: &mut Vec<u32>, progress: &ffi::CancellationToken) -> Result<(), Error> {
 	if ring.len() < 2 {
 		return Err(Error::TriangulationFailed);
 	}
-	for segment in ring.windows(2) {
+	for (segment_index, segment) in ring.windows(2).enumerate() {
+		cancellation_checkpoint(progress, segment_index)?;
 		push_surface_oriented_triangle([segment[0].1, segment[1].1, pole], vertices, normals, indices)?;
 	}
 	Ok(())
 }
 
-fn mesh_column_structured_patch(face: &TrimmedFace, boundaries: StructuredBoundarySides<'_>, v_tolerance: f64, linear: f64, angular: f64) -> Result<Option<MeshedFace>, Error> {
+fn mesh_column_structured_patch(face: &TrimmedFace, boundaries: StructuredBoundarySides<'_>, v_tolerance: f64, linear: f64, angular: f64, progress: &ffi::CancellationToken) -> Result<Option<MeshedFace>, Error> {
+	check_cancelled(progress)?;
 	let StructuredBoundarySides { lower, upper, left, right } = boundaries;
 	let lower_collapsed = boundary_vertices_collapsed(lower);
 	let upper_collapsed = boundary_vertices_collapsed(upper);
@@ -1632,11 +1723,11 @@ fn mesh_column_structured_patch(face: &TrimmedFace, boundaries: StructuredBounda
 	// would create four independently triangulated corner regions which can
 	// overlap at the collapsed boundary.  Instead, adapt the non-collapsed
 	// parameter direction while retaining every exact edge sample.
-	let mut v_coordinates = if has_collapsed_horizontal_boundary { adaptive_axis_coordinates(face, ParametricAxis::V, [left, right], AxisSampling { target_length: f64::INFINITY, linear: linear * 0.5, angular: angular * 0.5, coordinate_tolerance: v_tolerance })? } else { left.iter().chain(right.iter()).map(|vertex| vertex.uv.y).collect::<Vec<_>>() };
+	let mut v_coordinates = if has_collapsed_horizontal_boundary { adaptive_axis_coordinates(face, ParametricAxis::V, [left, right], AxisSampling { target_length: f64::INFINITY, linear: linear * 0.5, angular: angular * 0.5, coordinate_tolerance: v_tolerance }, progress)? } else { left.iter().chain(right.iter()).map(|vertex| vertex.uv.y).collect::<Vec<_>>() };
 	v_coordinates.sort_by(f64::total_cmp);
 	v_coordinates.dedup_by(|first, second| (*first - *second).abs() <= v_tolerance);
 	let u_coordinates = if both_horizontal_boundaries_collapsed {
-		let adaptive_u = adaptive_axis_coordinates(face, ParametricAxis::U, [lower, upper], AxisSampling { target_length: f64::INFINITY, linear, angular, coordinate_tolerance: (u_max - u_min).abs().max(1.0) * 1.0e-7 })?;
+		let adaptive_u = adaptive_axis_coordinates(face, ParametricAxis::U, [lower, upper], AxisSampling { target_length: f64::INFINITY, linear, angular, coordinate_tolerance: (u_max - u_min).abs().max(1.0) * 1.0e-7 }, progress)?;
 		let metric = MetricMap::from_face(face);
 		let [_, _, v_min, v_max] = face.surface.uv_bounds;
 		let metric_u = metric_distance(metric.map(DVec2::new(u_min, (v_min + v_max) * 0.5)), metric.map(DVec2::new(u_max, (v_min + v_max) * 0.5)));
@@ -1674,7 +1765,7 @@ fn mesh_column_structured_patch(face: &TrimmedFace, boundaries: StructuredBounda
 			v_coordinates.dedup_by(|first, second| (*first - *second).abs() <= v_tolerance);
 		}
 	}
-	if !refine_compact_patch_v_coordinates(face, &u_coordinates, &mut v_coordinates, v_tolerance, linear)? {
+	if !refine_compact_patch_v_coordinates(face, &u_coordinates, &mut v_coordinates, v_tolerance, linear, progress)? {
 		if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
 			eprintln!("custom tessellation face {} compact structured rejected: diagonal refinement exhausted its resource budget", face.index);
 		}
@@ -1710,6 +1801,7 @@ fn mesh_column_structured_patch(face: &TrimmedFace, boundaries: StructuredBounda
 	let refined_seam_points = if self_seam_edge.is_some() { Some(v_coordinates.iter().copied().map(|v| boundary_position_at_coordinate(left, v, false, false, v_tolerance).or_else(|| face.surface.evaluate(DVec2::new(u_min, v)).map(|sample| sample.position)).ok_or(Error::TriangulationFailed)).collect::<Result<Vec<_>, _>>()?) } else { None };
 	let mut columns = Vec::<Vec<(f64, usize)>>::with_capacity(u_count);
 	for (u_index, u) in u_coordinates.iter().copied().enumerate() {
+		cancellation_checkpoint(progress, u_index)?;
 		let boundary_column = if u_index == 0 {
 			Some(left)
 		} else if u_index + 1 == u_count {
@@ -1721,6 +1813,7 @@ fn mesh_column_structured_patch(face: &TrimmedFace, boundaries: StructuredBounda
 		let column_coordinates = owned_boundary_coordinates.as_deref().unwrap_or(v_coordinates.as_slice());
 		let mut column_indices = Vec::with_capacity(column_coordinates.len());
 		for (v_index, v) in column_coordinates.iter().copied().enumerate() {
+			cancellation_checkpoint(progress, v_index)?;
 			// Opposite canonical boundaries can differ by a few chart ULPs even
 			// when their physical samples correspond one-for-one. The tensor
 			// interior uses averaged coordinates, but every unrefined boundary
@@ -1772,13 +1865,14 @@ fn mesh_column_structured_patch(face: &TrimmedFace, boundaries: StructuredBounda
 	let estimated_indices = checked_mul_resource(estimated_vertices, 6, "tessellation compact structured index count overflowed")?;
 	let mut indices = Vec::new();
 	reserve_exact(&mut indices, estimated_indices, "tessellation compact structured index allocation failed")?;
-	for pair in columns.windows(2) {
-		triangulate_monotone_strip(face, pair[0].as_slice(), pair[1].as_slice(), &vertices, &uvs, &normals, v_tolerance, linear, angular, &mut indices)?;
+	for (column_index, pair) in columns.windows(2).enumerate() {
+		cancellation_checkpoint(progress, column_index)?;
+		triangulate_monotone_strip(face, pair[0].as_slice(), pair[1].as_slice(), &vertices, &uvs, &normals, v_tolerance, linear, angular, &mut indices, progress)?;
 	}
 	if indices.is_empty() {
 		return Err(Error::TriangulationFailed);
 	}
-	fill_singular_normals(face, &uvs, &vertices, &indices, &mut normals)?;
+	fill_singular_normals(face, &uvs, &vertices, &indices, &mut normals, progress)?;
 	let refined_edges = self_seam_edge.zip(refined_seam_points).into_iter().collect::<BTreeMap<_, _>>();
 	let boundary_refinements = match self_seam_edge {
 		Some(edge_index) => self_seam_boundary_refinements(left, right, &v_coordinates, &refined_edges[&edge_index])?,
@@ -1805,16 +1899,19 @@ fn subdivide_axis_intervals(coordinates: &[f64], maximum_step: f64) -> Vec<f64> 
 /// Axis-only refinement cannot detect this mixed derivative: a cone's U arcs
 /// and V generators are each individually well sampled while a long diagonal
 /// between them still bows far away from the exact surface.
-fn refine_compact_patch_v_coordinates(face: &TrimmedFace, u_coordinates: &[f64], v_coordinates: &mut Vec<f64>, tolerance: f64, linear: f64) -> Result<bool, Error> {
+fn refine_compact_patch_v_coordinates(face: &TrimmedFace, u_coordinates: &[f64], v_coordinates: &mut Vec<f64>, tolerance: f64, linear: f64, progress: &ffi::CancellationToken) -> Result<bool, Error> {
 	const MAXIMUM_COMPACT_PATCH_V_POINTS: usize = 513;
 	const MAXIMUM_COMPACT_PATCH_REFINEMENT_PASSES: usize = 16;
 
-	for _ in 0..MAXIMUM_COMPACT_PATCH_REFINEMENT_PASSES {
+	for pass in 0..MAXIMUM_COMPACT_PATCH_REFINEMENT_PASSES {
+		cancellation_checkpoint(progress, pass)?;
 		let mut insertions = Vec::new();
-		for v_pair in v_coordinates.windows(2) {
+		for (v_index, v_pair) in v_coordinates.windows(2).enumerate() {
+			cancellation_checkpoint(progress, v_index)?;
 			let midpoint_v = (v_pair[0] + v_pair[1]) * 0.5;
 			let mut needs_split = false;
-			for u_pair in u_coordinates.windows(2) {
+			for (u_index, u_pair) in u_coordinates.windows(2).enumerate() {
+				cancellation_checkpoint(progress, u_index)?;
 				let diagonals = [(DVec2::new(u_pair[0], v_pair[0]), DVec2::new(u_pair[1], v_pair[1])), (DVec2::new(u_pair[1], v_pair[0]), DVec2::new(u_pair[0], v_pair[1]))];
 				for (first_uv, last_uv) in diagonals {
 					let midpoint_uv = regularized_edge_midpoint_uv(face, first_uv, last_uv);
@@ -1927,7 +2024,8 @@ fn boundary_position_at_coordinate(boundary: &[&BoundaryVertex], coordinate: f64
 /// adjacent faces still consume byte-identical shared-edge positions, while
 /// the face interior has coherent rows instead of an unconstrained CDT fan.
 #[allow(clippy::too_many_arguments)]
-fn mesh_inset_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], upper: &[&BoundaryVertex], left: &[&BoundaryVertex], right: &[&BoundaryVertex], u_tolerance: f64, v_tolerance: f64, linear: f64, angular: f64, transition_ring_count: usize) -> Result<Option<MeshedFace>, Error> {
+fn mesh_inset_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], upper: &[&BoundaryVertex], left: &[&BoundaryVertex], right: &[&BoundaryVertex], u_tolerance: f64, v_tolerance: f64, linear: f64, angular: f64, transition_ring_count: usize, progress: &ffi::CancellationToken) -> Result<Option<MeshedFace>, Error> {
+	check_cancelled(progress)?;
 	let [u_min, u_max, v_min, v_max] = face.surface.uv_bounds;
 	let metric = MetricMap::from_face(face);
 	let metric_u = metric_distance(metric.map(DVec2::new(u_min, (v_min + v_max) * 0.5)), metric.map(DVec2::new(u_max, (v_min + v_max) * 0.5)));
@@ -1944,8 +2042,8 @@ fn mesh_inset_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], up
 	// A tensor-cell diagonal combines error from both parametric directions.
 	// Refine each one-dimensional axis to half the requested tolerance so the
 	// two contributions remain bounded when the grid is triangulated.
-	let mut u_axis = adaptive_axis_coordinates(face, ParametricAxis::U, [lower, upper], AxisSampling { target_length, linear: linear * 0.4, angular: angular * 0.4, coordinate_tolerance: u_tolerance })?;
-	let mut v_axis = adaptive_axis_coordinates(face, ParametricAxis::V, [left, right], AxisSampling { target_length, linear: linear * 0.4, angular: angular * 0.4, coordinate_tolerance: v_tolerance })?;
+	let mut u_axis = adaptive_axis_coordinates(face, ParametricAxis::U, [lower, upper], AxisSampling { target_length, linear: linear * 0.4, angular: angular * 0.4, coordinate_tolerance: u_tolerance }, progress)?;
+	let mut v_axis = adaptive_axis_coordinates(face, ParametricAxis::V, [left, right], AxisSampling { target_length, linear: linear * 0.4, angular: angular * 0.4, coordinate_tolerance: v_tolerance }, progress)?;
 	ensure_axis_interior(&mut u_axis, u_min, u_max);
 	ensure_axis_interior(&mut v_axis, v_min, v_max);
 	// Opposite trims can contribute almost-coincident parameters even though
@@ -1963,6 +2061,7 @@ fn mesh_inset_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], up
 	const TARGET_STRUCTURED_GRID_CELLS: usize = 2_304;
 	const COARSENING_SEARCH_TOLERANCE_SCALE: f64 = 2.0;
 	while (u_axis.len() - 1).saturating_mul(v_axis.len() - 1) > TARGET_STRUCTURED_GRID_CELLS {
+		check_cancelled(progress)?;
 		let u_intervals = u_axis.len() - 1;
 		let v_intervals = v_axis.len() - 1;
 		let u_step = metric_u / u_intervals as f64;
@@ -1970,10 +2069,10 @@ fn mesh_inset_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], up
 		let before = (u_axis.len(), v_axis.len());
 		if u_step <= v_step && u_intervals > 3 {
 			let target_intervals = (TARGET_STRUCTURED_GRID_CELLS / v_intervals).clamp(3, u_intervals - 1);
-			u_axis = coarsen_axis_coordinates(face, ParametricAxis::U, &u_axis, target_intervals + 1, linear * COARSENING_SEARCH_TOLERANCE_SCALE, angular * COARSENING_SEARCH_TOLERANCE_SCALE)?;
+			u_axis = coarsen_axis_coordinates(face, ParametricAxis::U, &u_axis, target_intervals + 1, linear * COARSENING_SEARCH_TOLERANCE_SCALE, angular * COARSENING_SEARCH_TOLERANCE_SCALE, progress)?;
 		} else if v_intervals > 3 {
 			let target_intervals = (TARGET_STRUCTURED_GRID_CELLS / u_intervals).clamp(3, v_intervals - 1);
-			v_axis = coarsen_axis_coordinates(face, ParametricAxis::V, &v_axis, target_intervals + 1, linear * COARSENING_SEARCH_TOLERANCE_SCALE, angular * COARSENING_SEARCH_TOLERANCE_SCALE)?;
+			v_axis = coarsen_axis_coordinates(face, ParametricAxis::V, &v_axis, target_intervals + 1, linear * COARSENING_SEARCH_TOLERANCE_SCALE, angular * COARSENING_SEARCH_TOLERANCE_SCALE, progress)?;
 		} else {
 			break;
 		}
@@ -1985,6 +2084,7 @@ fn mesh_inset_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], up
 	let mut v_intervals = v_axis.len() - 1;
 	let boundary_vertex_count = lower.len().saturating_add(upper.len()).saturating_add(left.len()).saturating_add(right.len());
 	while boundary_vertex_count.saturating_add(u_intervals.saturating_sub(1).saturating_mul(v_intervals.saturating_sub(1))) > MAXIMUM_FACE_VERTICES {
+		check_cancelled(progress)?;
 		if u_intervals >= v_intervals && u_intervals > 3 {
 			u_axis = decimate_axis_coordinates(&u_axis);
 			u_intervals = u_axis.len() - 1;
@@ -2007,7 +2107,7 @@ fn mesh_inset_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], up
 	let v_transition = transition_axis_index(v_axis.len(), transition_ring_count);
 	let mut u_coordinates = u_axis[u_transition..u_axis.len() - u_transition].to_vec();
 	let mut v_coordinates = v_axis[v_transition..v_axis.len() - v_transition].to_vec();
-	if !refine_tensor_coordinates(face, &mut u_coordinates, &mut v_coordinates, u_tolerance, v_tolerance, linear * 0.9, angular * 3.0)? {
+	if !refine_tensor_coordinates(face, &mut u_coordinates, &mut v_coordinates, TensorSampling { u_tolerance, v_tolerance, linear: linear * 0.9, angular: angular * 3.0 }, progress)? {
 		return Ok(None);
 	}
 	if !strictly_increasing(&u_coordinates) || !strictly_increasing(&v_coordinates) {
@@ -2025,15 +2125,17 @@ fn mesh_inset_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], up
 	reserve_exact(&mut vertices, base_vertex_count, "tessellation inset structured vertex allocation failed")?;
 	reserve_exact(&mut uvs, base_vertex_count, "tessellation inset structured parameter allocation failed")?;
 	reserve_exact(&mut normals, base_vertex_count, "tessellation inset structured normal allocation failed")?;
-	let mut lower_indices = append_boundary_side(face, lower, true, &mut vertices, &mut uvs, &mut normals)?;
-	let mut upper_indices = append_boundary_side(face, upper, true, &mut vertices, &mut uvs, &mut normals)?;
-	let mut left_indices = append_boundary_side(face, left, false, &mut vertices, &mut uvs, &mut normals)?;
-	let mut right_indices = append_boundary_side(face, right, false, &mut vertices, &mut uvs, &mut normals)?;
+	let mut lower_indices = append_boundary_side(face, lower, true, &mut vertices, &mut uvs, &mut normals, progress)?;
+	let mut upper_indices = append_boundary_side(face, upper, true, &mut vertices, &mut uvs, &mut normals, progress)?;
+	let mut left_indices = append_boundary_side(face, left, false, &mut vertices, &mut uvs, &mut normals, progress)?;
+	let mut right_indices = append_boundary_side(face, right, false, &mut vertices, &mut uvs, &mut normals, progress)?;
 	weld_exact_boundary_corners([&mut lower_indices, &mut upper_indices, &mut left_indices, &mut right_indices], &vertices, &uvs)?;
 	let mut columns = Vec::<Vec<(f64, usize)>>::with_capacity(u_coordinates.len());
-	for u in u_coordinates.iter().copied() {
+	for (u_index, u) in u_coordinates.iter().copied().enumerate() {
+		cancellation_checkpoint(progress, u_index)?;
 		let mut column = Vec::with_capacity(v_coordinates.len());
-		for v in v_coordinates.iter().copied() {
+		for (v_index, v) in v_coordinates.iter().copied().enumerate() {
+			cancellation_checkpoint(progress, v_index)?;
 			let index = append_surface_vertex(face, DVec2::new(u, v), None, &mut vertices, &mut uvs, &mut normals)?;
 			column.push((parameter_fraction(v, v_min, v_max), index));
 		}
@@ -2043,10 +2145,10 @@ fn mesh_inset_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], up
 	let top_inner = columns.iter().enumerate().map(|(u_index, column)| (parameter_fraction(u_coordinates[u_index], u_coordinates[0], u_coordinates[u_coordinates.len() - 1]), column[column.len() - 1].1)).collect::<Vec<_>>();
 	let left_inner = columns[0].iter().map(|(_, index)| (parameter_fraction(uvs[*index].y, v_coordinates[0], v_coordinates[v_coordinates.len() - 1]), *index)).collect::<Vec<_>>();
 	let right_inner = columns[columns.len() - 1].iter().map(|(_, index)| (parameter_fraction(uvs[*index].y, v_coordinates[0], v_coordinates[v_coordinates.len() - 1]), *index)).collect::<Vec<_>>();
-	lower_indices = augment_collapsed_boundary(face, &lower_indices, &bottom_inner, PatchSide::Lower, &mut vertices, &mut uvs, &mut normals)?;
-	upper_indices = augment_collapsed_boundary(face, &upper_indices, &top_inner, PatchSide::Upper, &mut vertices, &mut uvs, &mut normals)?;
-	left_indices = augment_collapsed_boundary(face, &left_indices, &left_inner, PatchSide::Left, &mut vertices, &mut uvs, &mut normals)?;
-	right_indices = augment_collapsed_boundary(face, &right_indices, &right_inner, PatchSide::Right, &mut vertices, &mut uvs, &mut normals)?;
+	lower_indices = augment_collapsed_boundary(face, &lower_indices, &bottom_inner, PatchSide::Lower, &mut vertices, &mut uvs, &mut normals, progress)?;
+	upper_indices = augment_collapsed_boundary(face, &upper_indices, &top_inner, PatchSide::Upper, &mut vertices, &mut uvs, &mut normals, progress)?;
+	left_indices = augment_collapsed_boundary(face, &left_indices, &left_inner, PatchSide::Left, &mut vertices, &mut uvs, &mut normals, progress)?;
+	right_indices = augment_collapsed_boundary(face, &right_indices, &right_inner, PatchSide::Right, &mut vertices, &mut uvs, &mut normals, progress)?;
 	let transition_vertex_count = checked_add_resource(checked_add_resource(transition_stage_vertex_count(lower_indices.len(), bottom_inner.len(), transition_ring_count)?, transition_stage_vertex_count(upper_indices.len(), top_inner.len(), transition_ring_count)?, "tessellation transition-ring vertex count overflowed")?, checked_add_resource(transition_stage_vertex_count(left_indices.len(), left_inner.len(), transition_ring_count)?, transition_stage_vertex_count(right_indices.len(), right_inner.len(), transition_ring_count)?, "tessellation transition-ring vertex count overflowed")?, "tessellation transition-ring vertex count overflowed")?;
 	let planned_vertex_count = checked_add_resource(vertices.len(), transition_vertex_count, "tessellation inset structured vertex count overflowed")?;
 	if planned_vertex_count > MAXIMUM_FACE_VERTICES {
@@ -2055,30 +2157,36 @@ fn mesh_inset_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], up
 	reserve_exact(&mut vertices, transition_vertex_count, "tessellation inset structured transition allocation failed")?;
 	reserve_exact(&mut uvs, transition_vertex_count, "tessellation inset structured transition allocation failed")?;
 	reserve_exact(&mut normals, transition_vertex_count, "tessellation inset structured transition allocation failed")?;
-	let mut lower_rings = append_transition_rings(face, &lower_indices, &bottom_inner, PatchSide::Lower, u_coordinates[0], u_coordinates[u_coordinates.len() - 1], v_coordinates[0], v_coordinates[v_coordinates.len() - 1], transition_ring_count, &mut vertices, &mut uvs, &mut normals)?;
-	let mut upper_rings = append_transition_rings(face, &upper_indices, &top_inner, PatchSide::Upper, u_coordinates[0], u_coordinates[u_coordinates.len() - 1], v_coordinates[0], v_coordinates[v_coordinates.len() - 1], transition_ring_count, &mut vertices, &mut uvs, &mut normals)?;
-	let mut left_rings = append_transition_rings(face, &left_indices, &left_inner, PatchSide::Left, u_coordinates[0], u_coordinates[u_coordinates.len() - 1], v_coordinates[0], v_coordinates[v_coordinates.len() - 1], transition_ring_count, &mut vertices, &mut uvs, &mut normals)?;
-	let mut right_rings = append_transition_rings(face, &right_indices, &right_inner, PatchSide::Right, u_coordinates[0], u_coordinates[u_coordinates.len() - 1], v_coordinates[0], v_coordinates[v_coordinates.len() - 1], transition_ring_count, &mut vertices, &mut uvs, &mut normals)?;
+	let mut lower_rings = append_transition_rings(face, &lower_indices, &bottom_inner, PatchSide::Lower, u_coordinates[0], u_coordinates[u_coordinates.len() - 1], v_coordinates[0], v_coordinates[v_coordinates.len() - 1], transition_ring_count, &mut vertices, &mut uvs, &mut normals, progress)?;
+	let mut upper_rings = append_transition_rings(face, &upper_indices, &top_inner, PatchSide::Upper, u_coordinates[0], u_coordinates[u_coordinates.len() - 1], v_coordinates[0], v_coordinates[v_coordinates.len() - 1], transition_ring_count, &mut vertices, &mut uvs, &mut normals, progress)?;
+	let mut left_rings = append_transition_rings(face, &left_indices, &left_inner, PatchSide::Left, u_coordinates[0], u_coordinates[u_coordinates.len() - 1], v_coordinates[0], v_coordinates[v_coordinates.len() - 1], transition_ring_count, &mut vertices, &mut uvs, &mut normals, progress)?;
+	let mut right_rings = append_transition_rings(face, &right_indices, &right_inner, PatchSide::Right, u_coordinates[0], u_coordinates[u_coordinates.len() - 1], v_coordinates[0], v_coordinates[v_coordinates.len() - 1], transition_ring_count, &mut vertices, &mut uvs, &mut normals, progress)?;
 	share_transition_ring_corners(&mut lower_rings, &mut upper_rings, &mut left_rings, &mut right_rings)?;
-	let quality_exempt_vertices = lower_indices.iter().chain(&upper_indices).chain(&left_indices).chain(&right_indices).map(|(_, index)| *index).chain([&lower_rings, &upper_rings, &left_rings, &right_rings].into_iter().flat_map(|rings| rings.iter().flatten().map(|(_, index)| *index))).map(|index| u32::try_from(index).map_err(|_| Error::TriangulationFailed)).collect::<Result<BTreeSet<_>, _>>()?;
+	let quality_exempt_indices = lower_indices.iter().chain(&upper_indices).chain(&left_indices).chain(&right_indices).map(|(_, index)| *index).chain([&lower_rings, &upper_rings, &left_rings, &right_rings].into_iter().flat_map(|rings| rings.iter().flatten().map(|(_, index)| *index)));
+	let mut quality_exempt_vertices = BTreeSet::new();
+	for (index_ordinal, index) in quality_exempt_indices.enumerate() {
+		cancellation_checkpoint(progress, index_ordinal)?;
+		quality_exempt_vertices.insert(u32::try_from(index).map_err(|_| Error::TriangulationFailed)?);
+	}
 	debug_assert_eq!(vertices.len(), planned_vertex_count);
 
 	let planned_index_count = checked_mul_resource(planned_vertex_count, 6, "tessellation inset structured index count overflowed")?;
 	let mut indices = Vec::new();
 	reserve_exact(&mut indices, planned_index_count, "tessellation inset structured index allocation failed")?;
-	for pair in columns.windows(2) {
-		triangulate_monotone_strip(face, &pair[0], &pair[1], &vertices, &uvs, &normals, 1.0e-10, linear, angular, &mut indices)?;
+	for (column_index, pair) in columns.windows(2).enumerate() {
+		cancellation_checkpoint(progress, column_index)?;
+		triangulate_monotone_strip(face, &pair[0], &pair[1], &vertices, &uvs, &normals, 1.0e-10, linear, angular, &mut indices, progress)?;
 	}
 	// Strip ordering is chosen so its natural winding follows +du x +dv.
-	triangulate_transition_rings(face, &lower_indices, &lower_rings, &bottom_inner, false, &vertices, &uvs, &normals, linear, angular, &mut indices)?;
-	triangulate_transition_rings(face, &upper_indices, &upper_rings, &top_inner, true, &vertices, &uvs, &normals, linear, angular, &mut indices)?;
-	triangulate_transition_rings(face, &left_indices, &left_rings, &left_inner, true, &vertices, &uvs, &normals, linear, angular, &mut indices)?;
-	triangulate_transition_rings(face, &right_indices, &right_rings, &right_inner, false, &vertices, &uvs, &normals, linear, angular, &mut indices)?;
-	weld_exact_mesh_vertex_indices(&vertices, &uvs, &mut indices)?;
+	triangulate_transition_rings(face, &lower_indices, &lower_rings, &bottom_inner, false, &vertices, &uvs, &normals, linear, angular, &mut indices, progress)?;
+	triangulate_transition_rings(face, &upper_indices, &upper_rings, &top_inner, true, &vertices, &uvs, &normals, linear, angular, &mut indices, progress)?;
+	triangulate_transition_rings(face, &left_indices, &left_rings, &left_inner, true, &vertices, &uvs, &normals, linear, angular, &mut indices, progress)?;
+	triangulate_transition_rings(face, &right_indices, &right_rings, &right_inner, false, &vertices, &uvs, &normals, linear, angular, &mut indices, progress)?;
+	weld_exact_mesh_vertex_indices(&vertices, &uvs, &mut indices, progress)?;
 	if indices.is_empty() {
 		return Err(Error::TriangulationFailed);
 	}
-	fill_singular_normals(face, &uvs, &vertices, &indices, &mut normals)?;
+	fill_singular_normals(face, &uvs, &vertices, &indices, &mut normals, progress)?;
 	Ok(Some(MeshedFace { index: face.index, tshape_id: face.tshape_id, vertices, uvs, normals, indices, refined_edges: BTreeMap::new(), boundary_refinements: Vec::new(), quality_exempt_vertices }))
 }
 
@@ -2166,7 +2274,8 @@ struct AxisSampling {
 	coordinate_tolerance: f64,
 }
 
-fn adaptive_axis_coordinates(face: &TrimmedFace, axis: ParametricAxis, boundaries: [&[&BoundaryVertex]; 2], sampling: AxisSampling) -> Result<Vec<f64>, Error> {
+fn adaptive_axis_coordinates(face: &TrimmedFace, axis: ParametricAxis, boundaries: [&[&BoundaryVertex]; 2], sampling: AxisSampling, progress: &ffi::CancellationToken) -> Result<Vec<f64>, Error> {
+	check_cancelled(progress)?;
 	let [first_boundary, second_boundary] = boundaries;
 	// Ordinary viewport requests normally converge well below this ceiling. A
 	// tight angular request on a complete periodic chart (for example, a sphere)
@@ -2202,14 +2311,16 @@ fn adaptive_axis_coordinates(face: &TrimmedFace, axis: ParametricAxis, boundarie
 	let last = coordinates.len() - 1;
 	coordinates[last] = maximum;
 
-	for _ in 0..MAXIMUM_AXIS_REFINEMENT_PASSES {
+	for pass in 0..MAXIMUM_AXIS_REFINEMENT_PASSES {
+		cancellation_checkpoint(progress, pass)?;
 		if coordinates.len() >= MAXIMUM_AXIS_POINTS {
 			break;
 		}
 		let mut insertions = Vec::new();
-		for pair in coordinates.windows(2) {
+		for (interval_index, pair) in coordinates.windows(2).enumerate() {
+			cancellation_checkpoint(progress, interval_index)?;
 			let midpoint = (pair[0] + pair[1]) * 0.5;
-			if midpoint > pair[0] && midpoint < pair[1] && axis_interval_needs_split(face, axis, [pair[0], midpoint, pair[1]], sampling)? {
+			if midpoint > pair[0] && midpoint < pair[1] && axis_interval_needs_split(face, axis, [pair[0], midpoint, pair[1]], sampling, progress)? {
 				insertions.push((pair[1] - pair[0], midpoint));
 			}
 		}
@@ -2227,7 +2338,8 @@ fn adaptive_axis_coordinates(face: &TrimmedFace, axis: ParametricAxis, boundarie
 	Ok(coordinates)
 }
 
-fn axis_interval_needs_split(face: &TrimmedFace, axis: ParametricAxis, interval: [f64; 3], sampling: AxisSampling) -> Result<bool, Error> {
+fn axis_interval_needs_split(face: &TrimmedFace, axis: ParametricAxis, interval: [f64; 3], sampling: AxisSampling, progress: &ffi::CancellationToken) -> Result<bool, Error> {
+	check_cancelled(progress)?;
 	let [first, midpoint, last] = interval;
 	let [u_min, u_max, v_min, v_max] = face.surface.uv_bounds;
 	let cross_values = match axis {
@@ -2290,11 +2402,12 @@ fn resample_axis_coordinates(coordinates: &[f64], target_count: usize) -> Vec<f6
 		.collect()
 }
 
-fn coarsen_axis_coordinates(face: &TrimmedFace, axis: ParametricAxis, coordinates: &[f64], target_count: usize, linear: f64, angular: f64) -> Result<Vec<f64>, Error> {
+fn coarsen_axis_coordinates(face: &TrimmedFace, axis: ParametricAxis, coordinates: &[f64], target_count: usize, linear: f64, angular: f64, progress: &ffi::CancellationToken) -> Result<Vec<f64>, Error> {
 	let mut count = target_count.max(4).min(coordinates.len());
 	loop {
+		check_cancelled(progress)?;
 		let candidate = resample_axis_coordinates(coordinates, count);
-		if axis_coordinates_meet_error(face, axis, &candidate, linear * 0.5, angular * 0.5)? {
+		if axis_coordinates_meet_error(face, axis, &candidate, linear * 0.5, angular * 0.5, progress)? {
 			return Ok(candidate);
 		}
 		if count == coordinates.len() {
@@ -2304,11 +2417,12 @@ fn coarsen_axis_coordinates(face: &TrimmedFace, axis: ParametricAxis, coordinate
 	}
 }
 
-fn axis_coordinates_meet_error(face: &TrimmedFace, axis: ParametricAxis, coordinates: &[f64], linear: f64, angular: f64) -> Result<bool, Error> {
+fn axis_coordinates_meet_error(face: &TrimmedFace, axis: ParametricAxis, coordinates: &[f64], linear: f64, angular: f64, progress: &ffi::CancellationToken) -> Result<bool, Error> {
 	let sampling = AxisSampling { target_length: f64::INFINITY, linear, angular, coordinate_tolerance: 0.0 };
-	for interval in coordinates.windows(2) {
+	for (interval_index, interval) in coordinates.windows(2).enumerate() {
+		cancellation_checkpoint(progress, interval_index)?;
 		let midpoint = (interval[0] + interval[1]) * 0.5;
-		if axis_interval_needs_split(face, axis, [interval[0], midpoint, interval[1]], sampling)? {
+		if axis_interval_needs_split(face, axis, [interval[0], midpoint, interval[1]], sampling, progress)? {
 			return Ok(false);
 		}
 	}
@@ -2329,17 +2443,29 @@ fn transition_axis_index(axis_length: usize, transition_ring_count: usize) -> us
 /// narrow region. Deterministic midpoint insertion keeps the grid coherent,
 /// chooses the less expensive refinement direction for a failing cell, and
 /// remains bounded independently of surface complexity.
-fn refine_tensor_coordinates(face: &TrimmedFace, u_coordinates: &mut Vec<f64>, v_coordinates: &mut Vec<f64>, u_tolerance: f64, v_tolerance: f64, linear: f64, angular: f64) -> Result<bool, Error> {
+#[derive(Clone, Copy)]
+struct TensorSampling {
+	u_tolerance: f64,
+	v_tolerance: f64,
+	linear: f64,
+	angular: f64,
+}
+
+fn refine_tensor_coordinates(face: &TrimmedFace, u_coordinates: &mut Vec<f64>, v_coordinates: &mut Vec<f64>, sampling: TensorSampling, progress: &ffi::CancellationToken) -> Result<bool, Error> {
 	const MAXIMUM_TENSOR_AXIS_POINTS: usize = 513;
 	const MAXIMUM_TENSOR_CELLS: usize = 131_072;
 	const MAXIMUM_TENSOR_REFINEMENT_PASSES: usize = 8;
+	let TensorSampling { u_tolerance, v_tolerance, linear, angular } = sampling;
 
-	for _ in 0..MAXIMUM_TENSOR_REFINEMENT_PASSES {
+	for pass in 0..MAXIMUM_TENSOR_REFINEMENT_PASSES {
+		cancellation_checkpoint(progress, pass)?;
 		let mut u_insertions = Vec::new();
-		for interval in u_coordinates.windows(2) {
+		for (u_interval_index, interval) in u_coordinates.windows(2).enumerate() {
+			cancellation_checkpoint(progress, u_interval_index)?;
 			let midpoint = (interval[0] + interval[1]) * 0.5;
 			let mut needs_split = false;
-			for v in v_coordinates.iter().copied() {
+			for (v_index, v) in v_coordinates.iter().copied().enumerate() {
+				cancellation_checkpoint(progress, v_index)?;
 				let first = face.surface.evaluate(DVec2::new(interval[0], v)).ok_or(Error::TriangulationFailed)?.position;
 				let middle = face.surface.evaluate(DVec2::new(midpoint, v)).ok_or(Error::TriangulationFailed)?.position;
 				let last = face.surface.evaluate(DVec2::new(interval[1], v)).ok_or(Error::TriangulationFailed)?.position;
@@ -2354,10 +2480,12 @@ fn refine_tensor_coordinates(face: &TrimmedFace, u_coordinates: &mut Vec<f64>, v
 		}
 
 		let mut v_insertions = Vec::new();
-		for interval in v_coordinates.windows(2) {
+		for (v_interval_index, interval) in v_coordinates.windows(2).enumerate() {
+			cancellation_checkpoint(progress, v_interval_index)?;
 			let midpoint = (interval[0] + interval[1]) * 0.5;
 			let mut needs_split = false;
-			for u in u_coordinates.iter().copied() {
+			for (u_index, u) in u_coordinates.iter().copied().enumerate() {
+				cancellation_checkpoint(progress, u_index)?;
 				let first = face.surface.evaluate(DVec2::new(u, interval[0])).ok_or(Error::TriangulationFailed)?.position;
 				let middle = face.surface.evaluate(DVec2::new(u, midpoint)).ok_or(Error::TriangulationFailed)?.position;
 				let last = face.surface.evaluate(DVec2::new(u, interval[1])).ok_or(Error::TriangulationFailed)?.position;
@@ -2377,8 +2505,10 @@ fn refine_tensor_coordinates(face: &TrimmedFace, u_coordinates: &mut Vec<f64>, v
 		// and V subdivisions and insert only the midpoint that lowers the worst
 		// child-cell error most. This produces a graded tensor mesh instead of
 		// abandoning a well-structured face for an unconstrained point cloud.
-		for u_interval in u_coordinates.windows(2) {
-			for v_interval in v_coordinates.windows(2) {
+		for (u_interval_index, u_interval) in u_coordinates.windows(2).enumerate() {
+			cancellation_checkpoint(progress, u_interval_index)?;
+			for (v_interval_index, v_interval) in v_coordinates.windows(2).enumerate() {
+				cancellation_checkpoint(progress, v_interval_index)?;
 				let current = tensor_cell_error(face, u_interval[0], u_interval[1], v_interval[0], v_interval[1], linear, angular)?;
 				if current <= 1.0 {
 					continue;
@@ -2460,11 +2590,13 @@ fn metric_distance(first: Point2<f64>, second: Point2<f64>) -> f64 {
 	((second.x - first.x).powi(2) + (second.y - first.y).powi(2)).sqrt()
 }
 
-fn append_boundary_side(face: &TrimmedFace, vertices_on_side: &[&BoundaryVertex], use_u: bool, vertices: &mut Vec<DVec3>, uvs: &mut Vec<DVec2>, normals: &mut Vec<DVec3>) -> Result<Vec<(f64, usize)>, Error> {
+fn append_boundary_side(face: &TrimmedFace, vertices_on_side: &[&BoundaryVertex], use_u: bool, vertices: &mut Vec<DVec3>, uvs: &mut Vec<DVec2>, normals: &mut Vec<DVec3>, progress: &ffi::CancellationToken) -> Result<Vec<(f64, usize)>, Error> {
 	let [u_min, u_max, v_min, v_max] = face.surface.uv_bounds;
 	vertices_on_side
 		.iter()
-		.map(|vertex| {
+		.enumerate()
+		.map(|(index, vertex)| {
+			cancellation_checkpoint(progress, index)?;
 			let index = append_surface_vertex(face, vertex.uv, Some(vertex.position), vertices, uvs, normals)?;
 			let key = if use_u { parameter_fraction(vertex.uv.x, u_min, u_max) } else { parameter_fraction(vertex.uv.y, v_min, v_max) };
 			Ok((key, index))
@@ -2502,7 +2634,7 @@ fn weld_exact_boundary_corners(sides: [&mut Vec<(f64, usize)>; 4], vertices: &[D
 	Ok(())
 }
 
-fn weld_exact_mesh_vertex_indices(vertices: &[DVec3], uvs: &[DVec2], indices: &mut Vec<u32>) -> Result<(), Error> {
+fn weld_exact_mesh_vertex_indices(vertices: &[DVec3], uvs: &[DVec2], indices: &mut Vec<u32>, progress: &ffi::CancellationToken) -> Result<(), Error> {
 	fn coordinate_key(value: f64) -> u64 {
 		if value == 0.0 {
 			0
@@ -2517,12 +2649,14 @@ fn weld_exact_mesh_vertex_indices(vertices: &[DVec3], uvs: &[DVec2], indices: &m
 	let mut canonical = BTreeMap::<(u64, u64, PointKey), u32>::new();
 	let mut replacements = Vec::with_capacity(vertices.len());
 	for (index, (position, uv)) in vertices.iter().zip(uvs).enumerate() {
+		cancellation_checkpoint(progress, index)?;
 		let index = u32::try_from(index).map_err(|_| Error::TriangulationFailed)?;
 		let key = (coordinate_key(uv.x), coordinate_key(uv.y), point_key(*position));
 		let canonical = *canonical.entry(key).or_insert(index);
 		replacements.push(canonical);
 	}
-	for index in indices.iter_mut() {
+	for (ordinal, index) in indices.iter_mut().enumerate() {
+		cancellation_checkpoint(progress, ordinal)?;
 		*index = *replacements.get(*index as usize).ok_or(Error::TriangulationFailed)?;
 	}
 	*indices = indices.chunks_exact(3).filter(|triangle| triangle[0] != triangle[1] && triangle[1] != triangle[2] && triangle[2] != triangle[0]).flatten().copied().collect();
@@ -2543,7 +2677,9 @@ enum PatchSide {
 /// point, so every interior column closes independently at the singularity.
 /// This avoids a sparse-density transition fan that jumps across latitude
 /// rings without changing the geometric shared boundary.
-fn augment_collapsed_boundary(face: &TrimmedFace, boundary: &[(f64, usize)], inner: &[(f64, usize)], side: PatchSide, vertices: &mut Vec<DVec3>, uvs: &mut Vec<DVec2>, normals: &mut Vec<DVec3>) -> Result<Vec<(f64, usize)>, Error> {
+#[allow(clippy::too_many_arguments)]
+fn augment_collapsed_boundary(face: &TrimmedFace, boundary: &[(f64, usize)], inner: &[(f64, usize)], side: PatchSide, vertices: &mut Vec<DVec3>, uvs: &mut Vec<DVec2>, normals: &mut Vec<DVec3>, progress: &ffi::CancellationToken) -> Result<Vec<(f64, usize)>, Error> {
+	check_cancelled(progress)?;
 	let Some((_, first_index)) = boundary.first().copied() else {
 		return Err(Error::TriangulationFailed);
 	};
@@ -2567,7 +2703,9 @@ fn augment_collapsed_boundary(face: &TrimmedFace, boundary: &[(f64, usize)], inn
 	reserve_exact(normals, additional_vertices, "tessellation collapsed boundary normal allocation failed")?;
 	let [u_min, u_max, v_min, v_max] = face.surface.uv_bounds;
 	keys.into_iter()
-		.map(|key| {
+		.enumerate()
+		.map(|(key_index, key)| {
+			cancellation_checkpoint(progress, key_index)?;
 			if let Some(entry) = boundary.iter().find(|entry| (entry.0 - key).abs() <= 1.0e-12) {
 				return Ok(*entry);
 			}
@@ -2584,23 +2722,27 @@ fn augment_collapsed_boundary(face: &TrimmedFace, boundary: &[(f64, usize)], inn
 }
 
 #[allow(clippy::too_many_arguments)]
-fn append_transition_rings(face: &TrimmedFace, boundary: &[(f64, usize)], inner: &[(f64, usize)], side: PatchSide, core_u_min: f64, core_u_max: f64, core_v_min: f64, core_v_max: f64, transition_ring_count: usize, vertices: &mut Vec<DVec3>, uvs: &mut Vec<DVec2>, normals: &mut Vec<DVec3>) -> Result<Vec<Vec<(f64, usize)>>, Error> {
+fn append_transition_rings(face: &TrimmedFace, boundary: &[(f64, usize)], inner: &[(f64, usize)], side: PatchSide, core_u_min: f64, core_u_max: f64, core_v_min: f64, core_v_max: f64, transition_ring_count: usize, vertices: &mut Vec<DVec3>, uvs: &mut Vec<DVec2>, normals: &mut Vec<DVec3>, progress: &ffi::CancellationToken) -> Result<Vec<Vec<(f64, usize)>>, Error> {
+	check_cancelled(progress)?;
 	let boundary_keys = boundary.iter().map(|entry| entry.0).collect::<Vec<_>>();
 	let inner_keys = inner.iter().map(|entry| entry.0).collect::<Vec<_>>();
-	let key_stages = transition_key_stages(&boundary_keys, &inner_keys, transition_ring_count)?;
+	let key_stages = transition_key_stages(&boundary_keys, &inner_keys, transition_ring_count, progress)?;
 	let [face_u_min, face_u_max, face_v_min, face_v_max] = face.surface.uv_bounds;
 	let stage_count = key_stages.len();
 	key_stages
 		.into_iter()
 		.enumerate()
 		.map(|(ordinal, keys)| {
+			cancellation_checkpoint(progress, ordinal)?;
 			let fraction = (ordinal + 1) as f64 / (stage_count + 1) as f64;
 			let u_min = face_u_min + (core_u_min - face_u_min) * fraction;
 			let u_max = face_u_max + (core_u_max - face_u_max) * fraction;
 			let v_min = face_v_min + (core_v_min - face_v_min) * fraction;
 			let v_max = face_v_max + (core_v_max - face_v_max) * fraction;
 			keys.into_iter()
-				.map(|key| {
+				.enumerate()
+				.map(|(key_index, key)| {
+					cancellation_checkpoint(progress, key_index)?;
 					let uv = match side {
 						PatchSide::Lower => DVec2::new(u_min + (u_max - u_min) * key, v_min),
 						PatchSide::Upper => DVec2::new(u_min + (u_max - u_min) * key, v_max),
@@ -2642,7 +2784,7 @@ fn share_transition_ring_corners(lower: &mut [Vec<(f64, usize)>], upper: &mut [V
 	Ok(())
 }
 
-fn transition_key_stages(boundary: &[f64], inner: &[f64], transition_ring_count: usize) -> Result<Vec<Vec<f64>>, Error> {
+fn transition_key_stages(boundary: &[f64], inner: &[f64], transition_ring_count: usize, progress: &ffi::CancellationToken) -> Result<Vec<Vec<f64>>, Error> {
 	// A shallow collar makes the radial spacing comparable to even the densest
 	// canonical trim intervals. Morph quantile-corresponding samples from the
 	// boundary distribution to the regular interior distribution. This retires
@@ -2653,6 +2795,7 @@ fn transition_key_stages(boundary: &[f64], inner: &[f64], transition_ring_count:
 	}
 	let mut stages = Vec::with_capacity(transition_ring_count);
 	for stage in 1..=transition_ring_count {
+		cancellation_checkpoint(progress, stage - 1)?;
 		let blend = stage as f64 / (transition_ring_count + 1) as f64;
 		// Change density progressively as well as moving the samples. Giving the
 		// very first ring the full core count would connect each sparse canonical
@@ -2661,6 +2804,7 @@ fn transition_key_stages(boundary: &[f64], inner: &[f64], transition_ring_count:
 		let sample_count = ((boundary.len() as f64 + (inner.len() as f64 - boundary.len() as f64) * blend).round() as usize).max(2);
 		let mut keys = Vec::with_capacity(sample_count);
 		for index in 0..sample_count {
+			cancellation_checkpoint(progress, index)?;
 			let quantile = index as f64 / (sample_count - 1) as f64;
 			let boundary_key = sample_key_distribution(boundary, quantile);
 			let inner_key = sample_key_distribution(inner, quantile);
@@ -2696,25 +2840,26 @@ fn sample_key_distribution(keys: &[f64], quantile: f64) -> f64 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn triangulate_transition_rings(face: &TrimmedFace, boundary: &[(f64, usize)], rings: &[Vec<(f64, usize)>], inner: &[(f64, usize)], outer_to_inner: bool, vertices: &[DVec3], uvs: &[DVec2], normals: &[DVec3], linear: f64, angular: f64, indices: &mut Vec<u32>) -> Result<(), Error> {
+fn triangulate_transition_rings(face: &TrimmedFace, boundary: &[(f64, usize)], rings: &[Vec<(f64, usize)>], inner: &[(f64, usize)], outer_to_inner: bool, vertices: &[DVec3], uvs: &[DVec2], normals: &[DVec3], linear: f64, angular: f64, indices: &mut Vec<u32>, progress: &ffi::CancellationToken) -> Result<(), Error> {
 	let mut previous = boundary;
 	for (ring_index, ring) in rings.iter().enumerate() {
+		cancellation_checkpoint(progress, ring_index)?;
 		// Equal-density generated rings have quantile-corresponding vertices. Pair
 		// them by construction even though their keys move slightly; density-changing
 		// stages and the immutable boundary/core transitions use the general
 		// minimax dynamic program.
 		let tolerance = if ring_index == 0 { 1.0e-10 } else { f64::INFINITY };
 		if outer_to_inner {
-			triangulate_monotone_strip(face, previous, ring, vertices, uvs, normals, tolerance, linear, angular, indices)?;
+			triangulate_monotone_strip(face, previous, ring, vertices, uvs, normals, tolerance, linear, angular, indices, progress)?;
 		} else {
-			triangulate_monotone_strip(face, ring, previous, vertices, uvs, normals, tolerance, linear, angular, indices)?;
+			triangulate_monotone_strip(face, ring, previous, vertices, uvs, normals, tolerance, linear, angular, indices, progress)?;
 		}
 		previous = ring;
 	}
 	if outer_to_inner {
-		triangulate_monotone_strip(face, previous, inner, vertices, uvs, normals, 1.0e-10, linear, angular, indices)
+		triangulate_monotone_strip(face, previous, inner, vertices, uvs, normals, 1.0e-10, linear, angular, indices, progress)
 	} else {
-		triangulate_monotone_strip(face, inner, previous, vertices, uvs, normals, 1.0e-10, linear, angular, indices)
+		triangulate_monotone_strip(face, inner, previous, vertices, uvs, normals, 1.0e-10, linear, angular, indices, progress)
 	}
 }
 
@@ -2741,7 +2886,8 @@ fn strictly_increasing(values: &[f64]) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn triangulate_monotone_strip(face: &TrimmedFace, left: &[(f64, usize)], right: &[(f64, usize)], vertices: &[DVec3], uvs: &[DVec2], normals: &[DVec3], tolerance: f64, linear: f64, angular: f64, indices: &mut Vec<u32>) -> Result<(), Error> {
+fn triangulate_monotone_strip(face: &TrimmedFace, left: &[(f64, usize)], right: &[(f64, usize)], vertices: &[DVec3], uvs: &[DVec2], normals: &[DVec3], tolerance: f64, linear: f64, angular: f64, indices: &mut Vec<u32>, progress: &ffi::CancellationToken) -> Result<(), Error> {
+	check_cancelled(progress)?;
 	if left.len() < 2 || right.len() < 2 || !strictly_increasing(&left.iter().map(|entry| entry.0).collect::<Vec<_>>()) || !strictly_increasing(&right.iter().map(|entry| entry.0).collect::<Vec<_>>()) {
 		return Err(Error::TriangulationFailed);
 	}
@@ -2754,12 +2900,15 @@ fn triangulate_monotone_strip(face: &TrimmedFace, left: &[(f64, usize)], right: 
 	// Cartesian product turns an otherwise linear periodic sphere into cubic
 	// work without changing the local connectivity choice.
 	if samples_differ && larger_row > smaller_row.saturating_mul(2) {
-		return triangulate_unequal_monotone_strip(face, left, right, vertices, uvs, normals, linear, angular, indices);
+		return triangulate_unequal_monotone_strip(face, left, right, vertices, uvs, normals, linear, angular, indices, progress);
 	}
 
 	let mut left_index = 0;
 	let mut right_index = 0;
+	let mut step_index = 0;
 	while left_index + 1 < left.len() || right_index + 1 < right.len() {
+		cancellation_checkpoint(progress, step_index)?;
+		step_index += 1;
 		let next_left = left.get(left_index + 1).map(|entry| entry.0);
 		let next_right = right.get(right_index + 1).map(|entry| entry.0);
 		match (next_left, next_right) {
@@ -2841,7 +2990,8 @@ enum StripStep {
 /// physical triangle aspect, so a sparse segment can meet a central sample on
 /// the denser row while retaining deterministic, non-crossing connectivity.
 #[allow(clippy::too_many_arguments)]
-fn triangulate_unequal_monotone_strip(face: &TrimmedFace, left: &[(f64, usize)], right: &[(f64, usize)], vertices: &[DVec3], uvs: &[DVec2], normals: &[DVec3], linear: f64, angular: f64, indices: &mut Vec<u32>) -> Result<(), Error> {
+fn triangulate_unequal_monotone_strip(face: &TrimmedFace, left: &[(f64, usize)], right: &[(f64, usize)], vertices: &[DVec3], uvs: &[DVec2], normals: &[DVec3], linear: f64, angular: f64, indices: &mut Vec<u32>, progress: &ffi::CancellationToken) -> Result<(), Error> {
+	check_cancelled(progress)?;
 	const MAXIMUM_STRIP_STATES: usize = 262_144;
 	let column_count = right.len();
 	let state_count = left.len().checked_mul(column_count).ok_or(Error::TriangulationFailed)?;
@@ -2855,6 +3005,7 @@ fn triangulate_unequal_monotone_strip(face: &TrimmedFace, left: &[(f64, usize)],
 	for left_index in 0..left.len() {
 		for right_index in 0..right.len() {
 			let state = left_index * column_count + right_index;
+			cancellation_checkpoint(progress, state)?;
 			let Some(score) = scores[state] else {
 				continue;
 			};
@@ -2875,7 +3026,10 @@ fn triangulate_unequal_monotone_strip(face: &TrimmedFace, left: &[(f64, usize)],
 		return Err(Error::TriangulationFailed);
 	}
 	let mut triangles = Vec::with_capacity(left.len() + right.len() - 2);
+	let mut step_index = 0;
 	while left_index != 0 || right_index != 0 {
+		cancellation_checkpoint(progress, step_index)?;
+		step_index += 1;
 		let step = predecessors[left_index * column_count + right_index].ok_or(Error::TriangulationFailed)?;
 		match step {
 			StripStep::Left => {
@@ -2888,7 +3042,8 @@ fn triangulate_unequal_monotone_strip(face: &TrimmedFace, left: &[(f64, usize)],
 			}
 		}
 	}
-	for triangle in triangles.into_iter().rev() {
+	for (triangle_index, triangle) in triangles.into_iter().rev().enumerate() {
+		cancellation_checkpoint(progress, triangle_index)?;
 		push_chart_oriented_triangle(face, triangle, vertices, uvs, normals, indices)?;
 	}
 	Ok(())
@@ -3054,12 +3209,14 @@ fn inward_parameter(parameter: f64, minimum: f64, maximum: f64, step: f64) -> f6
 	}
 }
 
-fn fill_singular_normals(face: &TrimmedFace, uvs: &[DVec2], vertices: &[DVec3], indices: &[u32], normals: &mut [DVec3]) -> Result<(), Error> {
+fn fill_singular_normals(face: &TrimmedFace, uvs: &[DVec2], vertices: &[DVec3], indices: &[u32], normals: &mut [DVec3], progress: &ffi::CancellationToken) -> Result<(), Error> {
+	check_cancelled(progress)?;
 	if uvs.len() != vertices.len() || normals.len() != vertices.len() || !indices.len().is_multiple_of(3) {
 		return Err(Error::TriangulationFailed);
 	}
 	let mut accumulated = vec![DVec3::ZERO; vertices.len()];
-	for triangle in indices.chunks_exact(3) {
+	for (triangle_index, triangle) in indices.chunks_exact(3).enumerate() {
+		cancellation_checkpoint(progress, triangle_index)?;
 		if triangle.iter().any(|index| *index as usize >= vertices.len()) {
 			return Err(Error::TriangulationFailed);
 		}
@@ -3068,7 +3225,8 @@ fn fill_singular_normals(face: &TrimmedFace, uvs: &[DVec2], vertices: &[DVec3], 
 			accumulated[*index as usize] += normal;
 		}
 	}
-	for ((normal, uv), fallback) in normals.iter_mut().zip(uvs).zip(accumulated) {
+	for (vertex_index, ((normal, uv), fallback)) in normals.iter_mut().zip(uvs).zip(accumulated).enumerate() {
+		cancellation_checkpoint(progress, vertex_index)?;
 		if normal.length_squared() <= 1.0e-24 {
 			*normal = oriented_surface_normal(face, *uv).or_else(|| fallback.try_normalize()).ok_or(Error::TriangulationFailed)?;
 		}
@@ -3358,7 +3516,7 @@ fn triangle_minimum_angle_degrees(points: [DVec3; 3]) -> Option<f64> {
 /// small, fixed pattern set is built independently and ranked by physical
 /// worst-case, p95, and mean aspect. The exact constrained boundary is cloned
 /// unchanged into every trial; only unconstrained interior points differ.
-fn seed_best_planar_lattice(face: &TrimmedFace, chart: FaceChart, linear: f64, insertion_domain: &InsertionDomain, base: FaceTriangulation) -> Result<FaceTriangulation, Error> {
+fn seed_best_planar_lattice(face: &TrimmedFace, chart: FaceChart, linear: f64, insertion_domain: &InsertionDomain, base: FaceTriangulation, progress: &ffi::CancellationToken) -> Result<FaceTriangulation, Error> {
 	const PATTERNS: [LatticePattern; 8] = [
 		LatticePattern { angle: 0.0, x_phase: 0.0, y_phase: 0.0 },
 		LatticePattern { angle: 0.0, x_phase: 0.5, y_phase: 0.5 },
@@ -3372,9 +3530,10 @@ fn seed_best_planar_lattice(face: &TrimmedFace, chart: FaceChart, linear: f64, i
 
 	let mut best = None::<(PlanarMeshQuality, FaceTriangulation)>;
 	for (pattern_index, pattern) in PATTERNS.into_iter().enumerate() {
+		cancellation_checkpoint(progress, pattern_index)?;
 		let mut trial = base.clone();
 		seed_metric_lattice_pattern(face, chart, linear, insertion_domain, pattern, &mut trial)?;
-		let Ok(mesh) = build_face_mesh(face, &trial) else {
+		let Ok(mesh) = build_face_mesh(face, &trial, progress) else {
 			continue;
 		};
 		let Some(quality) = PlanarMeshQuality::from_mesh(&mesh) else {
@@ -3765,10 +3924,12 @@ fn triangle_aspect(points: [DVec3; 3]) -> f64 {
 	}
 }
 
-fn build_face_mesh(face: &TrimmedFace, triangulation: &FaceTriangulation) -> Result<MeshedFace, Error> {
+fn build_face_mesh(face: &TrimmedFace, triangulation: &FaceTriangulation, progress: &ffi::CancellationToken) -> Result<MeshedFace, Error> {
+	check_cancelled(progress)?;
 	let mut triangles = Vec::new();
 	let mut used = BTreeSet::new();
-	for triangle in triangulation.inner_faces() {
+	for (triangle_index, triangle) in triangulation.inner_faces().enumerate() {
+		cancellation_checkpoint(progress, triangle_index)?;
 		let handles = triangle.vertices().map(|vertex| vertex.fix().index());
 		let parametric = handles.map(|index| *triangulation.vertex(spade::handles::FixedVertexHandle::from_index(index)).data());
 		let uv = parametric.map(|vertex| vertex.uv);
@@ -3832,7 +3993,8 @@ fn build_face_mesh(face: &TrimmedFace, triangulation: &FaceTriangulation) -> Res
 	let mut vertices = Vec::with_capacity(used.len());
 	let mut uvs = Vec::with_capacity(used.len());
 	let mut normals = Vec::with_capacity(used.len());
-	for old_index in used {
+	for (vertex_index, old_index) in used.into_iter().enumerate() {
+		cancellation_checkpoint(progress, vertex_index)?;
 		let handle = triangulation.vertex(spade::handles::FixedVertexHandle::from_index(old_index));
 		let vertex = *handle.data();
 		let sample = face.surface.evaluate(vertex.uv).ok_or(Error::TriangulationFailed)?;
@@ -3844,10 +4006,11 @@ fn build_face_mesh(face: &TrimmedFace, triangulation: &FaceTriangulation) -> Res
 		normals.push(normal);
 	}
 	let mut indices = Vec::with_capacity(triangles.len() * 3);
-	for triangle in triangles {
+	for (triangle_index, triangle) in triangles.into_iter().enumerate() {
+		cancellation_checkpoint(progress, triangle_index)?;
 		indices.extend(triangle.map(|index| remap[index]));
 	}
-	fill_singular_normals(face, &uvs, &vertices, &indices, &mut normals)?;
+	fill_singular_normals(face, &uvs, &vertices, &indices, &mut normals, progress)?;
 	Ok(MeshedFace {
 		index: face.index,
 		tshape_id: face.tshape_id,
@@ -3884,13 +4047,15 @@ fn point_in_polygon(point: DVec2, vertices: &[BoundaryVertex]) -> bool {
 	inside
 }
 
-fn assemble_mesh_data(faces: Vec<MeshedFace>, edges: &[Vec<DVec3>], include_edges: bool) -> Result<ffi::MeshData, Error> {
+fn assemble_mesh_data(faces: Vec<MeshedFace>, edges: &[Vec<DVec3>], include_edges: bool, progress: &ffi::CancellationToken) -> Result<ffi::MeshData, Error> {
+	check_cancelled(progress)?;
 	let mut seen_face_indices = BTreeSet::new();
 	let mut edge_refinements = BTreeMap::<u32, &[DVec3]>::new();
 	let mut vertex_count = 0usize;
 	let mut index_count = 0usize;
 	let mut triangle_count = 0usize;
-	for face in &faces {
+	for (face_index, face) in faces.iter().enumerate() {
+		cancellation_checkpoint(progress, face_index)?;
 		if face.vertices.is_empty() || face.vertices.len() != face.uvs.len() || face.vertices.len() != face.normals.len() || face.vertices.len() > MAXIMUM_FACE_VERTICES || !face.indices.len().is_multiple_of(3) || face.indices.iter().any(|index| *index as usize >= face.vertices.len()) || face.vertices.iter().any(|vertex| !vertex.is_finite()) || face.normals.iter().any(|normal| !normal.is_finite()) || !seen_face_indices.insert(face.index) {
 			return Err(Error::TriangulationFailed);
 		}
@@ -3916,6 +4081,7 @@ fn assemble_mesh_data(faces: Vec<MeshedFace>, edges: &[Vec<DVec3>], include_edge
 	if include_edges {
 		reserve_exact(&mut effective_edges, edges.len(), "tessellation edge plan allocation failed")?;
 		for (index, edge) in edges.iter().enumerate() {
+			cancellation_checkpoint(progress, index)?;
 			let edge_index = u32::try_from(index).map_err(|_| resource_limit("tessellation edge count exceeded index capacity"))?;
 			let (points, reversed) = if let Some(refinement) = edge_refinements.get(&edge_index).copied() {
 				if edge.len() < 2 || refinement.len() < 2 || edge.iter().any(|point| !point.is_finite()) || refinement.iter().any(|point| !point.is_finite()) {
@@ -3989,31 +4155,38 @@ fn assemble_mesh_data(faces: Vec<MeshedFace>, edges: &[Vec<DVec3>], include_edge
 	result.face_index_offsets.push(0);
 	result.edge_point_offsets.push(0);
 
-	for face in &faces {
+	for (face_index, face) in faces.iter().enumerate() {
+		cancellation_checkpoint(progress, face_index)?;
 		let vertex_offset = u32::try_from(result.vertices.len() / 3).map_err(|_| resource_limit("tessellation vertex count exceeded index capacity"))?;
 		result.chunk_face_indices.push(face.index);
 		result.chunk_face_tshape_ids.push(face.tshape_id);
-		for vertex in &face.vertices {
+		for (vertex_index, vertex) in face.vertices.iter().enumerate() {
+			cancellation_checkpoint(progress, vertex_index)?;
 			result.vertices.extend(vertex.to_array());
 		}
-		for normal in &face.normals {
+		for (normal_index, normal) in face.normals.iter().enumerate() {
+			cancellation_checkpoint(progress, normal_index)?;
 			result.normals.extend(normal.to_array());
 		}
-		for index in &face.indices {
+		for (index_ordinal, index) in face.indices.iter().enumerate() {
+			cancellation_checkpoint(progress, index_ordinal)?;
 			result.indices.push(vertex_offset.checked_add(*index).ok_or_else(|| resource_limit("tessellation vertex index overflowed"))?);
 		}
 		result.face_tshape_ids.extend(std::iter::repeat_n(face.tshape_id, face.indices.len() / 3));
 		result.face_vertex_offsets.push(u32::try_from(result.vertices.len() / 3).map_err(|_| resource_limit("tessellation vertex count exceeded index capacity"))?);
 		result.face_index_offsets.push(u32::try_from(result.indices.len()).map_err(|_| resource_limit("tessellation index count exceeded index capacity"))?);
 	}
-	for (points, reversed, edge_index) in effective_edges {
+	for (edge_ordinal, (points, reversed, edge_index)) in effective_edges.into_iter().enumerate() {
+		cancellation_checkpoint(progress, edge_ordinal)?;
 		result.chunk_edge_indices.push(edge_index);
 		if reversed {
-			for point in points.iter().rev() {
+			for (point_index, point) in points.iter().rev().enumerate() {
+				cancellation_checkpoint(progress, point_index)?;
 				result.edge_points.extend(point.to_array());
 			}
 		} else {
-			for point in points {
+			for (point_index, point) in points.iter().enumerate() {
+				cancellation_checkpoint(progress, point_index)?;
 				result.edge_points.extend(point.to_array());
 			}
 		}
