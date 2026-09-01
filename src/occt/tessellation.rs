@@ -28,7 +28,7 @@ const MAXIMUM_QUALITY_INSERTIONS: usize = 4_096;
 const MAXIMUM_BSPLINE_DEGREE: usize = 25;
 const MAXIMUM_BASIS_WIDTH: usize = MAXIMUM_BSPLINE_DEGREE + 1;
 const TARGET_PHYSICAL_ASPECT: f64 = 6.0;
-const MAXIMUM_PHYSICAL_ASPECT: f64 = 10.0;
+const MAXIMUM_PHYSICAL_ASPECT: f64 = 12.0;
 const MAXIMUM_HARD_PHYSICAL_ASPECT: f64 = 50.0;
 const MAXIMUM_BALANCED_AXIS_INTERVALS: usize = 128;
 
@@ -1117,6 +1117,9 @@ fn mesh_satisfies_tolerances(face: &TrimmedFace, mesh: &MeshedFace, linear: f64,
 	}
 	let angular_p99 = percentile(&mut normal_angles, 0.99).ok_or(Error::TriangulationFailed)?;
 	if angular_p99 > usable_angular * acceptance_slack {
+		if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+			eprintln!("custom tessellation face {} facet-to-surface normal angle p99 {angular_p99:.12e} > {:.12e}", face.index, usable_angular * acceptance_slack);
+		}
 		return Ok(reject_mesh_tolerance(face, "angular-deflection violations are not confined to boundary or singular cells"));
 	}
 	if let Some(aspect_p95) = percentile(&mut physical_aspects, 0.95) {
@@ -1313,7 +1316,7 @@ fn mesh_structured_patch(face: &TrimmedFace, linear: f64, angular: f64) -> Resul
 	// This keeps ordinary faces compact while giving high-curvature lofts a
 	// deterministic structured refinement path instead of falling back to an
 	// unstructured point cloud.
-	for transition_ring_count in [8, 16, 32] {
+	for transition_ring_count in [8, 16, 32, 64] {
 		let Some(mesh) = mesh_inset_structured_patch(face, lower, upper, left, right, u_tolerance, v_tolerance, linear, angular, transition_ring_count)? else {
 			return Ok(None);
 		};
@@ -1370,7 +1373,7 @@ fn mesh_singular_row_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVert
 	if !maximum_ring_length.is_finite() || maximum_ring_length <= 1.0e-12 {
 		return Ok(None);
 	}
-	let boundary_intervals = reference_u.len().saturating_sub(1).clamp(3, 256);
+	let boundary_intervals = reference_u.len().saturating_sub(1).clamp(3, 512);
 	const MAXIMUM_SINGULAR_RING_INTERVALS: usize = 512;
 	let mut vertices = Vec::new();
 	let mut uvs = Vec::new();
@@ -1996,11 +1999,13 @@ fn mean_boundary_segment_length(side: &[&BoundaryVertex]) -> Option<f64> {
 }
 
 fn adaptive_axis_coordinates(face: &TrimmedFace, axis: ParametricAxis, first_boundary: &[&BoundaryVertex], second_boundary: &[&BoundaryVertex], target_length: f64, linear: f64, angular: f64, tolerance: f64) -> Result<Vec<f64>, Error> {
-	// A coherent 80-by-80 chart already exceeds normal viewport needs. The
-	// cap bounds both evaluation cost and triangle count; export quality can be
-	// raised later by selecting a tighter tessellation request rather than by
-	// allowing a single distorted parameter axis to dominate every face.
-	const MAXIMUM_AXIS_POINTS: usize = 129;
+	// Ordinary viewport requests normally converge well below this ceiling. A
+	// tight angular request on a complete periodic chart (for example, a sphere)
+	// can legitimately require more than 128 intervals around the full normal
+	// turn, so retain enough room for the deterministic power-of-two refinement
+	// sequence while the face-wide vertex ceiling remains the final resource
+	// bound.
+	const MAXIMUM_AXIS_POINTS: usize = 513;
 	const MAXIMUM_AXIS_REFINEMENT_PASSES: usize = 16;
 
 	let [u_min, u_max, v_min, v_max] = face.surface.uv_bounds;
@@ -2548,7 +2553,15 @@ fn triangulate_monotone_strip(face: &TrimmedFace, left: &[(f64, usize)], right: 
 	if left.len() < 2 || right.len() < 2 || !strictly_increasing(&left.iter().map(|entry| entry.0).collect::<Vec<_>>()) || !strictly_increasing(&right.iter().map(|entry| entry.0).collect::<Vec<_>>()) {
 		return Err(Error::TriangulationFailed);
 	}
-	if left.len() != right.len() || left.iter().zip(right).any(|(first, second)| (first.0 - second.0).abs() > tolerance) {
+	let samples_differ = left.len() != right.len() || left.iter().zip(right).any(|(first, second)| (first.0 - second.0).abs() > tolerance);
+	let smaller_row = left.len().min(right.len());
+	let larger_row = left.len().max(right.len());
+	// The full dynamic path is valuable when a sparse constrained boundary must
+	// meet a much denser interior row. Adjacent adaptive rows with comparable
+	// density need only the ordered linear zipper below; exploring their entire
+	// Cartesian product turns an otherwise linear periodic sphere into cubic
+	// work without changing the local connectivity choice.
+	if samples_differ && larger_row > smaller_row.saturating_mul(2) {
 		return triangulate_unequal_monotone_strip(face, left, right, vertices, uvs, normals, linear, angular, indices);
 	}
 

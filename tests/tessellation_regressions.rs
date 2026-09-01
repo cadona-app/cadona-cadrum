@@ -140,6 +140,17 @@ fn sealed_shell_and_offset_tessellations_preserve_closed_surfaces() {
 }
 
 #[test]
+fn tight_sphere_angular_tolerance_refines_the_complete_periodic_chart() {
+	let sphere = Solid::sphere(30.0);
+	let options = Tessellation { deflection_linear: 0.01, deflection_angular: 0.02, relative_linear: true, include_edges: true, parallel: false };
+	let chunks = Solid::mesh_chunks([&sphere], options).expect("tight-angle sphere tessellates");
+
+	assert_closed_well_shaped("tight-angle sphere", &chunks, 12.0);
+	let triangle_count = chunks.faces.iter().map(|face| face.indices.len() / 3).sum::<usize>();
+	assert!(triangle_count <= 300_000, "tight-angle sphere exceeded its bounded structured mesh budget: {triangle_count} triangles");
+}
+
+#[test]
 fn multiple_inner_trim_loops_remain_open_in_caps_and_watertight() {
 	let prism = multiply_trimmed_prism();
 	let expected_volume = (24.0 * 16.0 - 2.0 * 4.0 * 4.0) * 6.0;
