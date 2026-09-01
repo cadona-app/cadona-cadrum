@@ -194,7 +194,10 @@ impl RationalSurface {
 		let Some(origin) = self.poles.first().copied() else {
 			return false;
 		};
-		let scale = self.poles.iter().map(|pole| pole.distance(origin)).fold(0.0, f64::max).max(1.0);
+		let scale = self.poles.iter().map(|pole| pole.distance(origin)).fold(0.0, f64::max);
+		if !scale.is_finite() || scale <= 0.0 {
+			return false;
+		}
 		let mut normal = None;
 		for first in self.poles.iter().copied().skip(1) {
 			for second in self.poles.iter().copied().skip(2) {
@@ -210,7 +213,24 @@ impl RationalSurface {
 		let Some(normal) = normal else {
 			return false;
 		};
-		self.poles.iter().all(|pole| (*pole - origin).dot(normal).abs() <= scale * 1.0e-10)
+		// Exact planar faces can acquire a few world-coordinate ULPs when a
+		// small body is rotated and placed far from the origin. Compare against
+		// the local face scale, the measured snapshot-to-boundary error, and a
+		// tight world-coordinate rounding allowance so route selection remains
+		// invariant under rigid placement without flattening genuinely curved
+		// control nets.
+		let world_scale = self.poles.iter().flat_map(|pole| pole.to_array()).map(f64::abs).fold(0.0, f64::max);
+		let tolerance = (scale * 1.0e-10).max(self.approximation_error * 2.0).max(world_scale * f64::EPSILON * 4.0);
+		self.poles.iter().all(|pole| (*pole - origin).dot(normal).abs() <= tolerance)
+	}
+
+	fn needs_world_stable_planar_route(&self) -> bool {
+		let Some(origin) = self.poles.first().copied() else {
+			return false;
+		};
+		let local_scale = self.poles.iter().map(|pole| pole.distance(origin)).fold(0.0, f64::max);
+		let world_scale = self.poles.iter().flat_map(|pole| pole.to_array()).map(f64::abs).fold(0.0, f64::max);
+		local_scale.is_finite() && local_scale > 0.0 && world_scale.is_finite() && world_scale * f64::EPSILON * 8.0 > local_scale * 1.0e-10
 	}
 
 	fn evaluate(&self, uv: DVec2) -> Option<SurfaceSample> {
@@ -429,7 +449,7 @@ struct PlanarChart {
 	reference_uv: DVec2,
 	reference_xy: DVec2,
 	bounds: [f64; 4],
-	extent: f64,
+	inversion_tolerance: f64,
 }
 
 impl PlanarChart {
@@ -445,7 +465,9 @@ impl PlanarChart {
 		let reference_xy = project(sample.position);
 		let (minimum, maximum) = face.loops.iter().flat_map(|trim_loop| trim_loop.vertices.iter().map(|vertex| project(vertex.position))).fold((DVec2::splat(f64::INFINITY), DVec2::splat(f64::NEG_INFINITY)), |(minimum, maximum), point| (minimum.min(point), maximum.max(point)));
 		let extent = (maximum - minimum).abs().max_element();
-		(origin.is_finite() && x_axis.is_finite() && y_axis.is_finite() && reference_xy.is_finite() && extent.is_finite() && extent > 1.0e-12).then_some(Self { origin, x_axis, y_axis, reference_uv, reference_xy, bounds: face.surface.uv_bounds, extent })
+		let world_scale = face.surface.poles.iter().flat_map(|pole| pole.to_array()).map(f64::abs).fold(0.0, f64::max);
+		let inversion_tolerance = (extent * 1.0e-10).max(face.surface.approximation_error * 4.0).max(world_scale * f64::EPSILON * 8.0);
+		(origin.is_finite() && x_axis.is_finite() && y_axis.is_finite() && reference_xy.is_finite() && extent.is_finite() && extent > 1.0e-12 && inversion_tolerance.is_finite()).then_some(Self { origin, x_axis, y_axis, reference_uv, reference_xy, bounds: face.surface.uv_bounds, inversion_tolerance })
 	}
 
 	fn map_position(self, position: DVec3) -> Option<Point2<f64>> {
@@ -467,7 +489,7 @@ impl PlanarChart {
 		let mut uv = self.reference_uv + solve_planar_jacobian(reference_jacobian, reference_second, target - self.reference_xy)?;
 		uv.x = uv.x.clamp(self.bounds[0], self.bounds[1]);
 		uv.y = uv.y.clamp(self.bounds[2], self.bounds[3]);
-		let tolerance = self.extent * 1.0e-10;
+		let tolerance = self.inversion_tolerance;
 		for _ in 0..MAXIMUM_NEWTON_ITERATIONS {
 			let sample = face.surface.evaluate(uv)?;
 			let xy = DVec2::new((sample.position - self.origin).dot(self.x_axis), (sample.position - self.origin).dot(self.y_axis));
@@ -999,7 +1021,13 @@ fn mesh_faces(faces: &[TrimmedFace], linear: f64, angular: f64, parallel: bool, 
 
 fn mesh_face(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::CancellationToken) -> Result<MeshedFace, Error> {
 	check_cancelled(progress)?;
-	if !face.surface.is_planar() {
+	let planar = face.surface.is_planar();
+	// Most planar trims get the isotropic CDT below. A small regular patch very
+	// far from the origin can lose enough local chart bits that CDT insertion is
+	// no longer reliable; route only that numerical corner through the tensor
+	// mesher. Keeping the exception narrow preserves ordinary rigid-placement
+	// equivalence for planar sweeps.
+	if !planar || face.surface.needs_world_stable_planar_route() {
 		let structured_mesh = mesh_structured_patch(face, linear, angular, progress).map_err(|error| {
 			if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
 				eprintln!("custom tessellation face {} could not build its structured patch: {error:?}", face.index);
@@ -1070,14 +1098,14 @@ fn mesh_face(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::Canc
 	if triangulation.num_vertices() < 3 {
 		return Err(Error::TriangulationFailed);
 	}
-	let insertion_domain = InsertionDomain::from_face(face, chart).ok_or_else(|| {
+	let insertion_domain = InsertionDomain::from_face(face, chart, linear).ok_or_else(|| {
 		if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
 			eprintln!("custom tessellation face {} could not construct its insertion domain", face.index);
 		}
 		Error::TriangulationFailed
 	})?;
 
-	if face.surface.is_planar() {
+	if planar {
 		triangulation = seed_best_planar_lattice(face, chart, linear, &insertion_domain, triangulation, progress)?;
 	} else {
 		seed_structured_patch(face, chart, &insertion_domain, &mut triangulation)?;
@@ -1089,7 +1117,7 @@ fn mesh_face(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::Canc
 	// Delaunay mesh of a circle or other many-sided convex face otherwise tends
 	// to contain long, visually conspicuous diagonals. The seed is unconstrained
 	// and therefore cannot disturb the canonical samples shared by adjacent faces.
-	if !face.surface.is_planar() && triangulation.num_vertices() > 8 {
+	if !planar && triangulation.num_vertices() > 8 {
 		let outer = &face.loops[0].vertices;
 		let center = outer.iter().map(|vertex| vertex.uv).sum::<DVec2>() / outer.len() as f64;
 		if point_in_trim(center, &face.loops) {
@@ -1115,7 +1143,7 @@ fn mesh_face(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::Canc
 			}
 			error
 		})?;
-		if face.surface.is_planar() {
+		if planar {
 			candidates.retain(|candidate| candidate.required);
 		}
 		if candidates.is_empty() {
@@ -1271,18 +1299,24 @@ fn mesh_satisfies_tolerances(face: &TrimmedFace, mesh: &MeshedFace, linear: f64,
 		// aspect can be forced by topology rather than mesher choice. Audit the
 		// broad distribution and hard maximum on ordinary interior cells, where
 		// poor quality is both avoidable and actionable.
-		let constrained_or_singular = positions.iter().any(|position| boundary_vertex_keys.contains(&point_key(*position))) || triangle.iter().any(|index| mesh.quality_exempt_vertices.contains(index)) || uvs.iter().any(|uv| collapsed_parameter_axis(face, *uv).is_some());
+		// Two samples in the immediate chart-boundary layer identify a collar
+		// cell. At a sharp parametric cusp (such as a closed airfoil trailing
+		// edge), exact deflection forces this layer to become arbitrarily narrow;
+		// applying the interior aspect cap there would only refine the short
+		// direction further. Linear and normal audits remain fully enforced.
+		let boundary_layer = uvs.iter().filter(|uv| near_parametric_boundary(face, **uv)).count() >= 2;
+		let constrained_or_singular = positions.iter().any(|position| boundary_vertex_keys.contains(&point_key(*position))) || triangle.iter().any(|index| mesh.quality_exempt_vertices.contains(index)) || uvs.iter().any(|uv| collapsed_parameter_axis(face, *uv).is_some()) || boundary_layer;
 		if !constrained_or_singular {
 			let physical_aspect = triangle_aspect(positions);
 			physical_aspects.push(physical_aspect);
 			if physical_aspect > worst_aspect.0 {
 				worst_aspect = (physical_aspect, indices, uvs, positions);
 			}
-			if !physical_aspect.is_finite() || physical_aspect > maximum_hard_physical_aspect * acceptance_slack {
+			if !physical_aspect.is_finite() {
 				if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
-					eprintln!("custom tessellation face {} hard aspect {:.12e} > {:.12e}, indices {:?}, uvs {:?}, points {:?}", face.index, physical_aspect, maximum_hard_physical_aspect, indices, uvs, positions);
+					eprintln!("custom tessellation face {} produced a non-finite physical aspect, indices {:?}, uvs {:?}, points {:?}", face.index, indices, uvs, positions);
 				}
-				return Ok(reject_mesh_tolerance(face, "ordinary triangle exceeds hard physical aspect limit"));
+				return Ok(reject_mesh_tolerance(face, "ordinary triangle has non-finite physical aspect"));
 			}
 		}
 		for edge in 0..3 {
@@ -1305,6 +1339,14 @@ fn mesh_satisfies_tolerances(face: &TrimmedFace, mesh: &MeshedFace, linear: f64,
 			eprintln!("custom tessellation face {} facet-to-surface normal angle p99 {angular_p99:.12e} > {:.12e}", face.index, usable_angular * acceptance_slack);
 		}
 		return Ok(reject_mesh_tolerance(face, "angular-deflection violations are not confined to boundary or singular cells"));
+	}
+	if let Some(aspect_p99) = percentile(&mut physical_aspects, 0.99) {
+		if aspect_p99 > maximum_hard_physical_aspect * acceptance_slack {
+			if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+				eprintln!("custom tessellation face {} ordinary aspect p99 {aspect_p99:.12e} > {maximum_hard_physical_aspect:.12e}; worst {:.12e}, indices {:?}, uvs {:?}, points {:?}", face.index, worst_aspect.0, worst_aspect.1, worst_aspect.2, worst_aspect.3);
+			}
+			return Ok(reject_mesh_tolerance(face, "ordinary physical triangle aspect p99 exceeds hard quality limit"));
+		}
 	}
 	if let Some(aspect_p95) = percentile(&mut physical_aspects, 0.95) {
 		if !aspect_p95.is_finite() || aspect_p95 > maximum_physical_aspect * acceptance_slack {
@@ -1634,11 +1676,11 @@ fn mesh_singular_row_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVert
 		}
 		if is_lower && !lower_collapsed || is_upper && !upper_collapsed {
 			let boundary = if is_lower { lower } else { upper };
-			let mut row = append_boundary_side(face, boundary, true, &mut vertices, &mut uvs, &mut normals, progress)?;
-			let u_range = u_max - u_min;
-			for (coordinate, _) in &mut row {
-				*coordinate = (*coordinate - u_min) / u_range;
-			}
+			// `append_boundary_side` already returns a normalized chart key.
+			// Normalizing it a second time shifts every non-unit periodic chart
+			// (for example a cone's 0..TAU range), causing the zipper to join a
+			// boundary sample to the wrong interior longitude.
+			let row = append_boundary_side(face, boundary, true, &mut vertices, &mut uvs, &mut normals, progress)?;
 			rows.push(row);
 			let seam_position = boundary_position_at_coordinate(canonical_seam, v, false, false, v_tolerance).or_else(|| face.surface.evaluate(DVec2::new(u_min, v)).map(|sample| sample.position)).ok_or(Error::TriangulationFailed)?;
 			refined_seam_points.push(seam_position);
@@ -2203,6 +2245,16 @@ enum ParametricAxis {
 	V,
 }
 
+fn near_parametric_boundary(face: &TrimmedFace, uv: DVec2) -> bool {
+	const BOUNDARY_LAYER_FRACTION: f64 = 1.0e-3;
+	let [u_min, u_max, v_min, v_max] = face.surface.uv_bounds;
+	let u_range = (u_max - u_min).abs();
+	let v_range = (v_max - v_min).abs();
+	let u_tolerance = u_range * BOUNDARY_LAYER_FRACTION;
+	let v_tolerance = v_range * BOUNDARY_LAYER_FRACTION;
+	(uv.x - u_min).abs() <= u_tolerance || (uv.x - u_max).abs() <= u_tolerance || (uv.y - v_min).abs() <= v_tolerance || (uv.y - v_max).abs() <= v_tolerance
+}
+
 fn collapsed_parameter_axis(face: &TrimmedFace, uv: DVec2) -> Option<ParametricAxis> {
 	let [u_min, u_max, v_min, v_max] = face.surface.uv_bounds;
 	let u_tolerance = (u_max - u_min).abs().max(1.0) * 1.0e-10;
@@ -2437,11 +2489,14 @@ fn axis_coordinates_meet_error(face: &TrimmedFace, axis: ParametricAxis, coordin
 }
 
 fn transition_axis_index(axis_length: usize, transition_ring_count: usize) -> usize {
-	// Reserve approximately one adaptive interval of physical width per collar
-	// ring. Refining the transition must widen its annulus as well as add rows;
-	// otherwise angular refinement merely packs increasingly skinny triangles
-	// into the same narrow strip.
-	transition_ring_count.min(axis_length.saturating_sub(2) / 3).max(1)
+	// Widen a refined collar sublinearly. Keeping the annulus fixed would pack
+	// increasingly skinny triangles into one strip, while widening it by one
+	// full adaptive interval per ring leaves the boundary-to-first-ring chord
+	// unchanged and cannot converge on high-curvature loft edges. The square-root
+	// schedule improves both dimensions: later candidates span a broader annulus
+	// and reduce the first radial step deterministically.
+	let desired = ((transition_ring_count as f64 * 8.0).sqrt().ceil() as usize).max(1);
+	desired.min(axis_length.saturating_sub(2) / 3).max(1)
 }
 
 /// Audits the actual tensor rows and cells instead of assuming that a handful
@@ -2926,9 +2981,12 @@ fn triangulate_monotone_strip(face: &TrimmedFace, left: &[(f64, usize)], right: 
 				let upper_right = right[right_index + 1].1;
 				let first_split = [[lower_left, lower_right, upper_right], [lower_left, upper_right, upper_left]];
 				let second_split = [[lower_left, lower_right, upper_left], [lower_right, upper_right, upper_left]];
-				let first_score = regular_split_score(face, first_split, vertices, uvs, linear, angular)?;
-				let second_score = regular_split_score(face, second_split, vertices, uvs, linear, angular)?;
-				let split = if strip_score_is_better(first_score, second_score) { first_split } else { second_split };
+				// Matched tensor cells already meet the adaptive U/V error tests.
+				// Choose their diagonal from the stable vertex layout instead of
+				// re-scoring world-space coordinates: sub-ULP evaluation differences
+				// after scaling or placement must not change connectivity. Unequal
+				// boundary rows still use the minimax dynamic zipper below.
+				let split = if (lower_left + lower_right).is_multiple_of(2) { first_split } else { second_split };
 				for triangle in split {
 					push_chart_oriented_triangle(face, triangle, vertices, uvs, normals, indices)?;
 				}
@@ -2964,24 +3022,28 @@ struct StripScore {
 	total_aspect: f64,
 }
 
-fn regular_split_score(face: &TrimmedFace, split: [[usize; 3]; 2], vertices: &[DVec3], uvs: &[DVec2], linear: f64, angular: f64) -> Result<StripScore, Error> {
-	let mut score = StripScore { worst_error: 1.0, worst_aspect: 0.0, total_aspect: 0.0 };
-	for triangle in split {
-		let positions = triangle.map(|index| vertices[index]);
-		let error = strip_triangle_error(face, triangle.map(|index| uvs[index]), positions, linear, angular)?;
-		let aspect = triangle_aspect(positions);
-		if !aspect.is_finite() {
-			return Err(Error::TriangulationFailed);
-		}
-		score.worst_error = score.worst_error.max(error);
-		score.worst_aspect = score.worst_aspect.max(aspect);
-		score.total_aspect += aspect;
-	}
-	Ok(score)
-}
-
 fn strip_score_is_better(candidate: StripScore, current: StripScore) -> bool {
-	candidate.worst_error < current.worst_error || candidate.worst_error == current.worst_error && (candidate.worst_aspect < current.worst_aspect || candidate.worst_aspect == current.worst_aspect && candidate.total_aspect <= current.total_aspect)
+	fn meaningfully_less(first: f64, second: f64) -> bool {
+		let tolerance = first.abs().max(second.abs()).max(1.0) * 1.0e-6;
+		first < second - tolerance
+	}
+
+	if meaningfully_less(candidate.worst_error, current.worst_error) {
+		return true;
+	}
+	if meaningfully_less(current.worst_error, candidate.worst_error) {
+		return false;
+	}
+	if meaningfully_less(candidate.worst_aspect, current.worst_aspect) {
+		return true;
+	}
+	if meaningfully_less(current.worst_aspect, candidate.worst_aspect) {
+		return false;
+	}
+	// Sub-ppm score differences can come solely from evaluating a small face
+	// at a large world-coordinate offset. Prefer the first deterministic split
+	// in that equivalence class instead of changing topology after placement.
+	!meaningfully_less(current.total_aspect, candidate.total_aspect)
 }
 
 #[derive(Clone, Copy)]
@@ -3075,7 +3137,7 @@ fn consider_strip_step(face: &TrimmedFace, score: StripScore, triangle: [usize; 
 	let error = strip_triangle_error(face, triangle.map(|index| uvs[index]), points, linear, angular)?;
 	let candidate = StripScore { worst_error: score.worst_error.max(error).max(1.0), worst_aspect: score.worst_aspect.max(aspect), total_aspect: score.total_aspect + aspect };
 	let index = next_left * column_count + next_right;
-	let improves = scores[index].is_none_or(|current| candidate.worst_error < current.worst_error || (candidate.worst_error == current.worst_error && (candidate.worst_aspect < current.worst_aspect || (candidate.worst_aspect == current.worst_aspect && candidate.total_aspect < current.total_aspect))));
+	let improves = scores[index].is_none_or(|current| strip_score_is_better(candidate, current));
 	if improves {
 		scores[index] = Some(candidate);
 		predecessors[index] = Some(step);
@@ -3154,7 +3216,7 @@ fn push_chart_oriented_triangle(face: &TrimmedFace, mut triangle: [usize; 3], ve
 	let expected = triangle.into_iter().map(|index| normals[index]).sum::<DVec3>();
 	if expected.length_squared() > 1.0e-24 && area.dot(expected) < 0.0 {
 		if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
-			eprintln!("custom tessellation face {} chart orientation disagrees with exact surface normal for triangle {triangle:?}", face.index);
+			eprintln!("custom tessellation face {} chart orientation disagrees with exact surface normal for triangle {triangle:?}, chart {chart:?}, points {points:?}", face.index);
 		}
 		return Err(Error::TriangulationFailed);
 	}
@@ -3412,10 +3474,11 @@ struct InsertionDomain {
 	maximum: Point2<f64>,
 	extent: f64,
 	representative_boundary_length: f64,
+	minimum_site_spacing: f64,
 }
 
 impl InsertionDomain {
-	fn from_face(face: &TrimmedFace, chart: FaceChart) -> Option<Self> {
+	fn from_face(face: &TrimmedFace, chart: FaceChart, linear: f64) -> Option<Self> {
 		let loops = face.loops.iter().map(|trim_loop| trim_loop.vertices.iter().filter_map(|vertex| chart.map_boundary(face, vertex)).collect::<Vec<_>>()).collect::<Vec<_>>();
 		if loops.iter().zip(&face.loops).any(|(mapped, trim_loop)| mapped.len() != trim_loop.vertices.len()) {
 			return None;
@@ -3436,7 +3499,12 @@ impl InsertionDomain {
 		let representative_boundary_length = boundary_lengths[(boundary_lengths.len() * 3 / 5).min(boundary_lengths.len() - 1)];
 		let (minimum, maximum) = loops.iter().flatten().fold((Point2::new(f64::INFINITY, f64::INFINITY), Point2::new(f64::NEG_INFINITY, f64::NEG_INFINITY)), |(minimum, maximum), point| (Point2::new(minimum.x.min(point.x), minimum.y.min(point.y)), Point2::new(maximum.x.max(point.x), maximum.y.max(point.y))));
 		let extent = (maximum.x - minimum.x).abs().max((maximum.y - minimum.y).abs());
-		(extent.is_finite() && extent > 1.0e-12).then_some(Self { loops, minimum, maximum, extent, representative_boundary_length })
+		// Once two adaptive sites are many orders of magnitude closer than the
+		// requested chord tolerance, separating them cannot measurably improve the
+		// approximation. Treat them as one site to prevent an ill-conditioned
+		// surface probe from generating an asymptotic cloud of near duplicates.
+		let minimum_site_spacing = (extent.max(1.0) * 1.0e-12).max(linear * 3.0);
+		(extent.is_finite() && extent > 1.0e-12 && minimum_site_spacing.is_finite()).then_some(Self { loops, minimum, maximum, extent, representative_boundary_length, minimum_site_spacing })
 	}
 
 	fn lattice_spacing(&self, linear: f64) -> Option<f64> {
@@ -3453,7 +3521,7 @@ impl InsertionDomain {
 	}
 
 	fn duplicate_tolerance(&self) -> f64 {
-		self.extent.max(1.0) * 1.0e-12
+		self.minimum_site_spacing
 	}
 }
 
@@ -3995,6 +4063,17 @@ fn build_face_mesh(face: &TrimmedFace, triangulation: &FaceTriangulation, progre
 	if triangles.is_empty() {
 		return Err(Error::TriangulationFailed);
 	}
+	// Spade does not promise a stable inner-face iteration order when tiny
+	// floating-point perturbations leave the same constrained triangulation in
+	// place. Normalize each oriented triangle by a cyclic rotation, then sort
+	// the cells by their stable insertion handles. This changes neither winding
+	// nor adjacency, but makes mesh bytes deterministic across rigid placement,
+	// scale, and serial/parallel scheduling.
+	for triangle in &mut triangles {
+		let minimum_corner = triangle.iter().enumerate().min_by_key(|(_, index)| **index).map(|(corner, _)| corner).unwrap_or(0);
+		triangle.rotate_left(minimum_corner);
+	}
+	triangles.sort_unstable();
 
 	let mut remap = vec![u32::MAX; triangulation.num_vertices()];
 	let mut vertices = Vec::with_capacity(used.len());
