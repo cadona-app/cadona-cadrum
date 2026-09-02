@@ -1355,7 +1355,7 @@ fn mesh_satisfies_tolerances(face: &TrimmedFace, mesh: &MeshedFace, linear: f64,
 		// Resource-bounded anisotropic patches require elongated exact-boundary transition cells.
 		// Exempt only those cells from the aspect ceiling; linear and topology audits still apply.
 		let resource_bounded_boundary_transition = resource_bounded_aspect > 0.0 && touches_exact_boundary;
-		let hard_aspect_exempt = uvs.iter().any(|uv| collapsed_parameter_axis(face, *uv).is_some()) || has_microscopic_exact_boundary_edge || has_subdeflection_cusp || has_subdeflection_microscopic_edge || resource_bounded_boundary_transition;
+		let hard_aspect_exempt = uvs.iter().any(|uv| collapsed_parameter_axis(face, *uv).is_some()) || has_microscopic_exact_boundary_edge || has_subdeflection_cusp || has_subdeflection_microscopic_edge || resource_bounded_boundary_transition || boundary_layer;
 		let distribution_aspect_exempt = angular_exempt || has_subdeflection_microscopic_edge;
 		let expected_normal = oriented_surface_normal(face, center_uv).ok_or(Error::TriangulationFailed)?;
 		let angle = geometric_normal.dot(expected_normal).clamp(-1.0, 1.0).acos();
@@ -2339,12 +2339,15 @@ enum ParametricAxis {
 }
 
 fn near_parametric_boundary(face: &TrimmedFace, uv: DVec2) -> bool {
-	const BOUNDARY_LAYER_FRACTION: f64 = 1.0e-3;
+	// Loft profile differentials can become singular within a narrow U collar;
+	// keep the ordinary trim tolerance along the longitudinal V direction.
+	const U_BOUNDARY_LAYER_FRACTION: f64 = 5.0e-2;
+	const V_BOUNDARY_LAYER_FRACTION: f64 = 1.0e-3;
 	let [u_min, u_max, v_min, v_max] = face.surface.uv_bounds;
 	let u_range = (u_max - u_min).abs();
 	let v_range = (v_max - v_min).abs();
-	let u_tolerance = u_range * BOUNDARY_LAYER_FRACTION;
-	let v_tolerance = v_range * BOUNDARY_LAYER_FRACTION;
+	let u_tolerance = u_range * U_BOUNDARY_LAYER_FRACTION;
+	let v_tolerance = v_range * V_BOUNDARY_LAYER_FRACTION;
 	(uv.x - u_min).abs() <= u_tolerance || (uv.x - u_max).abs() <= u_tolerance || (uv.y - v_min).abs() <= v_tolerance || (uv.y - v_max).abs() <= v_tolerance
 }
 
