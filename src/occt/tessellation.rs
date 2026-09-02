@@ -1869,7 +1869,7 @@ fn mesh_singular_row_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVert
 	if indices.is_empty() {
 		return Ok(None);
 	}
-	fill_singular_normals(face, &uvs, &vertices, &indices, &mut normals, progress)?;
+	stabilize_vertex_normals(face, &uvs, &vertices, &indices, &mut normals, progress)?;
 	if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
 		let row_sizes = rows.iter().map(Vec::len).collect::<Vec<_>>();
 		eprintln!("custom tessellation face {} graded singular rows {:?}: {} vertices, {} triangles", face.index, row_sizes, vertices.len(), indices.len() / 3);
@@ -2069,7 +2069,7 @@ fn mesh_column_structured_patch(face: &TrimmedFace, boundaries: StructuredBounda
 	if indices.is_empty() {
 		return Err(Error::TriangulationFailed);
 	}
-	fill_singular_normals(face, &uvs, &vertices, &indices, &mut normals, progress)?;
+	stabilize_vertex_normals(face, &uvs, &vertices, &indices, &mut normals, progress)?;
 	let refined_edges = self_seam_edge.zip(refined_seam_points).into_iter().collect::<BTreeMap<_, _>>();
 	let boundary_refinements = match self_seam_edge {
 		Some(edge_index) => self_seam_boundary_refinements(left, right, &v_coordinates, &refined_edges[&edge_index])?,
@@ -2383,7 +2383,7 @@ fn mesh_inset_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], up
 	if indices.is_empty() {
 		return Err(Error::TriangulationFailed);
 	}
-	fill_singular_normals(face, &uvs, &vertices, &indices, &mut normals, progress)?;
+	stabilize_vertex_normals(face, &uvs, &vertices, &indices, &mut normals, progress)?;
 	Ok(Some(MeshedFace { index: face.index, tshape_id: face.tshape_id, vertices, uvs, normals, indices, refined_edges: BTreeMap::new(), boundary_refinements: Vec::new(), quality_exempt_vertices }))
 }
 
@@ -3486,7 +3486,7 @@ fn inward_parameter(parameter: f64, minimum: f64, maximum: f64, step: f64) -> f6
 	}
 }
 
-fn fill_singular_normals(face: &TrimmedFace, uvs: &[DVec2], vertices: &[DVec3], indices: &[u32], normals: &mut [DVec3], progress: &ffi::CancellationToken) -> Result<(), Error> {
+fn stabilize_vertex_normals(face: &TrimmedFace, uvs: &[DVec2], vertices: &[DVec3], indices: &[u32], normals: &mut [DVec3], progress: &ffi::CancellationToken) -> Result<(), Error> {
 	check_cancelled(progress)?;
 	if uvs.len() != vertices.len() || normals.len() != vertices.len() || !indices.len().is_multiple_of(3) {
 		return Err(Error::TriangulationFailed);
@@ -3504,8 +3504,23 @@ fn fill_singular_normals(face: &TrimmedFace, uvs: &[DVec2], vertices: &[DVec3], 
 	}
 	for (vertex_index, ((normal, uv), fallback)) in normals.iter_mut().zip(uvs).zip(accumulated).enumerate() {
 		cancellation_checkpoint(progress, vertex_index)?;
+		let geometric = fallback.try_normalize();
 		if normal.length_squared() <= 1.0e-24 {
-			*normal = oriented_surface_normal(face, *uv).or_else(|| fallback.try_normalize()).ok_or(Error::TriangulationFailed)?;
+			*normal = oriented_surface_normal(face, *uv).or(geometric).ok_or(Error::TriangulationFailed)?;
+		}
+		let exact = normal.try_normalize().ok_or(Error::TriangulationFailed)?;
+		// A rational spline can have a finite but ill-conditioned derivative at an
+		// artificial knot or a sub-deflection cusp.  Passing that outlier to the
+		// renderer makes every incident triangle interpolate through the bad normal,
+		// producing a conspicuous star even though the facets themselves are sound.
+		// The local area-weighted fan is the presentation geometry the normal shades;
+		// use it only for gross disagreements, retaining exact differential normals
+		// across ordinary curvature and keeping the correction within this B-rep face.
+		if let Some(geometric) = geometric {
+			const MINIMUM_FAN_ALIGNMENT: f64 = 0.866_025_403_784_438_6;
+			*normal = if exact.dot(geometric) < MINIMUM_FAN_ALIGNMENT { geometric } else { exact };
+		} else {
+			*normal = exact;
 		}
 	}
 	Ok(())
@@ -4312,7 +4327,7 @@ fn build_face_mesh(face: &TrimmedFace, triangulation: &FaceTriangulation, progre
 		cancellation_checkpoint(progress, triangle_index)?;
 		indices.extend(triangle.map(|index| remap[index]));
 	}
-	fill_singular_normals(face, &uvs, &vertices, &indices, &mut normals, progress)?;
+	stabilize_vertex_normals(face, &uvs, &vertices, &indices, &mut normals, progress)?;
 	Ok(MeshedFace {
 		index: face.index,
 		tshape_id: face.tshape_id,
