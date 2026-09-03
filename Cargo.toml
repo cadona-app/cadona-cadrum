@@ -28,7 +28,7 @@ test-support = []
 
 [dependencies]
 cxx = "1"
-glam = { version = ">=0.29", features = ["std"] }
+glam = { version = "0.32.1", features = ["std"] }
 # Pure-Rust 2D rasterizer used by Scene2D::write_png. Pulled in only with
 # the `png` feature; tiny-skia bundles its own PNG encoder so no separate
 # `png` crate dep is needed.
