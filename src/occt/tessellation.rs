@@ -3063,11 +3063,9 @@ fn transition_key_stages(boundary: &[f64], inner: &[f64], transition_ring_count:
 	for stage in 1..=transition_ring_count {
 		cancellation_checkpoint(progress, stage - 1)?;
 		let blend = stage as f64 / (transition_ring_count + 1) as f64;
-		// Change density progressively as well as moving the samples. Giving the
-		// very first ring the full core count would connect each sparse canonical
-		// boundary interval to a fan of tiny tangential intervals, producing the
-		// exact slivers this collar exists to avoid.
-		let sample_count = ((boundary.len() as f64 + (inner.len() as f64 - boundary.len() as f64) * blend).round() as usize).max(2);
+		// Grow interval counts geometrically so no early strip absorbs most of
+		// the boundary/core density change as one high-valence fan.
+		let sample_count = transition_stage_sample_count(boundary.len(), inner.len(), blend);
 		let mut keys = Vec::with_capacity(sample_count);
 		for index in 0..sample_count {
 			cancellation_checkpoint(progress, index)?;
@@ -3091,10 +3089,16 @@ fn transition_stage_vertex_count(boundary_count: usize, inner_count: usize, tran
 	let mut total = 0usize;
 	for stage in 1..=transition_ring_count {
 		let blend = stage as f64 / (transition_ring_count + 1) as f64;
-		let sample_count = ((boundary_count as f64 + (inner_count as f64 - boundary_count as f64) * blend).round() as usize).max(2);
+		let sample_count = transition_stage_sample_count(boundary_count, inner_count, blend);
 		total = checked_add_resource(total, sample_count, "tessellation transition-ring vertex count overflowed")?;
 	}
 	Ok(total)
+}
+
+fn transition_stage_sample_count(boundary_count: usize, inner_count: usize, blend: f64) -> usize {
+	let boundary_intervals = (boundary_count - 1) as f64;
+	let inner_intervals = (inner_count - 1) as f64;
+	(boundary_intervals.ln() + (inner_intervals.ln() - boundary_intervals.ln()) * blend).exp().round() as usize + 1
 }
 
 fn sample_key_distribution(keys: &[f64], quantile: f64) -> f64 {
@@ -3110,11 +3114,10 @@ fn triangulate_transition_rings(face: &TrimmedFace, boundary: &[(f64, usize)], r
 	let mut previous = boundary;
 	for (ring_index, ring) in rings.iter().enumerate() {
 		cancellation_checkpoint(progress, ring_index)?;
-		// Equal-density generated rings have quantile-corresponding vertices. Pair
-		// them by construction even though their keys move slightly; density-changing
-		// stages and the immutable boundary/core transitions use the general
-		// minimax dynamic program.
-		let tolerance = if ring_index == 0 { 1.0e-10 } else { f64::INFINITY };
+		// Only equal-density generated rings have quantile-corresponding vertices.
+		// Density-changing stages must use their actual parameter keys.
+		let equal_density = previous.len() == ring.len();
+		let tolerance = if ring_index > 0 && equal_density { f64::INFINITY } else { 1.0e-10 };
 		if outer_to_inner {
 			triangulate_monotone_strip(face, previous, ring, vertices, uvs, normals, tolerance, linear, angular, indices, progress)?;
 		} else {
