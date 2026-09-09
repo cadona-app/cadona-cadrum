@@ -1168,6 +1168,11 @@ fn mesh_face(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::Canc
 		for index in 0..handles.len() {
 			let first = handles[index];
 			let second = handles[(index + 1) % handles.len()];
+			// Collapsed canonical segments need no constraint; the boundary audit
+			// still requires every non-collapsed segment exactly once.
+			if first == second && point_key(trim_loop.vertices[index].position) == point_key(trim_loop.vertices[(index + 1) % handles.len()].position) {
+				continue;
+			}
 			if first == second || !triangulation.can_add_constraint(first, second) {
 				if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
 					let first_boundary = &trim_loop.vertices[index];
@@ -1309,13 +1314,10 @@ fn mesh_face(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::Canc
 fn boundary_vertex_occurrences(loop_index: u32, trim_loop: &TrimLoop, index: usize) -> [Option<BoundaryOccurrence>; 2] {
 	let current = &trim_loop.vertices[index];
 	let previous = &trim_loop.vertices[(index + trim_loop.vertices.len() - 1) % trim_loop.vertices.len()];
-	let current = BoundaryOccurrence { loop_index, edge_index: current.edge_index, occurrence_index: current.edge_occurrence_index };
-	let previous = BoundaryOccurrence { loop_index, edge_index: previous.edge_index, occurrence_index: previous.edge_occurrence_index };
-	if current == previous {
-		[Some(current), None]
-	} else {
-		[Some(current), Some(previous)]
-	}
+	let next = &trim_loop.vertices[(index + 1) % trim_loop.vertices.len()];
+	let current_occurrence = (point_key(current.position) != point_key(next.position)).then_some(BoundaryOccurrence { loop_index, edge_index: current.edge_index, occurrence_index: current.edge_occurrence_index });
+	let previous_occurrence = (point_key(previous.position) != point_key(current.position)).then_some(BoundaryOccurrence { loop_index, edge_index: previous.edge_index, occurrence_index: previous.edge_occurrence_index });
+	[current_occurrence, previous_occurrence.filter(|previous| Some(*previous) != current_occurrence)]
 }
 
 fn diagnose_meshed_face(mesh: &MeshedFace) {

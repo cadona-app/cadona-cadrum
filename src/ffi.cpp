@@ -3297,19 +3297,9 @@ BrepMeshSourceData extract_brep_mesh_source(
         result.linear_deflection = absolute_linear;
         const double edge_normalization_tolerance =
             std::max(absolute_linear * 0.05, Precision::Confusion());
-        // Some valid imported B-reps store only face pcurves. Build their 3-D
-        // edge curves on the detached operation-local copy before asking
-        // SameParameter to synchronize every representation.
-        // The aggregate return may be false for legitimate degenerate pole
-        // edges, which intentionally have no 3-D curve. Verify each ordinary
-        // edge individually after giving the aggregate repair a chance to run.
+        // Build missing 3D curves only for ordinary edges; collapsed pcurve-only
+        // edges become invalid if the aggregate BuildCurves3d fills them in.
         failure_stage = "normalize_edges";
-        BRepLib::BuildCurves3d(
-            extraction_shape,
-            edge_normalization_tolerance,
-            GeomAbs_C1,
-            14,
-            0);
         BrepShapeMap edges;
         if (!map_unique_brep_subshapes_bounded(
                 extraction_shape,
@@ -4556,65 +4546,71 @@ TopologyData shape_topology(const TopoDS_Shape& shape, uint32_t query_flags) {
                 gp_Vec tangent(0.0, 0.0, 0.0);
                 gp_Vec outward(0.0, 0.0, 0.0);
                 double length = 0.0;
-                BRepAdaptor_Curve curve(typed_edge);
-                if (query_geometry) {
-                    geometry_kind = static_cast<uint32_t>(curve.GetType()) + 1;
-                }
-                if (query_frames) {
-                    const double first = curve.FirstParameter();
-                    const double last = curve.LastParameter();
-                    if (std::isfinite(first) && std::isfinite(last)) {
-                        curve.D1((first + last) * 0.5, point, tangent);
-                        if (tangent.SquareMagnitude() > Precision::SquareConfusion()) {
-                            tangent.Normalize();
-                            fact_flags |= FACT_FRAME;
-                        }
+                // Collapsed sewing edges can have only a pcurve. Querying their 3D
+                // adaptor or length can dereference a null BSpline inside OCCT.
+                if ((fact_flags & FACT_DEGENERATE) == 0) {
+                    BRepAdaptor_Curve curve(typed_edge);
+                    if (query_geometry) {
+                        geometry_kind = static_cast<uint32_t>(curve.GetType()) + 1;
                     }
-                    if (query_edge_directions && (fact_flags & FACT_FRAME) != 0) {
-                        for (uint32_t face_index : adjacent) {
-                            try {
-                                const TopoDS_Face face = TopoDS::Face(
-                                    faces(static_cast<int>(face_index + 1)));
-                                const TopoDS_Vertex probe =
-                                    BRepBuilderAPI_MakeVertex(point);
-                                BRepExtrema_ExtPF extrema(probe, face);
-                                if (!extrema.IsDone() || extrema.NbExt() < 1) continue;
-                                int nearest = 1;
-                                double nearest_distance = extrema.SquareDistance(1);
-                                for (int candidate = 2; candidate <= extrema.NbExt(); ++candidate) {
-                                    const double distance = extrema.SquareDistance(candidate);
-                                    if (distance < nearest_distance) {
-                                        nearest = candidate;
-                                        nearest_distance = distance;
-                                    }
-                                }
-                                double u = 0.0;
-                                double v = 0.0;
-                                extrema.Parameter(nearest, u, v);
-                                BRepAdaptor_Surface surface(face);
-                                BRepLProp_SLProps properties(
-                                    surface, u, v, 1, Precision::Confusion());
-                                if (!properties.IsNormalDefined()) continue;
-                                gp_Dir normal = properties.Normal();
-                                if (face.Orientation() == TopAbs_REVERSED) normal.Reverse();
-                                outward += gp_Vec(normal);
-                            } catch (const Standard_Failure&) {
-                                // A single singular adjacent surface does not invalidate the
-                                // topology snapshot; other adjacent normals may still define a
-                                // stable drag direction.
+                    if (query_frames) {
+                        const double first = curve.FirstParameter();
+                        const double last = curve.LastParameter();
+                        if (std::isfinite(first) && std::isfinite(last)) {
+                            curve.D1((first + last) * 0.5, point, tangent);
+                            if (tangent.SquareMagnitude() > Precision::SquareConfusion()) {
+                                tangent.Normalize();
+                                fact_flags |= FACT_FRAME;
                             }
                         }
-                        if (outward.SquareMagnitude() > Precision::SquareConfusion()) {
-                            outward.Normalize();
-                            fact_flags |= FACT_DIRECTION;
+                        if (query_edge_directions && (fact_flags & FACT_FRAME) != 0) {
+                            for (uint32_t face_index : adjacent) {
+                                try {
+                                    const TopoDS_Face face = TopoDS::Face(
+                                        faces(static_cast<int>(face_index + 1)));
+                                    const TopoDS_Vertex probe =
+                                        BRepBuilderAPI_MakeVertex(point);
+                                    BRepExtrema_ExtPF extrema(probe, face);
+                                    if (!extrema.IsDone() || extrema.NbExt() < 1) continue;
+                                    int nearest = 1;
+                                    double nearest_distance = extrema.SquareDistance(1);
+                                    for (int candidate = 2; candidate <= extrema.NbExt(); ++candidate) {
+                                        const double distance = extrema.SquareDistance(candidate);
+                                        if (distance < nearest_distance) {
+                                            nearest = candidate;
+                                            nearest_distance = distance;
+                                        }
+                                    }
+                                    double u = 0.0;
+                                    double v = 0.0;
+                                    extrema.Parameter(nearest, u, v);
+                                    BRepAdaptor_Surface surface(face);
+                                    BRepLProp_SLProps properties(
+                                        surface, u, v, 1, Precision::Confusion());
+                                    if (!properties.IsNormalDefined()) continue;
+                                    gp_Dir normal = properties.Normal();
+                                    if (face.Orientation() == TopAbs_REVERSED) normal.Reverse();
+                                    outward += gp_Vec(normal);
+                                } catch (const Standard_Failure&) {
+                                    // A single singular adjacent surface does not invalidate the
+                                    // topology snapshot; other adjacent normals may still define a
+                                    // stable drag direction.
+                                }
+                            }
+                            if (outward.SquareMagnitude() > Precision::SquareConfusion()) {
+                                outward.Normalize();
+                                fact_flags |= FACT_DIRECTION;
+                            }
                         }
                     }
-                }
-                if (query_measurements) {
-                    GProp_GProps properties;
-                    BRepGProp::LinearProperties(typed_edge, properties);
-                    length = properties.Mass();
-                    if (std::isfinite(length)) fact_flags |= FACT_MEASUREMENT;
+                    if (query_measurements) {
+                        GProp_GProps properties;
+                        BRepGProp::LinearProperties(typed_edge, properties);
+                        length = properties.Mass();
+                        if (std::isfinite(length)) fact_flags |= FACT_MEASUREMENT;
+                    }
+                } else if (query_measurements) {
+                    fact_flags |= FACT_MEASUREMENT;
                 }
                 result.edge_geometry_kinds.push_back(geometry_kind);
                 result.edge_fact_flags.push_back(fact_flags);
@@ -5423,6 +5419,21 @@ std::unique_ptr<TopoDS_Shape> builder_thick_solid(
     }
 }
 
+bool blend_tolerances_fit(const TopoDS_Shape& source, const TopoDS_Shape& result, double size)
+{
+    const auto maximum_edge_tolerance = [](const TopoDS_Shape& shape) {
+        double tolerance = Precision::Confusion();
+        for (TopExp_Explorer ex(shape, TopAbs_EDGE); ex.More(); ex.Next()) {
+            tolerance = std::max(tolerance, BRep_Tool::Tolerance(TopoDS::Edge(ex.Current())));
+        }
+        return tolerance;
+    };
+    // OCCT can report a valid solid by inflating edge tolerances past the blend
+    // size, leaving gaps between its 3D edges and supporting surface curves.
+    const double allowed = std::max(maximum_edge_tolerance(source) * 2.0, size * 0.01);
+    return maximum_edge_tolerance(result) <= allowed;
+}
+
 std::unique_ptr<TopoDS_Shape> builder_fillet(
     const TopoDS_Shape& solid,
     const std::vector<TopoDS_Edge>& edges,
@@ -5850,6 +5861,66 @@ std::unique_ptr<TopoDS_Shape> make_loft(
         remove_related_deleted_topology(out_topology_history);
         finish_topology_history(result_maps, out_topology_history);
         return result;
+    } catch (const Standard_Failure& failure) {
+        record_standard_failure(__func__, "native", 7, failure);
+        return nullptr;
+    }
+}
+
+std::unique_ptr<TopoDS_Shape> builder_sew_without_faces(
+    const TopoDS_Shape& shape,
+    rust::Slice<const uint32_t> removed_face_indices,
+    double tolerance,
+    rust::Vec<uint64_t>& out_history,
+    HistoryData& out_topology_history)
+{
+    try {
+        const HistoryMaps input_maps(shape);
+        BRepBuilderAPI_Sewing sewing(tolerance);
+        for (int ordinal = 1; ordinal <= input_maps.faces.Extent(); ++ordinal) {
+            if (std::find(removed_face_indices.begin(), removed_face_indices.end(),
+                          static_cast<uint32_t>(ordinal - 1)) == removed_face_indices.end()) {
+                sewing.Add(input_maps.faces(ordinal));
+            }
+        }
+        sewing.Perform();
+        const TopoDS_Shape& sewn = sewing.SewedShape();
+        if (sewn.IsNull() || sewn.ShapeType() != TopAbs_SHELL
+            || !BRep_Tool::IsClosed(sewn)) return nullptr;
+        BRepBuilderAPI_MakeSolid maker(TopoDS::Shell(sewn));
+        if (!maker.IsDone()) return nullptr;
+        TopoDS_Solid solid = maker.Solid();
+        if (!BRepLib::OrientClosedSolid(solid) || !BRepCheck_Analyzer(solid).IsValid()) {
+            return nullptr;
+        }
+        const HistoryMaps result_maps(solid);
+        for (HistoryKind kind : {HistoryKind::Face, HistoryKind::Edge, HistoryKind::Vertex}) {
+            const auto& sources = input_maps.map(kind);
+            for (int ordinal = 1; ordinal <= sources.Extent(); ++ordinal) {
+                const TopoDS_Shape& source = sources(ordinal);
+                TopoDS_Shape replacement = source;
+                if (sewing.IsModified(source)) replacement = sewing.Modified(source);
+                else if (sewing.IsModifiedSubShape(source)) replacement = sewing.ModifiedSubShape(source);
+                const size_t previous_size = out_topology_history.relations.size();
+                if (!replacement.IsNull()) {
+                    const HistoryRelation relation = source.IsSame(replacement)
+                        ? HistoryRelation::Unchanged : HistoryRelation::Modified;
+                    append_history_relation(out_topology_history, result_maps, replacement,
+                        relation, 0, kind, static_cast<uint32_t>(ordinal - 1));
+                    if (kind == HistoryKind::Face && result_maps.faces.Contains(replacement)) {
+                        out_history.push_back(reinterpret_cast<uint64_t>(replacement.TShape().get()));
+                        out_history.push_back(reinterpret_cast<uint64_t>(source.TShape().get()));
+                    }
+                }
+                if (out_topology_history.relations.size() == previous_size) {
+                    out_topology_history.deleted.push_back(0);
+                    out_topology_history.deleted.push_back(static_cast<uint32_t>(kind));
+                    out_topology_history.deleted.push_back(static_cast<uint32_t>(ordinal - 1));
+                }
+            }
+        }
+        finish_topology_history(result_maps, out_topology_history);
+        return std::make_unique<TopoDS_Shape>(solid);
     } catch (const Standard_Failure& failure) {
         record_standard_failure(__func__, "native", 7, failure);
         return nullptr;

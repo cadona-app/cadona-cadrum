@@ -251,6 +251,7 @@ mod ffi_bridge {
 		// shell/fillet/chamfer fill `out_history` with flat [post_id, src_id]
 		// pairs (same layout as builder_cells) → Solid::history + colormap remap.
 		fn builder_thick_solid(solid: &TopoDS_Shape, open_faces: &CxxVector<TopoDS_Face>, thickness: f64, progress: &CancellationToken, out_history: &mut Vec<u64>, out_topology_history: &mut HistoryData) -> UniquePtr<TopoDS_Shape>;
+		fn blend_tolerances_fit(source: &TopoDS_Shape, result: &TopoDS_Shape, size: f64) -> bool;
 		fn builder_fillet(solid: &TopoDS_Shape, edges: &CxxVector<TopoDS_Edge>, radius: f64, progress: &CancellationToken, out_history: &mut Vec<u64>, out_topology_history: &mut HistoryData) -> UniquePtr<TopoDS_Shape>;
 		fn builder_chamfer(solid: &TopoDS_Shape, edges: &CxxVector<TopoDS_Edge>, distance: f64, progress: &CancellationToken, out_history: &mut Vec<u64>, out_topology_history: &mut HistoryData) -> UniquePtr<TopoDS_Shape>;
 
@@ -351,6 +352,7 @@ mod ffi_bridge {
 		fn make_extrude(profile_edges: &CxxVector<TopoDS_Edge>, dx: f64, dy: f64, dz: f64, progress: &CancellationToken, out_topology_history: &mut HistoryData) -> UniquePtr<TopoDS_Shape>;
 		fn make_pipe_shell(all_edges: &CxxVector<TopoDS_Edge>, spine_edges: &CxxVector<TopoDS_Edge>, orient: u32, ux: f64, uy: f64, uz: f64, aux_spine_edges: &CxxVector<TopoDS_Edge>, progress: &CancellationToken, out_topology_history: &mut HistoryData) -> UniquePtr<TopoDS_Shape>;
 		fn make_loft(all_edges: &CxxVector<TopoDS_Edge>, ruled: bool, closed: bool, progress: &CancellationToken, out_topology_history: &mut HistoryData) -> UniquePtr<TopoDS_Shape>;
+		fn builder_sew_without_faces(shape: &TopoDS_Shape, removed_face_indices: &[u32], tolerance: f64, out_history: &mut Vec<u64>, out_topology_history: &mut HistoryData) -> UniquePtr<TopoDS_Shape>;
 		fn make_sewn_solid(faces: &CxxVector<TopoDS_Face>, tolerance: f64) -> UniquePtr<TopoDS_Shape>;
 		fn make_offset_shape(shape: &TopoDS_Shape, offset: f64, tolerance: f64) -> UniquePtr<TopoDS_Shape>;
 		fn make_bspline_solid(coords: &[f64], nu: u32, nv: u32, u_periodic: bool) -> UniquePtr<TopoDS_Shape>;

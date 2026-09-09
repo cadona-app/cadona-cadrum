@@ -550,6 +550,36 @@ impl Solid {
 		.with_topology_history(topology_history))
 	}
 
+	/// Remove the named faces and sew the remainder into one closed solid.
+	/// History maps source topology to the sewn result, including collapsed edges.
+	pub fn sew_without_faces(&self, removed_face_indices: &[u32], tolerance: f64) -> Result<Self, Error> {
+		if !tolerance.is_finite() || tolerance <= 0.0 || removed_face_indices.iter().any(|index| *index as usize >= self.iter_face().count()) {
+			return Err(Error::InvalidInput("sewing requires valid face ordinals and a finite positive tolerance".into()));
+		}
+		let mut history = Vec::new();
+		let mut topology_history = empty_ffi_history();
+		ffi::begin_operation();
+		let inner = ffi::builder_sew_without_faces(&self.inner, removed_face_indices, tolerance, &mut history, &mut topology_history);
+		if inner.is_null() {
+			return Err(ffi::operation_error(Error::SewFailed("remaining faces do not form a valid closed solid".into()), "sew without faces", "inspect_result"));
+		}
+		let topology_history = decode_topology_history(topology_history)?;
+		#[cfg(feature = "color")]
+		let colormap = self.remap_colormap(&inner, &history);
+		Ok(Solid::new(
+			inner,
+			#[cfg(feature = "color")]
+			colormap,
+			history,
+		)
+		.with_topology_history(topology_history))
+	}
+
+	/// Check whether a repaired blend kept edge tolerances near its source precision.
+	pub fn blend_tolerances_fit(&self, source: &Self, size: f64) -> bool {
+		ffi::blend_tolerances_fit(&source.inner, &self.inner, size)
+	}
+
 	/// Rebase this operation's history through a source-preparation operation.
 	pub fn compose_source_history(mut self, source_history: &TopologyHistory) -> Self {
 		self.topology_history = source_history.then(&self.topology_history);

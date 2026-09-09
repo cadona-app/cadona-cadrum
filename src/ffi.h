@@ -145,6 +145,8 @@ std::unique_ptr<TopoDS_Shape> builder_thick_solid(
 //
 // `out_history`: flat [post_id, src_id] pairs (Modified(), identity for
 // untouched). Generated fillet arc faces come from edges, absent.
+bool blend_tolerances_fit(const TopoDS_Shape& source, const TopoDS_Shape& result, double size);
+
 std::unique_ptr<TopoDS_Shape> builder_fillet(
     const TopoDS_Shape& solid,
 	const std::vector<TopoDS_Edge>& edges,
@@ -490,6 +492,13 @@ std::unique_ptr<TopoDS_Shape> make_loft(
     bool closed,
 	const CancellationToken& progress,
 	HistoryData& out_topology_history);
+
+std::unique_ptr<TopoDS_Shape> builder_sew_without_faces(
+    const TopoDS_Shape& shape,
+    rust::Slice<const uint32_t> removed_face_indices,
+    double tolerance,
+    rust::Vec<uint64_t>& out_history,
+    HistoryData& out_topology_history);
 
 // Sew (stitch) free faces into a single closed shell and upgrade it to a
 // solid via BRepBuilderAPI_MakeSolid. The sewn result must contain exactly

@@ -50,3 +50,41 @@ fn test_sew_03_empty_input_returns_sew_failed() {
 		other => panic!("expected Error::SewFailed, got {:?}", other),
 	}
 }
+
+#[test]
+fn sewing_a_narrow_strip_preserves_modified_face_history() {
+	use cadrum::{Edge, InputTopology, TopologyKind, TopologyQueryOptions};
+	let profile = Edge::polygon(&[DVec3::ZERO, DVec3::new(10.0, 0.0, 0.0), DVec3::new(10.0, 10.0, 0.0), DVec3::new(0.0001, 10.0, 0.0), DVec3::new(0.0, 9.9999, 0.0)]).expect("profile with a tiny corner");
+	let source = Solid::extrude(&profile, DVec3::Z * 5.0).expect("extrusion");
+	let before = source.topology_snapshot_with_options(TopologyQueryOptions::MEASUREMENT).unwrap();
+	let narrow = (0..before.face_ids().len() as u32).find(|face| before.face_facts(*face).unwrap().area.unwrap() < 0.001).unwrap();
+	let sewn = source.sew_without_faces(&[narrow], 0.001).expect("collapse narrow strip");
+	assert!(sewn.validate().unwrap().valid);
+	assert!((sewn.volume() - source.volume()).abs() < 0.01);
+	assert_eq!(sewn.iter_face().count(), 6);
+	let mesh = Solid::mesh_chunks([&sewn], cadrum::Tessellation::default()).expect("mesh collapsed planar boundary");
+	assert_eq!(mesh.faces.len(), 6);
+	assert!(mesh.faces.iter().all(|face| !face.indices.is_empty() && face.vertices.iter().all(|point| point.is_finite())));
+	let after = sewn.topology_snapshot_with_options(TopologyQueryOptions::MEASUREMENT).expect("query collapsed edges safely");
+	assert!(after.edge_ids().len() >= 12);
+	let history = sewn.topology_history();
+	for face in 0..before.face_ids().len() as u32 {
+		let input = InputTopology { operand: 0, kind: TopologyKind::Face, index: face };
+		if face == narrow {
+			assert!(history.deleted().contains(&input));
+		} else {
+			assert!(history.relations().iter().any(|relation| relation.source == input && relation.result.kind == TopologyKind::Face));
+		}
+	}
+	assert_eq!(before, source.topology_snapshot_with_options(TopologyQueryOptions::MEASUREMENT).unwrap(), "sewing leaves the source unchanged");
+}
+
+#[test]
+fn sewing_without_faces_rejects_gaps_and_invalid_arguments() {
+	let cube = Solid::cube(DVec3::ZERO, DVec3::splat(10.0));
+	assert!(cube.sew_without_faces(&[0], 0.001).is_err());
+	assert!(cube.sew_without_faces(&[6], 0.001).is_err());
+	for tolerance in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+		assert!(cube.sew_without_faces(&[], tolerance).is_err());
+	}
+}
