@@ -258,11 +258,28 @@ pub(super) fn mesh_chunks<'a>(solids: impl IntoIterator<Item = &'a Solid>, optio
 	mesh_chunks_cancelable(solids, options, &ffi::CancellationToken::new())
 }
 
+/// Detached numeric geometry; native topology stays on the extracting thread.
+pub struct PreparedMesh {
+	source: ffi::BrepMeshSourceData,
+	options: crate::traits::Tessellation,
+}
+
+impl PreparedMesh {
+	/// Tessellate the captured geometry without accessing any native shape.
+	pub fn mesh(self, progress: &ffi::CancellationToken) -> Result<crate::common::mesh::MeshChunks, Error> {
+		let data = tessellation::mesh_brep_source(self.source, self.options, progress)?;
+		decode_mesh_chunks(data, self.options)
+	}
+}
+
+pub(super) fn prepare_mesh<'a>(solids: impl IntoIterator<Item = &'a Solid>, options: crate::traits::Tessellation, progress: &ffi::CancellationToken) -> Result<PreparedMesh, Error> {
+	let compound = CompoundShape::new(solids);
+	let source = extract_mesh_source(compound.inner(), &[], options, progress)?;
+	Ok(PreparedMesh { source, options })
+}
+
 pub(super) fn mesh_chunks_cancelable<'a>(solids: impl IntoIterator<Item = &'a Solid>, options: crate::traits::Tessellation, progress: &ffi::CancellationToken) -> Result<crate::common::mesh::MeshChunks, Error> {
-	let solids = solids.into_iter().collect::<Vec<_>>();
-	let compound = CompoundShape::new(solids.iter().copied());
-	let data = custom_mesh_data(compound.inner(), &[], options, progress)?;
-	decode_mesh_chunks(data, options)
+	prepare_mesh(solids, options, progress)?.mesh(progress)
 }
 
 pub(super) fn mesh_chunks_raw_occt<'a>(solids: impl IntoIterator<Item = &'a Solid>, options: crate::traits::Tessellation) -> Result<crate::common::mesh::MeshChunks, Error> {
@@ -294,6 +311,10 @@ pub(super) fn mesh_face_chunks_cancelable(solid: &Solid, face_indices: &[u32], o
 }
 
 fn custom_mesh_data(shape: &ffi::TopoDS_Shape, face_indices: &[u32], options: crate::traits::Tessellation, progress: &ffi::CancellationToken) -> Result<ffi::MeshData, Error> {
+	tessellation::mesh_brep_source(extract_mesh_source(shape, face_indices, options, progress)?, options, progress)
+}
+
+fn extract_mesh_source(shape: &ffi::TopoDS_Shape, face_indices: &[u32], options: crate::traits::Tessellation, progress: &ffi::CancellationToken) -> Result<ffi::BrepMeshSourceData, Error> {
 	validate_tessellation_options(options)?;
 	if face_indices.iter().copied().collect::<std::collections::BTreeSet<_>>().len() != face_indices.len() {
 		return Err(Error::InvalidInput("tessellation face selection contains duplicate indices".into()));
@@ -306,7 +327,7 @@ fn custom_mesh_data(shape: &ffi::TopoDS_Shape, face_indices: &[u32], options: cr
 	if !source.success {
 		return Err(ffi::operation_error(Error::TriangulationFailed, "extract B-rep tessellation source", "extract"));
 	}
-	tessellation::mesh_brep_source(source, options, progress)
+	Ok(source)
 }
 
 fn validate_tessellation_options(options: crate::traits::Tessellation) -> Result<(), Error> {

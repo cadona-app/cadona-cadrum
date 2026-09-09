@@ -886,6 +886,11 @@ impl Solid {
 		super::io::mesh_chunks(solids, options)
 	}
 
+	/// Extract a detached numeric surface snapshot for meshing on another thread.
+	pub fn prepare_mesh<'a>(solids: impl IntoIterator<Item = &'a Self>, options: crate::traits::Tessellation, progress: &ffi::CancellationToken) -> Result<super::io::PreparedMesh, Error> {
+		super::io::prepare_mesh(solids, options, progress)
+	}
+
 	/// Mesh topology-keyed chunks with cooperative cancellation.
 	pub fn mesh_chunks_cancelable<'a>(solids: impl IntoIterator<Item = &'a Self>, options: crate::traits::Tessellation, progress: &ffi::CancellationToken) -> Result<crate::common::mesh::MeshChunks, Error> {
 		super::io::mesh_chunks_cancelable(solids, options, progress)

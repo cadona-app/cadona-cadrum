@@ -5,10 +5,8 @@
 //! normals, quality control, parallel scheduling, and assembly live here.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Mutex;
-#[cfg(not(target_arch = "wasm32"))]
-use std::sync::OnceLock;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use glam::{DVec2, DVec3};
 use spade::{ConstrainedDelaunayTriangulation, HasPosition, Intersection, LineIntersectionIterator, Point2, PositionInTriangulation, Triangulation};
@@ -731,7 +729,7 @@ impl HasPosition for ParametricVertex {
 
 type FaceTriangulation = ConstrainedDelaunayTriangulation<ParametricVertex>;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct MeshedFace {
 	index: u32,
 	tshape_id: u64,
@@ -1084,11 +1082,20 @@ pub(super) fn mesh_brep_source(data: ffi::BrepMeshSourceData, options: Tessellat
 }
 
 fn mesh_faces(faces: &[TrimmedFace], linear: f64, angular: f64, parallel: bool, progress: &ffi::CancellationToken) -> Result<Vec<MeshedFace>, Error> {
+	if let Some(cache) = FACE_MESH_CACHE.get() {
+		for face in faces {
+			check_cancelled(progress)?;
+			let key = face_mesh_key(face, linear, angular);
+			if cache.lock().unwrap_or_else(|error| error.into_inner()).entries.get(&key).is_some_and(|entry| entry.2.is_none()) {
+				return Err(Error::TriangulationFailed);
+			}
+		}
+	}
 	let budget = RequestMeshBudget::default();
 	let rust_progress = RustMeshProgress::new(faces.len());
 	let mesh_and_admit = |face: &TrimmedFace| {
 		rust_progress.face_started(progress)?;
-		let mesh = mesh_face(face, linear, angular, progress)?;
+		let mesh = cached_mesh_face(face, linear, angular, progress)?;
 		budget.admit(&mesh)?;
 		rust_progress.face_completed(progress)?;
 		Ok(mesh)
@@ -1099,6 +1106,108 @@ fn mesh_faces(faces: &[TrimmedFace], linear: f64, angular: f64, parallel: bool, 
 		return bounded_face_pool()?.install(|| faces.par_iter().map(mesh_and_admit).collect());
 	}
 	faces.iter().map(mesh_and_admit).collect()
+}
+
+const FACE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Default)]
+struct FaceMeshCache {
+	entries: HashMap<Vec<u64>, (u64, usize, Option<Arc<MeshedFace>>)>,
+	bytes: usize,
+	clock: u64,
+	hits: usize,
+	misses: usize,
+}
+
+static FACE_MESH_CACHE: OnceLock<Mutex<FaceMeshCache>> = OnceLock::new();
+
+#[cfg(feature = "test-support")]
+pub(super) fn face_cache_statistics(clear: bool) -> [usize; 4] {
+	let mut cache = FACE_MESH_CACHE.get_or_init(Mutex::default).lock().unwrap_or_else(|error| error.into_inner());
+	let statistics = [cache.hits, cache.misses, cache.entries.len(), cache.bytes];
+	if clear {
+		*cache = FaceMeshCache::default();
+	}
+	statistics
+}
+
+// Compare every geometric and boundary bit, never a pointer or hash alone.
+// Face ordinals and native IDs are presentation labels, rebound after reuse.
+fn face_mesh_key(face: &TrimmedFace, linear: f64, angular: f64) -> Vec<u64> {
+	let surface = &face.surface;
+	let mut key = vec![linear.to_bits(), angular.to_bits(), face.reversed as u64, surface.u_degree as u64, surface.v_degree as u64, surface.u_count as u64, surface.v_count as u64];
+	for points in [&surface.poles, &surface.local_poles] {
+		key.push(points.len() as u64);
+		key.extend(points.iter().flat_map(|point| point.to_array().map(f64::to_bits)));
+	}
+	key.extend(surface.origin.to_array().map(f64::to_bits));
+	for values in [&surface.weights, &surface.u_knots, &surface.v_knots] {
+		key.push(values.len() as u64);
+		key.extend(values.iter().map(|value| value.to_bits()));
+	}
+	key.extend(surface.uv_bounds.map(f64::to_bits));
+	key.push(surface.approximation_error.to_bits());
+	key.extend([face.collapsed_boundaries.u_at_v_min, face.collapsed_boundaries.u_at_v_max, face.collapsed_boundaries.v_at_u_min, face.collapsed_boundaries.v_at_u_max].map(u64::from));
+	key.push(face.loops.len() as u64);
+	for boundary in &face.loops {
+		key.push(boundary.vertices.len() as u64);
+		for vertex in &boundary.vertices {
+			key.extend(vertex.uv.to_array().map(f64::to_bits));
+			key.extend(vertex.position.to_array().map(f64::to_bits));
+			key.extend([vertex.edge_index as u64, vertex.edge_sample_index as u64, vertex.edge_occurrence_index as u64, vertex.edge_occurrence_direction as u64]);
+		}
+	}
+	key
+}
+
+fn cached_mesh_face(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::CancellationToken) -> Result<MeshedFace, Error> {
+	check_cancelled(progress)?;
+	let key = face_mesh_key(face, linear, angular);
+	let cache = FACE_MESH_CACHE.get_or_init(Mutex::default);
+	let cached = {
+		let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+		cache.clock = cache.clock.wrapping_add(1);
+		let clock = cache.clock;
+		let entry = cache.entries.get_mut(&key).map(|entry| {
+			entry.0 = clock;
+			entry.2.clone()
+		});
+		if entry.is_some() {
+			cache.hits += 1;
+		} else {
+			cache.misses += 1;
+		}
+		entry
+	};
+	if let Some(cached) = cached {
+		let mut mesh = cached.ok_or(Error::TriangulationFailed)?.as_ref().clone();
+		mesh.index = face.index;
+		mesh.tshape_id = face.tshape_id;
+		return Ok(mesh);
+	}
+	let result = mesh_face(face, linear, angular, progress);
+	check_cancelled(progress)?;
+	if result.is_ok() || matches!(result, Err(Error::TriangulationFailed)) {
+		let mesh_bytes = result.as_ref().map_or(0, |mesh| mesh.vertices.len() * 24 + mesh.uvs.len() * 16 + mesh.normals.len() * 24 + mesh.indices.len() * 4 + mesh.refined_edges.values().map(|points| points.len() * 24 + 64).sum::<usize>() + mesh.boundary_refinements.iter().map(|run| run.points.len() * 40 + 64).sum::<usize>() + mesh.quality_exempt_vertices.len() * 32);
+		let bytes = key.len() * 8 + mesh_bytes + 256;
+		if bytes <= FACE_CACHE_BYTES {
+			let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+			if let Some((_, previous, _)) = cache.entries.remove(&key) {
+				cache.bytes -= previous;
+			}
+			while cache.bytes + bytes > FACE_CACHE_BYTES || cache.entries.len() >= 512 {
+				let Some(oldest) = cache.entries.iter().min_by_key(|(_, entry)| entry.0).map(|(key, _)| key.clone()) else {
+					break;
+				};
+				cache.bytes -= cache.entries.remove(&oldest).unwrap().1;
+			}
+			cache.clock = cache.clock.wrapping_add(1);
+			let clock = cache.clock;
+			cache.entries.insert(key, (clock, bytes, result.as_ref().ok().map(|mesh| Arc::new(mesh.clone()))));
+			cache.bytes += bytes;
+		}
+	}
+	result
 }
 
 fn mesh_face(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::CancellationToken) -> Result<MeshedFace, Error> {

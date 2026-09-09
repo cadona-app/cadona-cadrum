@@ -3,6 +3,11 @@
 use super::{ffi, solid::Solid, tessellation};
 use crate::{Error, Tessellation};
 
+/// Face-cache hits, misses, entries and retained bytes; optionally clear it after reading.
+pub fn tessellation_face_cache_statistics(clear: bool) -> [usize; 4] {
+	tessellation::face_cache_statistics(clear)
+}
+
 /// Direction of one face-loop edge occurrence relative to the canonical
 /// topological edge sample sequence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
