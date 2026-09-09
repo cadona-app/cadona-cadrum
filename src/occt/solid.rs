@@ -575,7 +575,7 @@ impl Solid {
 		.with_topology_history(topology_history))
 	}
 
-	/// Check whether a repaired blend kept edge tolerances near its source precision.
+	/// Check suspicious blend boundaries against the source precision and blend size.
 	pub fn blend_tolerances_fit(&self, source: &Self, size: f64) -> bool {
 		ffi::blend_tolerances_fit(&source.inner, &self.inner, size)
 	}

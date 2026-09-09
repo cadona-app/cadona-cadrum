@@ -67,3 +67,42 @@ fn structured_boolean_patch_preserves_bit_identical_shared_boundaries() {
 		}
 	}
 }
+
+#[test]
+fn successive_fillets_keep_collapsed_corner_poles_closed() {
+	let source = Solid::cube(DVec3::new(-10.0, -10.0, 0.0), DVec3::new(20.0, 10.0, 20.0));
+	let topology = source.topology_snapshot_with_options(cadrum::TopologyQueryOptions::MEASUREMENT).unwrap();
+	let cap = (0..topology.face_ids().len() as u32).find(|face| topology.face_facts(*face).unwrap().normal.is_some_and(|normal| normal[0] > 0.99)).unwrap();
+	let edges = topology.face_edges(cap).unwrap().iter().map(|index| source.iter_edge().nth(*index as usize).unwrap());
+	let rounded = source.fillet_edges(2.0, edges).unwrap();
+	let topology = rounded.topology_snapshot_with_options(cadrum::TopologyQueryOptions::MEASUREMENT).unwrap();
+	let chain = (0..topology.edge_ids().len() as u32)
+		.filter(|index| {
+			let facts = topology.edge_facts(*index).unwrap();
+			facts.midpoint.is_some_and(|point| point[1] > 8.0 && point[2] > 18.0) && facts.tangent.is_some_and(|tangent| tangent[0].abs() > 0.1)
+		})
+		.collect::<Vec<_>>();
+	assert_eq!(chain.len(), 2);
+	for radius in [0.5, 1.0] {
+		let edges = chain.iter().map(|index| rounded.iter_edge().nth(*index as usize).unwrap());
+		let blended = rounded.fillet_edges(radius, edges).unwrap();
+		assert!(blended.validate().unwrap().valid);
+		for parallel in [false, true] {
+			let options = Tessellation { deflection_linear: 0.01, deflection_angular: 0.25, relative_linear: false, include_edges: true, parallel };
+			let mesh = Solid::mesh_chunks([&blended], options).expect("fillet corner poles must tessellate");
+			let invalid = triangle_edge_uses(&mesh).into_iter().filter(|(_, (count, direction))| *count != 2 || *direction != 0).take(8).collect::<Vec<_>>();
+			assert!(invalid.is_empty(), "fillet radius {radius} produced a cracked mesh: {invalid:?}");
+			let volume = mesh
+				.faces
+				.iter()
+				.flat_map(|face| {
+					face.indices.chunks_exact(3).map(|triangle| {
+						let [a, b, c] = [triangle[0], triangle[1], triangle[2]].map(|index| face.vertices[index as usize]);
+						a.dot(b.cross(c)) / 6.0
+					})
+				})
+				.sum::<f64>();
+			assert!((volume - blended.volume()).abs() < blended.volume() * 0.001);
+		}
+	}
+}

@@ -998,10 +998,24 @@ impl FaceBoundaryContract {
 		}
 
 		let mut edge_uses = BTreeMap::<(u32, u32), DirectedEdgeUse>::new();
+		// UV charts can have distinct samples at one proven collapsed pole.
+		// Audit their geometric adjacency without welding unrelated seams or nearby points.
+		let mut poles = BTreeMap::new();
+		let topology_vertices = mesh
+			.vertices
+			.iter()
+			.enumerate()
+			.map(|(index, position)| {
+				cancellation_checkpoint(progress, index)?;
+				let index = u32::try_from(index).map_err(|_| Error::TriangulationFailed)?;
+				let key = point_key(*position);
+				Ok(if collapsed_positions.contains(&key) { *poles.entry(key).or_insert(index) } else { index })
+			})
+			.collect::<Result<Vec<_>, Error>>()?;
 		for (triangle_index, triangle) in mesh.indices.chunks_exact(3).enumerate() {
 			cancellation_checkpoint(progress, triangle_index)?;
 			for edge in 0..3 {
-				let directed = (triangle[edge], triangle[(edge + 1) % 3]);
+				let directed = (*topology_vertices.get(triangle[edge] as usize).ok_or(Error::TriangulationFailed)?, *topology_vertices.get(triangle[(edge + 1) % 3] as usize).ok_or(Error::TriangulationFailed)?);
 				let local_edge = ordered_pair(directed.0, directed.1);
 				if local_edge.0 == local_edge.1 {
 					return Err(Error::TriangulationFailed);
@@ -1219,12 +1233,13 @@ fn mesh_face(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::Canc
 	// mesher. Keeping the exception narrow preserves ordinary rigid-placement
 	// equivalence for planar sweeps.
 	if !planar || face.surface.needs_world_stable_planar_route() {
-		let structured_mesh = mesh_structured_patch(face, linear, angular, progress).map_err(|error| {
-			if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
-				eprintln!("custom tessellation face {} could not build its structured patch: {error:?}", face.index);
-			}
-			error
-		})?;
+		let structured_mesh = match mesh_structured_patch(face, linear, angular, progress) {
+			Ok(mesh) => mesh,
+			// A rejected structured candidate must still reach the boundary-preserving CDT.
+			// Cancellation and resource errors remain authoritative for every route.
+			Err(Error::TriangulationFailed) => None,
+			Err(error) => return Err(error),
+		};
 		if let Some(mesh) = structured_mesh {
 			if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
 				eprintln!("custom tessellation face {} used structured patch: {} vertices, {} triangles", face.index, mesh.vertices.len(), mesh.indices.len() / 3);
@@ -1767,7 +1782,7 @@ fn mesh_structured_patch(face: &TrimmedFace, linear: f64, angular: f64, progress
 	if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() && has_collapsed_horizontal_boundary {
 		eprintln!("custom tessellation face {} singular routing: periodic seam={}, left edge={left_edge:?}, right edge={right_edge:?}", face.index, sides_are_one_periodic_seam);
 	}
-	if has_collapsed_horizontal_boundary && sides_are_one_periodic_seam {
+	if has_collapsed_horizontal_boundary {
 		if let Some(mesh) = mesh_singular_row_structured_patch(face, lower, upper, left, right, u_tolerance, v_tolerance, linear, angular, progress)? {
 			if mesh_satisfies_tolerances(face, &mesh, linear, angular, progress)? {
 				return Ok(Some(mesh));
@@ -1830,12 +1845,8 @@ fn mesh_structured_patch(face: &TrimmedFace, linear: f64, angular: f64, progress
 	Ok(None)
 }
 
-/// Builds periodic singular charts as latitude-like rows whose sample count
-/// decreases with physical circumference near a collapsed pole. A fixed
-/// tensor grid sends every equatorial column into one apex and consequently
-/// creates arbitrarily thin triangles even when chord error is small. The
-/// graded rows retain the exact non-collapsed boundary, use one geometric pole
-/// vertex, and zipper adjacent rings with deterministic minimax connectivity.
+/// Grades rows toward collapsed poles while retaining exact shared boundaries.
+/// Periodic self-seams share refinements; independent sides receive transition collars.
 #[allow(clippy::too_many_arguments)]
 fn mesh_singular_row_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVertex], upper: &[&BoundaryVertex], left: &[&BoundaryVertex], right: &[&BoundaryVertex], u_tolerance: f64, v_tolerance: f64, linear: f64, angular: f64, progress: &ffi::CancellationToken) -> Result<Option<MeshedFace>, Error> {
 	check_cancelled(progress)?;
@@ -1845,30 +1856,27 @@ fn mesh_singular_row_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVert
 		return Ok(None);
 	}
 	let [u_min, u_max, _, _] = face.surface.uv_bounds;
+	let self_seam = dominant_boundary_edge_index(left).zip(dominant_boundary_edge_index(right)).is_some_and(|(left, right)| left == right);
 	let mut reference_u = adaptive_axis_coordinates(face, ParametricAxis::U, [lower, upper], AxisSampling { target_length: f64::INFINITY, linear: linear * 0.5, angular: angular * 0.5, coordinate_tolerance: u_tolerance }, progress)?;
 	reference_u.sort_by(f64::total_cmp);
 	reference_u.dedup_by(|first, second| (*first - *second).abs() <= u_tolerance);
+	if !self_seam {
+		// Canonical trim density need not dictate every interior row's density.
+		reference_u = coarsen_axis_coordinates(face, ParametricAxis::U, &reference_u, 4, linear, angular, progress)?;
+	}
 	if reference_u.len() < 4 {
 		if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
-			eprintln!("custom tessellation face {} graded singular rejected with only {} periodic samples", face.index, reference_u.len());
+			eprintln!("custom tessellation face {} graded singular rejected with only {} cross-axis samples", face.index, reference_u.len());
 		}
 		return Ok(None);
 	}
-	// The two chart sides are occurrences of one topological seam. Never add a
-	// face-local sample to that seam: doing so would split a canonical segment
-	// on this face without making the identical change on its neighbor. Ring
-	// density may vary around U, while latitude rows are restricted to the
-	// once-sampled shared-edge sequence plus a single deterministic refinement
-	// shared by both occurrences of this self-seam.
 	let canonical_seam = if left.len() >= right.len() { left } else { right };
 	let seam_edge_index = dominant_boundary_edge_index(canonical_seam).ok_or(Error::TriangulationFailed)?;
-	let mut v_coordinates = adaptive_axis_coordinates(face, ParametricAxis::V, [canonical_seam, canonical_seam], AxisSampling { target_length: f64::INFINITY, linear: linear * 0.5, angular: angular * 0.5, coordinate_tolerance: v_tolerance }, progress)?;
+	let v_boundaries = if self_seam { [canonical_seam, canonical_seam] } else { [left, right] };
+	let mut v_coordinates = adaptive_axis_coordinates(face, ParametricAxis::V, v_boundaries, AxisSampling { target_length: f64::INFINITY, linear: linear * 0.5, angular: angular * 0.5, coordinate_tolerance: v_tolerance }, progress)?;
 	v_coordinates.sort_by(f64::total_cmp);
 	v_coordinates.dedup_by(|first, second| (*first - *second).abs() <= v_tolerance);
 	if !refine_compact_patch_v_coordinates(face, &reference_u, &mut v_coordinates, v_tolerance, linear * 0.5, progress)? || !strictly_increasing(&v_coordinates) {
-		if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
-			eprintln!("custom tessellation face {} graded singular rejected self-seam refinement: {}x{}", face.index, reference_u.len(), v_coordinates.len());
-		}
 		return Ok(None);
 	}
 
@@ -1901,12 +1909,40 @@ fn mesh_singular_row_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVert
 			let previous_step = face.surface.evaluate_position(DVec2::new(center_u, previous_v)).zip(current).map(|(first, second)| first.distance(second)).unwrap_or(0.0);
 			let next_step = current.zip(face.surface.evaluate_position(DVec2::new(center_u, next_v))).map(|(first, second)| first.distance(second)).unwrap_or(0.0);
 			let radial_step = previous_step.max(next_step).max(1.0e-12);
-			let accuracy_intervals = (boundary_intervals as f64 * (ring_lengths[v_index] / maximum_ring_length).sqrt()).ceil() as usize;
+			let accuracy_intervals = if self_seam {
+				(boundary_intervals as f64 * (ring_lengths[v_index] / maximum_ring_length).sqrt()).ceil() as usize
+			} else {
+				// Corner patches can be much narrower than their side boundaries are long.
+				// Measure local curvature instead of inheriting a periodic ring's density.
+				let mut intervals = 2;
+				loop {
+					check_cancelled(progress)?;
+					let mut meets_error = true;
+					for index in 0..intervals {
+						let u = |fraction: f64| u_min + (u_max - u_min) * fraction / intervals as f64;
+						let samples = [u(index as f64), u(index as f64 + 0.5), u(index as f64 + 1.0)].map(|u| face.surface.evaluate(DVec2::new(u, v_coordinates[v_index])).ok_or(Error::TriangulationFailed));
+						let [first, middle, last] = samples;
+						let (first, middle, last) = (first?, middle?, last?);
+						if point_segment_distance(middle.position, first.position, last.position) > linear * 0.5 || surface_normal_angle(first, middle) > angular * 0.5 || surface_normal_angle(middle, last) > angular * 0.5 {
+							meets_error = false;
+							break;
+						}
+					}
+					if meets_error || intervals >= MAXIMUM_SINGULAR_RING_INTERVALS {
+						break;
+					}
+					intervals *= 2;
+				}
+				intervals
+			};
 			let aspect_intervals = (ring_lengths[v_index] / (radial_step * TARGET_PHYSICAL_ASPECT)).ceil() as usize;
-			accuracy_intervals.max(aspect_intervals).clamp(3, MAXIMUM_SINGULAR_RING_INTERVALS) + 1
+			accuracy_intervals.max(aspect_intervals).clamp(if self_seam { 3 } else { 2 }, MAXIMUM_SINGULAR_RING_INTERVALS) + 1
 		};
 		planned_vertex_count = checked_add_resource(planned_vertex_count, row_size, "tessellation singular structured vertex count overflowed")?;
 		planned_row_sizes.push(row_size);
+	}
+	if !self_seam {
+		planned_vertex_count = checked_add_resource(planned_vertex_count, left.len() + right.len(), "tessellation singular boundary count overflowed")?;
 	}
 	if planned_vertex_count > MAXIMUM_FACE_VERTICES {
 		return Err(resource_limit("tessellation singular structured face exceeded the vertex limit"));
@@ -1935,10 +1971,8 @@ fn mesh_singular_row_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVert
 		}
 		if is_lower && !lower_collapsed || is_upper && !upper_collapsed {
 			let boundary = if is_lower { lower } else { upper };
-			// `append_boundary_side` already returns a normalized chart key.
-			// Normalizing it a second time shifts every non-unit periodic chart
-			// (for example a cone's 0..TAU range), causing the zipper to join a
-			// boundary sample to the wrong interior longitude.
+			// Boundary keys are already normalized; normalizing twice shifts non-unit charts.
+			// For example, cone longitudes span 0..TAU.
 			let row = append_boundary_side(face, boundary, true, &mut vertices, &mut uvs, &mut normals, progress)?;
 			rows.push(row);
 			let seam_position = boundary_position_at_coordinate(canonical_seam, v, false, false, v_tolerance).or_else(|| face.surface.evaluate_position(DVec2::new(u_min, v))).ok_or(Error::TriangulationFailed)?;
@@ -1946,25 +1980,21 @@ fn mesh_singular_row_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVert
 			continue;
 		}
 
-		// Circular chord error is proportional to radius / intervals².  Reduce
-		// the circumferential density with the square root of physical ring
-		// length so every latitude retains the same sagitta budget instead of
-		// collapsing too aggressively near the pole.
 		let intervals = planned_row_sizes[v_index] - 1;
 		let seam_position = boundary_position_at_coordinate(canonical_seam, v, false, false, v_tolerance).or_else(|| face.surface.evaluate_position(DVec2::new(u_min, v))).ok_or(Error::TriangulationFailed)?;
 		refined_seam_points.push(seam_position);
 		let mut row = Vec::with_capacity(intervals + 1);
-		for u_index in 0..=intervals {
+		for u_index in if self_seam { 0..=intervals } else { 1..=intervals - 1 } {
 			cancellation_checkpoint(progress, u_index)?;
 			let fraction = u_index as f64 / intervals as f64;
 			let u = u_min + (u_max - u_min) * fraction;
-			let boundary_position = (u_index == 0 || u_index == intervals).then_some(seam_position);
+			let boundary_position = (self_seam && (u_index == 0 || u_index == intervals)).then_some(seam_position);
 			let index = append_surface_vertex(face, DVec2::new(u, v), boundary_position, &mut vertices, &mut uvs, &mut normals)?;
 			row.push((fraction, index));
 		}
 		rows.push(row);
 	}
-	debug_assert_eq!(vertices.len(), planned_vertex_count);
+	debug_assert!(vertices.len() <= planned_vertex_count);
 
 	let planned_index_count = checked_mul_resource(planned_vertex_count, 6, "tessellation singular structured index count overflowed")?;
 	let mut indices = Vec::new();
@@ -1972,10 +2002,30 @@ fn mesh_singular_row_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVert
 	for (row_index, pair) in rows.windows(2).enumerate() {
 		cancellation_checkpoint(progress, row_index)?;
 		match (pair[0].as_slice(), pair[1].as_slice()) {
+			([_], [_]) if !self_seam => {}
 			([(_, pole)], ring) => push_pole_fan(*pole, ring, &vertices, &normals, &mut indices, progress)?,
 			(ring, [(_, pole)]) => push_pole_fan(*pole, ring, &vertices, &normals, &mut indices, progress)?,
 			(first, second) => triangulate_monotone_strip(face, first, second, &vertices, &uvs, &normals, 1.0e-10, linear, angular, &mut indices, progress)?,
 		}
+	}
+	if !self_seam {
+		// Interior rows grade toward the pole; exact side samples form independent collars.
+		// Only a periodic self-seam may refine its boundary face-locally.
+		let mut left_side = append_boundary_side(face, left, false, &mut vertices, &mut uvs, &mut normals, progress)?;
+		let mut right_side = append_boundary_side(face, right, false, &mut vertices, &mut uvs, &mut normals, progress)?;
+		let [_, _, v_min, v_max] = face.surface.uv_bounds;
+		let left_inner = rows.iter().zip(&v_coordinates).map(|(row, v)| (parameter_fraction(*v, v_min, v_max), row[0].1)).collect::<Vec<_>>();
+		let right_inner = rows.iter().zip(&v_coordinates).map(|(row, v)| (parameter_fraction(*v, v_min, v_max), row[row.len() - 1].1)).collect::<Vec<_>>();
+		for (boundary, inner) in [(&mut left_side, &left_inner), (&mut right_side, &right_inner)] {
+			for (boundary_index, inner_index) in [(0, 0), (boundary.len() - 1, inner.len() - 1)] {
+				if point_key(vertices[boundary[boundary_index].1]) != point_key(vertices[inner[inner_index].1]) {
+					return Ok(None);
+				}
+				boundary[boundary_index].1 = inner[inner_index].1;
+			}
+		}
+		triangulate_monotone_strip(face, &left_side, &left_inner, &vertices, &uvs, &normals, 1.0e-10, linear, angular, &mut indices, progress)?;
+		triangulate_monotone_strip(face, &right_inner, &right_side, &vertices, &uvs, &normals, 1.0e-10, linear, angular, &mut indices, progress)?;
 	}
 	if indices.is_empty() {
 		return Ok(None);
@@ -1985,8 +2035,12 @@ fn mesh_singular_row_structured_patch(face: &TrimmedFace, lower: &[&BoundaryVert
 		let row_sizes = rows.iter().map(Vec::len).collect::<Vec<_>>();
 		eprintln!("custom tessellation face {} graded singular rows {:?}: {} vertices, {} triangles", face.index, row_sizes, vertices.len(), indices.len() / 3);
 	}
-	let refined_edges = BTreeMap::from([(seam_edge_index, refined_seam_points)]);
-	let boundary_refinements = self_seam_boundary_refinements(left, right, &v_coordinates, &refined_edges[&seam_edge_index])?;
+	let (refined_edges, boundary_refinements) = if self_seam {
+		let refinements = self_seam_boundary_refinements(left, right, &v_coordinates, &refined_seam_points)?;
+		(BTreeMap::from([(seam_edge_index, refined_seam_points)]), refinements)
+	} else {
+		(BTreeMap::new(), Vec::new())
+	};
 	Ok(Some(MeshedFace { index: face.index, tshape_id: face.tshape_id, vertices, uvs, normals, indices, refined_edges, boundary_refinements, quality_exempt_vertices: BTreeSet::new() }))
 }
 

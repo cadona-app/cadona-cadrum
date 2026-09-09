@@ -1,5 +1,10 @@
 #include "cadrum/src/ffi.rs.h"
 
+#ifndef __wasm__
+#include <chrono>
+#include <mutex>
+#endif
+
 // ==================== OCCT headers (impl only — not exposed via wrapper.h) ====================
 //
 // Grouped by responsibility. Anything used in wrapper.h is included there;
@@ -3107,7 +3112,13 @@ static bool append_face_trim_loops(
                     || boundary_error > maximum_allowed_boundary_error) {
                     return fail(
                         "extract_face_trim_loops/validate_boundary",
-                        "surface chart and canonical edge disagree beyond tolerance");
+                        ("surface chart and canonical edge disagree beyond tolerance: edge "
+                            + std::to_string(edge_index) + ", sample "
+                            + std::to_string(sample_index) + ", original "
+                            + std::to_string(original_error) + ", spline "
+                            + std::to_string(spline_error) + ", conversion "
+                            + std::to_string(conversion_error) + ", allowed "
+                            + std::to_string(maximum_allowed_boundary_error)).c_str());
                 }
                 maximum_boundary_error =
                     std::max(maximum_boundary_error, boundary_error);
@@ -5421,18 +5432,68 @@ std::unique_ptr<TopoDS_Shape> builder_thick_solid(
 
 bool blend_tolerances_fit(const TopoDS_Shape& source, const TopoDS_Shape& result, double size)
 {
-    const auto maximum_edge_tolerance = [](const TopoDS_Shape& shape) {
+    const auto maximum_boundary_tolerance = [](const TopoDS_Shape& shape) {
         double tolerance = Precision::Confusion();
         for (TopExp_Explorer ex(shape, TopAbs_EDGE); ex.More(); ex.Next()) {
             tolerance = std::max(tolerance, BRep_Tool::Tolerance(TopoDS::Edge(ex.Current())));
         }
+        for (TopExp_Explorer ex(shape, TopAbs_VERTEX); ex.More(); ex.Next()) {
+            tolerance = std::max(tolerance, BRep_Tool::Tolerance(TopoDS::Vertex(ex.Current())));
+        }
         return tolerance;
     };
-    // OCCT can report a valid solid by inflating edge tolerances past the blend
+    // OCCT can report a valid solid by inflating boundary tolerances past the blend
     // size, leaving gaps between its 3D edges and supporting surface curves.
-    const double allowed = std::max(maximum_edge_tolerance(source) * 2.0, size * 0.01);
-    return maximum_edge_tolerance(result) <= allowed;
+    const double allowed = std::max(maximum_boundary_tolerance(source) * 2.0, size * 0.01);
+    if (maximum_boundary_tolerance(result) <= allowed) return true;
+    try {
+        // Large stored tolerances can be conservative. Reject measured gaps,
+        // including endpoints snapped to shared vertices by the display mesher.
+        for (TopExp_Explorer faces(result, TopAbs_FACE); faces.More(); faces.Next()) {
+            const TopoDS_Face face = TopoDS::Face(faces.Current());
+            BRepAdaptor_Surface surface(face);
+            for (TopExp_Explorer edges(face, TopAbs_EDGE); edges.More(); edges.Next()) {
+                const TopoDS_Edge edge = TopoDS::Edge(edges.Current().Oriented(TopAbs_FORWARD));
+                const TopoDS_Vertex first_vertex = TopExp::FirstVertex(edge);
+                const TopoDS_Vertex last_vertex = TopExp::LastVertex(edge);
+                if (first_vertex.IsNull() || last_vertex.IsNull()) return false;
+                BRepAdaptor_Curve2d pcurve(edge, face);
+                for (int sample = 0; sample <= 4; ++sample) {
+                    const double parameter = pcurve.FirstParameter()
+                        + (pcurve.LastParameter() - pcurve.FirstParameter()) * sample / 4.0;
+                    const gp_Pnt2d uv = pcurve.Value(parameter);
+                    gp_Pnt point;
+                    if (sample == 0 || BRep_Tool::Degenerated(edge)) {
+                        point = BRep_Tool::Pnt(first_vertex);
+                    } else if (sample == 4) {
+                        point = BRep_Tool::Pnt(last_vertex);
+                    } else {
+                        point = BRepAdaptor_Curve(edge).Value(parameter);
+                    }
+                    const double error = surface.Value(uv.X(), uv.Y()).Distance(point);
+                    if (!std::isfinite(error) || error > allowed) {
+                        if (std::getenv("PLEX_TESSELLATION_DIAGNOSTICS")) {
+                            std::cerr << "blend boundary rejected: size=" << size << " sample=" << sample
+                                << " error=" << error << " allowed=" << allowed
+                                << " source tolerance=" << maximum_boundary_tolerance(source)
+                                << " result tolerance=" << maximum_boundary_tolerance(result) << std::endl;
+                        }
+                        return false;
+                    }
+                }
+            }
+        }
+    } catch (const Standard_Failure&) {
+        return false;
+    }
+    return true;
 }
+
+#ifndef __wasm__
+// OCCT 8.0 blend solvers share mutable scratch state across otherwise independent shapes.
+// Keep this gate specific to their builders; tessellation and other operations stay parallel.
+static std::timed_mutex edge_blend_mutex;
+#endif
 
 std::unique_ptr<TopoDS_Shape> builder_fillet(
     const TopoDS_Shape& solid,
@@ -5444,6 +5505,12 @@ std::unique_ptr<TopoDS_Shape> builder_fillet(
 {
     try {
         if (rust_progress_cancelled(progress)) return nullptr;
+#ifndef __wasm__
+        std::unique_lock<std::timed_mutex> blend_lock(edge_blend_mutex, std::defer_lock);
+        while (!blend_lock.try_lock_for(std::chrono::milliseconds(10))) {
+            if (rust_progress_cancelled(progress)) return nullptr;
+        }
+#endif
         if (edges.empty()) {
             // No-op: shallow copy; every face is identity.
             std::unordered_map<uint64_t, uint64_t> relay;
@@ -5512,6 +5579,12 @@ std::unique_ptr<TopoDS_Shape> builder_chamfer(
 {
     try {
         if (rust_progress_cancelled(progress)) return nullptr;
+#ifndef __wasm__
+        std::unique_lock<std::timed_mutex> blend_lock(edge_blend_mutex, std::defer_lock);
+        while (!blend_lock.try_lock_for(std::chrono::milliseconds(10))) {
+            if (rust_progress_cancelled(progress)) return nullptr;
+        }
+#endif
         if (edges.empty()) {
             // No-op: shallow copy; every face is identity.
             std::unordered_map<uint64_t, uint64_t> relay;

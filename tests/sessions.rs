@@ -66,3 +66,40 @@ fn prepared_face_edit_retains_source_face_and_boundary() {
 	assert_eq!(session.boundary().len(), 4);
 	assert!(matches!(cube.prepare_face_edit(u32::MAX), Err(Error::InvalidEdge(_))));
 }
+
+#[test]
+fn independent_composed_blends_do_not_interfere_across_native_threads() {
+	let ready = std::sync::Barrier::new(4);
+	std::thread::scope(|scope| {
+		let tasks = (0..4)
+			.map(|worker| {
+				let ready = &ready;
+				scope.spawn(move || {
+					ready.wait();
+					for _ in 0..4 {
+						let source = Solid::cube(DVec3::new(-10.0, -10.0, 0.0), DVec3::new(20.0, 10.0, 20.0));
+						let facts = source.topology_snapshot_with_options(cadrum::TopologyQueryOptions::MEASUREMENT).unwrap();
+						let cap = (0..facts.face_ids().len() as u32).find(|face| facts.face_facts(*face).unwrap().normal.is_some_and(|normal| normal[0] > 0.99)).unwrap();
+						let rounded = source.fillet_edges(2.0, facts.face_edges(cap).unwrap().iter().map(|index| source.iter_edge().nth(*index as usize).unwrap())).unwrap();
+						let facts = rounded.topology_snapshot_with_options(cadrum::TopologyQueryOptions::MEASUREMENT).unwrap();
+						let chain = (0..facts.edge_ids().len() as u32)
+							.filter(|index| {
+								let edge = facts.edge_facts(*index).unwrap();
+								edge.midpoint.is_some_and(|point| point[1] > 8.0 && point[2] > 18.0) && edge.tangent.is_some_and(|tangent| tangent[0].abs() > 0.1)
+							})
+							.collect::<Vec<_>>();
+						assert_eq!(chain.len(), 2);
+						let session = rounded.prepare_edge_blend(&chain).unwrap();
+						let radius = 0.25 * (worker + 1) as f64;
+						let blended = session.update(EdgeBlendKind::Fillet, radius, &CancellationToken::new()).unwrap();
+						assert!(blended.validate().unwrap().valid);
+						assert!(blended.volume() < rounded.volume() && blended.volume() > rounded.volume() * 0.98);
+					}
+				})
+			})
+			.collect::<Vec<_>>();
+		for task in tasks {
+			task.join().unwrap();
+		}
+	});
+}
