@@ -2930,6 +2930,17 @@ static bool map_to_bspline_chart(
     return true;
 }
 
+static bool is_internal_brep_wire(const TopoDS_Wire& wire) {
+    if (wire.Orientation() == TopAbs_INTERNAL) return true;
+    bool has_edge = false;
+    for (TopExp_Explorer explorer(wire, TopAbs_EDGE);
+         explorer.More(); explorer.Next()) {
+        if (explorer.Current().Orientation() != TopAbs_INTERNAL) return false;
+        has_edge = true;
+    }
+    return has_edge;
+}
+
 static bool append_face_trim_loops(
     const TopoDS_Face& face,
     const BrepSurfaceChart& chart,
@@ -2959,6 +2970,8 @@ static bool append_face_trim_loops(
          wire_iterator.More(); wire_iterator.Next()) {
         if (rust_progress_cancelled(progress)) return false;
         const TopoDS_Wire wire = TopoDS::Wire(wire_iterator.Current());
+        // Internal wires lie inside the face and do not trim its surface domain.
+        if (is_internal_brep_wire(wire)) continue;
         if (wire.Orientation() != TopAbs_FORWARD
             && wire.Orientation() != TopAbs_REVERSED) {
             return fail(
@@ -3473,10 +3486,10 @@ BrepMeshSourceData extract_brep_mesh_source(
             if (rust_progress_cancelled(progress)) return result;
             const int copied_ordinal = copied_edge_ordinals_by_source_index[
                 static_cast<size_t>(index - 1)];
-            const TopoDS_Edge edge = TopoDS::Edge(edges(copied_ordinal));
-            if ((edge.Orientation() != TopAbs_FORWARD
-                    && edge.Orientation() != TopAbs_REVERSED)
-                || !sample_brep_edge(
+            // Canonical samples follow curve parameters, independently of face-use orientation.
+            const TopoDS_Edge edge = TopoDS::Edge(
+                edges(copied_ordinal).Oriented(TopAbs_FORWARD));
+            if (!sample_brep_edge(
                     edge,
                     edge_linear,
                     edge_angular,
@@ -3515,6 +3528,7 @@ BrepMeshSourceData extract_brep_mesh_source(
                 for (TopExp_Explorer wire_iterator(face, TopAbs_WIRE);
                      wire_iterator.More(); wire_iterator.Next()) {
                     const TopoDS_Wire wire = TopoDS::Wire(wire_iterator.Current());
+                    if (is_internal_brep_wire(wire)) continue;
                     if (wire.Orientation() != TopAbs_FORWARD
                         && wire.Orientation() != TopAbs_REVERSED) {
                         return result;
