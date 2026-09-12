@@ -408,6 +408,7 @@ pub(crate) fn operation_error(fallback: Error, operation: &'static str, stage: &
 pub struct CancellationToken {
 	cancelled: Arc<AtomicBool>,
 	progress_bits: Arc<AtomicU64>,
+	check: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 impl CancellationToken {
@@ -420,7 +421,13 @@ impl CancellationToken {
 	}
 
 	pub fn is_cancelled(&self) -> bool {
-		self.cancelled.load(Ordering::Acquire)
+		self.cancelled.load(Ordering::Acquire) || self.check.as_ref().is_some_and(|check| check())
+	}
+
+	/// Adds a request-local check without cancelling the parent when it expires.
+	pub fn with_cancellation_check(&self, check: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+		let parent_check = self.check.clone();
+		Self { cancelled: self.cancelled.clone(), progress_bits: self.progress_bits.clone(), check: Some(Arc::new(move || parent_check.as_ref().is_some_and(|parent| parent()) || check())) }
 	}
 
 	pub fn progress(&self) -> f64 {

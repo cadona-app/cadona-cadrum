@@ -92,3 +92,21 @@ fn cancellation_after_source_extraction_stops_rust_refinement() {
 	let later = Solid::cube(DVec3::ZERO, DVec3::splat(10.0));
 	assert!(!Solid::mesh_chunks([&later], Tessellation::default()).expect("later tessellation").faces.is_empty());
 }
+
+#[test]
+fn local_check_does_not_cancel_its_parent_or_siblings() {
+	let parent = CancellationToken::new();
+	let expired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+	let check = expired.clone();
+	let child = parent.with_cancellation_check(move || check.load(std::sync::atomic::Ordering::Relaxed));
+	let nested = child.with_cancellation_check(|| false);
+	let sibling = parent.with_cancellation_check(|| false);
+	assert!(!child.is_cancelled());
+	expired.store(true, std::sync::atomic::Ordering::Relaxed);
+	assert!(child.is_cancelled());
+	assert!(nested.is_cancelled());
+	assert!(!parent.is_cancelled());
+	assert!(!sibling.is_cancelled());
+	parent.cancel();
+	assert!(sibling.is_cancelled());
+}
