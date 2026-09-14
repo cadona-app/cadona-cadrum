@@ -1,3 +1,4 @@
+#include <BRepBuilderAPI_FindPlane.hxx>
 #include <Geom_ConicalSurface.hxx>
 #include <Geom_TrimmedCurve.hxx>
 #include <Geom2d_BSplineCurve.hxx>
@@ -6455,6 +6456,112 @@ bool write_step_stream(const TopoDS_Shape& shape, RustWriter& writer) {
     return step_writer.WriteStream(os) == IFSelect_RetDone;
 }
 #endif // !FEATURE_COLOR
+
+std::unique_ptr<std::vector<TopoDS_Shape>> builder_split_body(
+    const TopoDS_Shape& solid, rust::Slice<const double> planes,
+    const std::vector<TopoDS_Face>& faces, const std::vector<TopoDS_Edge>& edges,
+    rust::Slice<const uint32_t> group_sizes, rust::Slice<const double> directions,
+    const CancellationToken& progress, rust::Vec<HistoryData>& histories)
+{
+    try {
+        if (planes.size() % 6 || directions.size() != group_sizes.size() * 3
+            || edges.size() > 20000 || planes.size() / 6 + faces.size() + group_sizes.size() > 64)
+            return nullptr;
+        Bnd_Box bounds;
+        BRepBndLib::AddOptimal(solid, bounds, false, false);
+        if (bounds.IsVoid()) return nullptr;
+        const gp_Pnt low = bounds.CornerMin(), high = bounds.CornerMax();
+        const gp_Pnt center((low.X()+high.X())/2, (low.Y()+high.Y())/2, (low.Z()+high.Z())/2);
+        const double span = low.Distance(high) + 1.0;
+        BOPAlgo_Splitter splitter;
+        splitter.AddArgument(solid);
+        splitter.SetNonDestructive(true);
+        auto add_plane = [&](const gp_Pln& plane) {
+            const double reach = span + center.Distance(plane.Location());
+            BRepBuilderAPI_MakeFace face(plane, -reach, reach, -reach, reach);
+            if (!face.IsDone()) throw Standard_Failure("Cannot construct the splitting plane");
+            splitter.AddTool(face.Face());
+        };
+        for (size_t i=0; i<planes.size(); i+=6) {
+            for (size_t j=i; j<i+6; ++j) if (!std::isfinite(planes[j])) return nullptr;
+            add_plane(gp_Pln(gp_Pnt(planes[i],planes[i+1],planes[i+2]), gp_Dir(planes[i+3],planes[i+4],planes[i+5])));
+        }
+        for (const auto& face : faces) {
+            BRepAdaptor_Surface adaptor(face);
+            if (adaptor.GetType() == GeomAbs_Plane) {
+                add_plane(adaptor.Plane());
+            } else {
+                auto surface = unwrapped_brep_surface(BRep_Tool::Surface(face));
+                BRepBuilderAPI_MakeFace extended(surface, Precision::Confusion());
+                if (!extended.IsDone()) throw Standard_Failure("Cannot extend this face as a splitting surface");
+                splitter.AddTool(extended.Face());
+            }
+        }
+        size_t cursor = 0;
+        for (size_t group=0; group<group_sizes.size(); ++group) {
+            const size_t count = group_sizes[group];
+            if (!count || cursor+count>edges.size()) return nullptr;
+            gp_Vec direction(directions[group*3],directions[group*3+1],directions[group*3+2]);
+            if (direction.SquareMagnitude() == 0.0) {
+                TopoDS_Compound wire;
+                BRep_Builder builder; builder.MakeCompound(wire);
+                for (size_t j=0;j<count;++j) builder.Add(wire,edges[cursor+j]);
+                std::vector<gp_Pnt> samples;
+                for (size_t j=0;j<count;++j) {
+                    BRepAdaptor_Curve curve(edges[cursor+j]);
+                    for (int k=0;k<5;++k)
+                        samples.push_back(curve.Value(curve.FirstParameter()+(curve.LastParameter()-curve.FirstParameter())*k/4));
+                }
+                const auto origin = samples.front();
+                gp_Vec baseline;
+                bool defines_plane = false;
+                for (const auto& point : samples) {
+                    gp_Vec delta(origin, point);
+                    if (baseline.Magnitude() < 1.0e-6 && delta.Magnitude() >= 1.0e-6)
+                        baseline = delta.Normalized();
+                    if (baseline.Magnitude() > 0 && baseline.Crossed(delta).Magnitude() > 1.0e-6)
+                        defines_plane = true;
+                }
+                if (!defines_plane) throw Standard_Failure("Select non-collinear coplanar edges to define a plane");
+                BRepBuilderAPI_FindPlane fit(wire,1.0e-6);
+                if (!fit.Found()) throw Standard_Failure("Select coplanar edges that define a plane");
+                add_plane(fit.Plane()->Pln());
+            } else {
+                direction.Normalize();
+                for (size_t j=0;j<count;++j) {
+                    Bnd_Box edge_bounds; BRepBndLib::AddOptimal(edges[cursor+j],edge_bounds,false,false);
+                    const double reach = span + center.Distance(edge_bounds.CornerMin()) + center.Distance(edge_bounds.CornerMax());
+                    gp_Trsf shift; shift.SetTranslation(direction * -reach);
+                    TopoDS_Shape moved = edges[cursor+j].Moved(TopLoc_Location(shift));
+                    BRepPrimAPI_MakePrism prism(moved,direction*(2*reach),false,true);
+                    if (!prism.IsDone()) throw Standard_Failure("Cannot extend these sketch curves");
+                    splitter.AddTool(prism.Shape());
+                }
+            }
+            cursor += count;
+            if (rust_progress_cancelled(progress)) return nullptr;
+        }
+        if (cursor != edges.size() || (planes.empty() && faces.empty() && edges.empty())) return nullptr;
+        Handle(RustProgressIndicator) indicator = new RustProgressIndicator(progress);
+        splitter.Perform(indicator->Start());
+        if (splitter.HasErrors() || rust_progress_cancelled(progress)) return nullptr;
+        auto result = std::make_unique<std::vector<TopoDS_Shape>>();
+        for (TopExp_Explorer ex(splitter.Shape(),TopAbs_SOLID);ex.More();ex.Next()) {
+            const auto piece = ex.Current();
+            if (!BRepCheck_Analyzer(piece).IsValid()) return nullptr;
+            result->push_back(piece);
+            HistoryData history;
+            append_builder_topology_history(splitter,solid,0,HistoryMaps(piece),history);
+            finish_topology_history(HistoryMaps(piece),history);
+            histories.push_back(std::move(history));
+            if (result->size()>256) return nullptr;
+        }
+        return result;
+    } catch (const Standard_Failure& failure) {
+        record_standard_failure(__func__,"split body",7,failure);
+        return nullptr;
+    }
+}
 
 std::unique_ptr<TopoDS_Shape> builder_wrap_emboss(
     const TopoDS_Shape& solid, const TopoDS_Face& target,

@@ -650,6 +650,44 @@ impl Solid {
 		.with_topology_history(topology_history))
 	}
 
+	/// Split with extended planes, surfaces, and extruded curves; zero directions fit edge planes.
+	pub fn split_body_cancelable(&self, planes: &[[f64; 6]], faces: &[&Face], curves: &[(Vec<Edge>, [f64; 3])], progress: &ffi::CancellationToken) -> Result<Vec<Self>, Error> {
+		let mut face_vec = ffi::face_vec_new();
+		for face in faces {
+			ffi::face_vec_push(face_vec.pin_mut(), &face.inner);
+		}
+		let mut edges = ffi::edge_vec_new();
+		let mut sizes = Vec::new();
+		let mut directions = Vec::new();
+		for (group, direction) in curves {
+			sizes.push(group.len() as u32);
+			directions.extend_from_slice(direction);
+			for edge in group {
+				ffi::edge_vec_push(edges.pin_mut(), &edge.inner);
+			}
+		}
+		let planes = planes.iter().flatten().copied().collect::<Vec<_>>();
+		let mut histories = Vec::new();
+		ffi::begin_operation();
+		let shapes = ffi::builder_split_body(&self.inner, &planes, &face_vec, &edges, &sizes, &directions, progress, &mut histories);
+		if shapes.is_null() {
+			return Err(if progress.is_cancelled() { Error::Cancelled } else { ffi::operation_error(Error::InvalidInput("Splitting tools could not divide this body".into()), "split body", "occt_build") });
+		}
+		shapes
+			.iter()
+			.zip(histories)
+			.map(|(shape, history)| {
+				Ok(Self::new(
+					ffi::clone_shape_handle(shape),
+					#[cfg(feature = "color")]
+					self.colormap.clone(),
+					Vec::new(),
+				)
+				.with_topology_history(decode_topology_history(history)?))
+			})
+			.collect()
+	}
+
 	/// Wrap planar XY profile loops onto a cylinder or cone, then offset along its normal.
 	#[allow(clippy::too_many_arguments)]
 	pub fn wrap_emboss_cancelable(&self, face: &Face, regions: &[Vec<Vec<Edge>>], depth: f64, rotation: f64, center: [f64; 2], progress: &ffi::CancellationToken) -> Result<Self, Error> {

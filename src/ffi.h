@@ -138,6 +138,11 @@ std::unique_ptr<TopoDS_Shape> builder_thick_solid(
 	rust::Vec<uint64_t>& out_history,
 	HistoryData& out_topology_history);
 
+std::unique_ptr<std::vector<TopoDS_Shape>> builder_split_body(
+    const TopoDS_Shape& solid, rust::Slice<const double> planes,
+    const std::vector<TopoDS_Face>& faces, const std::vector<TopoDS_Edge>& edges,
+    rust::Slice<const uint32_t> group_sizes, rust::Slice<const double> directions,
+    const CancellationToken& progress, rust::Vec<HistoryData>& histories);
 std::unique_ptr<TopoDS_Shape> builder_wrap_emboss(
     const TopoDS_Shape& solid, const TopoDS_Face& face,
     const std::vector<TopoDS_Edge>& edges, rust::Slice<const uint32_t> wire_sizes,
