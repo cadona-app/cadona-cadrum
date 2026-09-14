@@ -67,3 +67,16 @@ fn supported_exact_surface_families_extract_complete_rational_snapshots() {
 		assert_extracts_boundary_contract(name, solid);
 	}
 }
+
+#[test]
+fn chart_mapping_accounts_for_the_canonical_edge_discrepancy() {
+	let errors = cadrum::occt::test_support::tessellation_chart_mapping_errors();
+	let [allowed, original, normalized_conversion, normalized_canonical, mapped_conversion, mapped_canonical] = errors.as_slice() else {
+		panic!("map the cylinder boundary back to its exact surface");
+	};
+	assert!(*original > 0.0 && original < allowed);
+	assert!(normalized_conversion < allowed, "the shortcut fits the surface alone");
+	assert!(normalized_canonical > allowed, "the shortcut must exceed the combined budget");
+	assert!(mapped_conversion <= allowed, "projected chart must fit the surface budget");
+	assert!(mapped_canonical <= allowed, "projected chart must fit the canonical edge budget");
+}

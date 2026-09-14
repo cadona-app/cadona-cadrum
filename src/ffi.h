@@ -305,6 +305,7 @@ bool test_brep_extraction_preflight_limits(
 	uint32_t maximum_control_points,
 	uint32_t maximum_knots,
 	const CancellationToken& progress);
+rust::Vec<double> test_brep_chart_mapping_errors();
 bool test_seed_occt_triangulation_cache(
 	const TopoDS_Shape& shape,
 	double linear,

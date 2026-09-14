@@ -2653,6 +2653,7 @@ static bool append_bounded_bspline_surface(
 static bool map_to_bspline_chart(
     const BrepSurfaceChart& chart,
     const gp_Pnt2d& original_uv,
+    const gp_Pnt& canonical_edge_point,
     BrepChartMapState& state,
     double geometric_tolerance,
     gp_Pnt2d& spline_uv)
@@ -2704,8 +2705,11 @@ static bool map_to_bspline_chart(
     const gp_Pnt normalized_point =
         chart.spline->Value(normalized_uv.X(), normalized_uv.Y());
     const double normalized_error = original_point.Distance(normalized_point);
+    // The chart shortcut must fit the canonical edge's budget as well as
+    // the source surface's: their existing pcurve error consumes that budget.
     if (std::isfinite(normalized_error)
-        && normalized_error <= geometric_tolerance) {
+        && normalized_error <= geometric_tolerance
+        && normalized_point.Distance(canonical_edge_point) <= geometric_tolerance) {
         spline_uv = normalized_uv;
         state.has_previous = true;
         state.original_uv = original_uv;
@@ -3094,6 +3098,7 @@ static bool append_face_trim_loops(
                     || !map_to_bspline_chart(
                         chart,
                         original_uv,
+                        sampled.points[sample_index],
                         map_state,
                         maximum_allowed_boundary_error,
                         uv)) {
@@ -4238,6 +4243,38 @@ MeshData mesh_shape_raw_occt(
         record_standard_failure(__func__, failure_stage, 7, failure);
     }
     return result;
+}
+
+rust::Vec<double> test_brep_chart_mapping_errors()
+{
+    BrepSurfaceChart chart;
+    chart.original = new Geom_CylindricalSurface(
+        gp_Ax3(gp_Pnt(0.0, 0.0, 0.0), gp_Dir(0.0, 0.0, 1.0)), 5.0);
+    chart.original_u_max = 2.0 * std::acos(-1.0);
+    chart.original_v_max = 4.0;
+    const Handle(Geom_RectangularTrimmedSurface) bounded =
+        new Geom_RectangularTrimmedSurface(
+            chart.original, 0.0, chart.original_u_max, 0.0, 4.0);
+    chart.spline = GeomConvert::SurfaceToBSplineSurface(bounded);
+    chart.spline->Bounds(
+        chart.spline_u_min, chart.spline_u_max,
+        chart.spline_v_min, chart.spline_v_max);
+    const gp_Pnt2d original_uv(0.37, 0.0);
+    const gp_Pnt source = chart.original->Value(original_uv.X(), original_uv.Y());
+    const gp_Pnt normalized = chart.spline->Value(
+        chart.spline_u_min + original_uv.X() / chart.original_u_max
+            * (chart.spline_u_max - chart.spline_u_min), chart.spline_v_min);
+    const double conversion_error = source.Distance(normalized);
+    const double allowed = conversion_error * 1.001;
+    const gp_Pnt canonical = source.Translated(gp_Vec(normalized, source) * 0.002);
+    BrepChartMapState state;
+    gp_Pnt2d mapped_uv;
+    if (!map_to_bspline_chart(chart, original_uv, canonical, state, allowed, mapped_uv)) {
+        return {};
+    }
+    const gp_Pnt mapped = chart.spline->Value(mapped_uv.X(), mapped_uv.Y());
+    return {allowed, source.Distance(canonical), conversion_error,
+        normalized.Distance(canonical), mapped.Distance(source), mapped.Distance(canonical)};
 }
 
 bool test_seed_occt_triangulation_cache(

@@ -174,3 +174,9 @@ fn extract_tessellation_source(solid: &Solid, options: Tessellation) -> Result<f
 	}
 	Ok(source)
 }
+
+/// Exercise a cylinder chart whose normalized conversion fits the source-surface
+/// budget but exceeds it when combined with a small canonical edge discrepancy.
+pub fn tessellation_chart_mapping_errors() -> Vec<f64> {
+	ffi::test_brep_chart_mapping_errors()
+}

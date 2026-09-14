@@ -297,6 +297,8 @@ mod ffi_bridge {
 		#[allow(dead_code)]
 		fn test_brep_extraction_preflight_limits(shape: &TopoDS_Shape, maximum_faces: u32, maximum_edges: u32, maximum_vertices: u32, maximum_control_points: u32, maximum_knots: u32, progress: &CancellationToken) -> bool;
 		#[allow(dead_code)]
+		fn test_brep_chart_mapping_errors() -> Vec<f64>;
+		#[allow(dead_code)]
 		fn test_seed_occt_triangulation_cache(shape: &TopoDS_Shape, linear: f64, angular: f64, relative: bool) -> bool;
 		#[allow(dead_code)]
 		fn test_occt_triangulation_cache(shape: &TopoDS_Shape) -> TriangulationCacheData;
