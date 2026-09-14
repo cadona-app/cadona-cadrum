@@ -138,6 +138,12 @@ std::unique_ptr<TopoDS_Shape> builder_thick_solid(
 	rust::Vec<uint64_t>& out_history,
 	HistoryData& out_topology_history);
 
+std::unique_ptr<TopoDS_Shape> builder_wrap_emboss(
+    const TopoDS_Shape& solid, const TopoDS_Face& face,
+    const std::vector<TopoDS_Edge>& edges, rust::Slice<const uint32_t> wire_sizes,
+    rust::Slice<const uint32_t> region_sizes, double depth, double rotation,
+    double center_x, double center_y, const CancellationToken& progress, HistoryData& history);
+
 // Fillet the given edges of `solid` with a uniform radius using
 // BRepFilletAPI_MakeFillet. Empty `edges` is a no-op (returns a shallow
 // copy of `solid`). Returns nullptr on OCCT failure (radius too large,

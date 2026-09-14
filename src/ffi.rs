@@ -251,6 +251,7 @@ mod ffi_bridge {
 		// shell/fillet/chamfer fill `out_history` with flat [post_id, src_id]
 		// pairs (same layout as builder_cells) → Solid::history + colormap remap.
 		fn builder_thick_solid(solid: &TopoDS_Shape, open_faces: &CxxVector<TopoDS_Face>, thickness: f64, progress: &CancellationToken, out_history: &mut Vec<u64>, out_topology_history: &mut HistoryData) -> UniquePtr<TopoDS_Shape>;
+		fn builder_wrap_emboss(solid: &TopoDS_Shape, face: &TopoDS_Face, edges: &CxxVector<TopoDS_Edge>, wire_sizes: &[u32], region_sizes: &[u32], depth: f64, rotation: f64, center_x: f64, center_y: f64, progress: &CancellationToken, history: &mut HistoryData) -> UniquePtr<TopoDS_Shape>;
 		fn blend_tolerances_fit(source: &TopoDS_Shape, result: &TopoDS_Shape, size: f64) -> bool;
 		fn builder_fillet(solid: &TopoDS_Shape, edges: &CxxVector<TopoDS_Edge>, radius: f64, progress: &CancellationToken, out_history: &mut Vec<u64>, out_topology_history: &mut HistoryData) -> UniquePtr<TopoDS_Shape>;
 		fn builder_chamfer(solid: &TopoDS_Shape, edges: &CxxVector<TopoDS_Edge>, distance: f64, progress: &CancellationToken, out_history: &mut Vec<u64>, out_topology_history: &mut HistoryData) -> UniquePtr<TopoDS_Shape>;

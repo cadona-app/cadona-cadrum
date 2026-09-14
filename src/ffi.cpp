@@ -1,3 +1,12 @@
+#include <Geom_ConicalSurface.hxx>
+#include <Geom_TrimmedCurve.hxx>
+#include <Geom2d_BSplineCurve.hxx>
+#include <Geom2dConvert.hxx>
+#include <GeomAPI.hxx>
+#include <Geom2dAPI_Interpolate.hxx>
+#include <BRepOffset_MakeOffset.hxx>
+#include <BRepAlgoAPI_Common.hxx>
+#include <BRepAlgoAPI_BooleanOperation.hxx>
 #include "cadrum/src/ffi.rs.h"
 
 #ifndef __wasm__
@@ -1649,15 +1658,16 @@ void shape_face_boundary_projection(const TopoDS_Shape& shape,
     }
 }
 
+// Adaptive integration resolves small curved details on much larger parent solids.
 double shape_volume(const TopoDS_Shape& shape) {
     GProp_GProps props;
-    BRepGProp::VolumeProperties(shape, props);
+    BRepGProp::VolumeProperties(shape, props, 1.0e-9);
     return props.Mass();
 }
 
 double shape_surface_area(const TopoDS_Shape& shape) {
     GProp_GProps props;
-    BRepGProp::SurfaceProperties(shape, props);
+    BRepGProp::SurfaceProperties(shape, props, 1.0e-9);
     return props.Mass();
 }
 
@@ -1665,7 +1675,7 @@ void shape_center_of_mass(const TopoDS_Shape& shape,
     double& x, double& y, double& z)
 {
     GProp_GProps props;
-    BRepGProp::VolumeProperties(shape, props);
+    BRepGProp::VolumeProperties(shape, props, 1.0e-9);
     gp_Pnt com = props.CentreOfMass();
     x = com.X(); y = com.Y(); z = com.Z();
 }
@@ -1681,7 +1691,7 @@ void shape_inertia_tensor(const TopoDS_Shape& shape,
     // folded in). Shift here with I_world = I_com + m·(|d|² I - d⊗d),
     // where d = COM vector from world origin, m = volume (uniform density).
     GProp_GProps props;
-    BRepGProp::VolumeProperties(shape, props);
+    BRepGProp::VolumeProperties(shape, props, 1.0e-9);
     gp_Mat ic = props.MatrixOfInertia();
     gp_Pnt com = props.CentreOfMass();
     double mass = props.Mass();
@@ -1953,7 +1963,7 @@ static double brep_mesh_absolute_deflection(
     // placement. An axis-aligned bounding-box diagonal changes under rotation
     // and made identical bodies receive different triangle densities.
     GProp_GProps properties;
-    BRepGProp::SurfaceProperties(shape, properties);
+    BRepGProp::SurfaceProperties(shape, properties, 1.0e-9);
     const double area = std::abs(properties.Mass());
     const double characteristic_length =
         std::isfinite(area) && area > 0.0
@@ -4473,7 +4483,7 @@ TopologyData shape_topology(const TopoDS_Shape& shape, uint32_t query_flags) {
                 const bool has_surface_properties = query_measurements
                     || (query_frames && query_geometry && surface_type == GeomAbs_Plane);
                 if (has_surface_properties) {
-                    BRepGProp::SurfaceProperties(typed_face, surface_properties);
+                    BRepGProp::SurfaceProperties(typed_face, surface_properties, 1.0e-9);
                     area = surface_properties.Mass();
                 }
                 if (query_frames) {
@@ -4785,7 +4795,7 @@ bool face_planar_frame(const TopoDS_Face& face,
         if (!planar.IsPlanar()) return false;
 
         GProp_GProps properties;
-        BRepGProp::SurfaceProperties(face, properties);
+        BRepGProp::SurfaceProperties(face, properties, 1.0e-9);
         const gp_Pnt center = properties.CentreOfMass();
         gp_Dir normal = planar.Plan().Axis().Direction();
         if (face.Orientation() == TopAbs_REVERSED) normal.Reverse();
@@ -6445,6 +6455,201 @@ bool write_step_stream(const TopoDS_Shape& shape, RustWriter& writer) {
     return step_writer.WriteStream(os) == IFSelect_RetDone;
 }
 #endif // !FEATURE_COLOR
+
+std::unique_ptr<TopoDS_Shape> builder_wrap_emboss(
+    const TopoDS_Shape& solid, const TopoDS_Face& target,
+    const std::vector<TopoDS_Edge>& edges, rust::Slice<const uint32_t> wire_sizes,
+    rust::Slice<const uint32_t> region_sizes, double depth, double rotation,
+    double center_x, double center_y, const CancellationToken& progress, HistoryData& history)
+{
+    try {
+        if (edges.empty() || edges.size() > 20000 || !std::isfinite(depth)
+            || !std::isfinite(rotation) || !std::isfinite(center_x) || !std::isfinite(center_y)) {
+            record_input_failure(__func__, "Select bounded profiles and finite dimensions"); return nullptr;
+        }
+        Handle(Geom_Surface) surface = unwrapped_brep_surface(BRep_Tool::Surface(target));
+        BRepAdaptor_Surface adaptor(target);
+        const bool cylinder = adaptor.GetType() == GeomAbs_Cylinder;
+        if (!cylinder && adaptor.GetType() != GeomAbs_Cone) {
+            record_input_failure(__func__, "Choose a cylindrical or conical face"); return nullptr;
+        }
+        double umin, umax, vmin, vmax;
+        BRepTools::UVBounds(target, umin, umax, vmin, vmax);
+        const double u0 = (umin + umax) * 0.5, v0 = (vmin + vmax) * 0.5;
+        const double radius = cylinder ? adaptor.Cylinder().Radius() : adaptor.Cone().RefRadius();
+        const double k = cylinder ? 0.0 : std::sin(adaptor.Cone().SemiAngle());
+        const double r0 = radius + v0 * k;
+        if (r0 <= 1.0e-6 || (!cylinder && std::abs(k) < 1.0e-8)) return nullptr;
+        if (std::abs(depth) >= r0 && depth < 0) {
+            record_input_failure(__func__, "Engraving depth reaches the surface axis"); return nullptr;
+        }
+        Bnd_Box bounds;
+        for (const auto& edge : edges) BRepBndLib::AddOptimal(edge, bounds, false, false);
+        double xmin, ymin, zmin, xmax, ymax, zmax;
+        bounds.Get(xmin, ymin, zmin, xmax, ymax, zmax);
+        if (std::abs(zmin) > 1.0e-5 || std::abs(zmax) > 1.0e-5) return nullptr;
+        const double cx = (xmin+xmax)*0.5, cy = (ymin+ymax)*0.5;
+        const double cs = std::cos(rotation), sn = std::sin(rotation);
+        double uv_shift=0.0;
+        auto mapped = [&](const gp_Pnt& p) {
+            const double x = cs*(p.X()-cx)-sn*(p.Y()-cy)+center_x;
+            const double y = sn*(p.X()-cx)+cs*(p.Y()-cy)+center_y;
+            if (cylinder) return gp_Pnt2d(u0+x/radius-uv_shift, v0+y);
+            const double rho0 = r0/k, sign = k > 0 ? 1.0 : -1.0;
+            const double rho = sign*std::hypot(x, y+rho0);
+            const double theta = std::atan2(x*sign, (y+rho0)*sign);
+            if (std::abs(theta/k) >= M_PI || std::abs(rho*k) < 1.0e-5)
+                throw Standard_Failure("Profile crosses the cone apex or overlaps a full turn");
+            return gp_Pnt2d(u0+theta/k-uv_shift, rho-radius/k);
+        };
+        // Move the surface seam away from the profile center without moving its geometry.
+        uv_shift=mapped(gp_Pnt(cx,cy,0)).X()-M_PI;
+        surface=Handle(Geom_Surface)::DownCast(surface->Copy());
+        surface->Rotate(cylinder ? adaptor.Cylinder().Axis() : adaptor.Cone().Axis(),uv_shift);
+        std::vector<TopoDS_Wire> wires;
+        std::vector<bool> holes;
+        for(uint32_t count:region_sizes) for(uint32_t j=0;j<count;++j) holes.push_back(j!=0);
+        if(holes.size()!=wire_sizes.size()) return nullptr;
+        double min_wrap_u=std::numeric_limits<double>::infinity(), max_wrap_u=-min_wrap_u;
+        size_t cursor=0;
+        for (uint32_t count : wire_sizes) {
+            if (count == 0 || cursor+count > edges.size()) return nullptr;
+            BRepBuilderAPI_MakeWire wire;
+            double oriented_area=0.0;
+            for (uint32_t j=0; j<count; ++j) {
+                if (rust_progress_cancelled(progress)) return nullptr;
+                const auto& edge = edges[cursor++];
+                double first, last;
+                Handle(Geom_Curve) curve = BRep_Tool::Curve(edge, first, last);
+                if (curve.IsNull()) return nullptr;
+                for(int i=0;i<64;++i) {
+                    const auto a=curve->Value(first+(last-first)*i/64), b=curve->Value(first+(last-first)*(i+1)/64);
+                    oriented_area+=(a.X()*b.Y()-b.X()*a.Y())*(edge.Orientation()==TopAbs_REVERSED?-1:1);
+                }
+                Handle(Geom2d_BSplineCurve) uv;
+                if (cylinder) {
+                    Handle(Geom_Curve) trimmed = new Geom_TrimmedCurve(curve, first, last);
+                    uv = Geom2dConvert::CurveToBSplineCurve(GeomAPI::To2d(trimmed, gp_Pln(gp::XOY())));
+                    for (int pole=1; pole<=uv->NbPoles(); ++pole) {
+                        const auto p = uv->Pole(pole);
+                        uv->SetPole(pole, mapped(gp_Pnt(p.X(),p.Y(),0)));
+                    }
+                } else {
+                    // Fit in parameter space, then verify the resulting surface curve in millimetres.
+                    for (int n=16; n<=4096; n*=2) {
+                        using HPoints2d = NCollection_HArray1<gp_Pnt2d>;
+                        using HParameters = NCollection_HArray1<double>;
+                        Handle(HPoints2d) points = new HPoints2d(1,n+1);
+                        Handle(HParameters) params = new HParameters(1,n+1);
+                        for (int i=0;i<=n;++i) {
+                            const double t=first+(last-first)*i/n;
+                            points->SetValue(i+1,mapped(curve->Value(t))); params->SetValue(i+1,t);
+                        }
+                        Geom2dAPI_Interpolate fit(points,params,false,1.0e-10); fit.Perform();
+                        if (!fit.IsDone()) return nullptr;
+                        uv=fit.Curve();
+                        bool accurate=true;
+                        for(int i=0;i<n*4;++i) {
+                            const double t=first+(last-first)*(i+0.5)/(n*4);
+                            const auto exact=mapped(curve->Value(t)), approx=uv->Value(t);
+                            if(surface->Value(exact.X(),exact.Y()).Distance(surface->Value(approx.X(),approx.Y()))>1.0e-6) { accurate=false; break; }
+                        }
+                        if(accurate) break;
+                        uv.Nullify();
+                        if(rust_progress_cancelled(progress)) return nullptr;
+                    }
+                    if(uv.IsNull()) { record_input_failure(__func__, "Surface mapping did not meet its tolerance"); return nullptr; }
+                }
+                for(int i=0;i<=64;++i) {
+                    const auto p=uv->Value(uv->FirstParameter()+(uv->LastParameter()-uv->FirstParameter())*i/64);
+                    min_wrap_u=std::min(min_wrap_u,p.X()); max_wrap_u=std::max(max_wrap_u,p.X());
+                    if(p.Y()<vmin-1.0e-6 || p.Y()>vmax+1.0e-6 || max_wrap_u-min_wrap_u>=2*M_PI-1.0e-6) {
+                        record_input_failure(__func__, "Profiles extend past the face or overlap a full turn; adjust Center or profile size"); return nullptr;
+                    }
+                }
+                BRepBuilderAPI_MakeEdge maker(uv,surface);
+                if(!maker.IsDone()) return nullptr;
+                TopoDS_Edge wrapped=maker.Edge();
+                BRepLib::BuildCurve3d(wrapped,1.0e-6);
+                if(edge.Orientation()==TopAbs_REVERSED) wrapped.Reverse();
+                wire.Add(wrapped);
+            }
+            if(!wire.IsDone() || !wire.Wire().Closed()) { record_input_failure(__func__, "Profiles must form closed loops"); return nullptr; }
+            TopoDS_Wire boundary=wire.Wire();
+            if((oriented_area>0.0)==holes[wires.size()]) boundary.Reverse();
+            wires.push_back(boundary);
+        }
+        if(cursor!=edges.size()) return nullptr;
+        BRep_Builder builder;
+        TopoDS_Compound tools; builder.MakeCompound(tools);
+        BOPAlgo_Splitter split; split.AddArgument(solid); split.SetNonDestructive(true);
+        cursor=0;
+        for(uint32_t count:region_sizes) {
+            if(count==0 || cursor+count>wires.size()) return nullptr;
+            BRepBuilderAPI_MakeFace face(surface,wires[cursor],true);
+            for(uint32_t j=1;j<count;++j) face.Add(wires[cursor+j]);
+            if(!face.IsDone()) return nullptr;
+            TopoDS_Face patch=face.Face();
+            BRepLib::SameParameter(patch,1.0e-6,true);
+            if(!BRepCheck_Analyzer(patch).IsValid()) return nullptr;
+            GProp_GProps full, clipped;
+            BRepGProp::SurfaceProperties(patch,full,1.0e-9);
+            BRepAlgoAPI_Common common;
+            NCollection_List<TopoDS_Shape> patch_args, target_args;
+            patch_args.Append(patch); target_args.Append(target);
+            common.SetArguments(patch_args); common.SetTools(target_args);
+            common.SetNonDestructive(true);
+            Handle(RustProgressIndicator) common_progress = new RustProgressIndicator(progress);
+            common.Build(common_progress->Start());
+            if(!common.IsDone()) return nullptr;
+            BRepGProp::SurfaceProperties(common.Shape(),clipped,1.0e-9);
+            if(std::abs(full.Mass()-clipped.Mass())>std::max(1.0e-6,full.Mass()*1.0e-6)) {
+                record_input_failure(__func__, "Profiles must fit entirely inside the selected face"); return nullptr;
+            }
+            if(depth==0) {
+                for(uint32_t j=0;j<count;++j) split.AddTool(wires[cursor+j]);
+            } else {
+                if(target.Orientation()==TopAbs_REVERSED) patch.Reverse();
+                BRepOffset_MakeOffset thick;
+                thick.Initialize(patch,depth,1.0e-6,BRepOffset_Skin,false,false,GeomAbs_Intersection,true);
+                Handle(RustProgressIndicator) offset_progress = new RustProgressIndicator(progress);
+                thick.MakeOffsetShape(offset_progress->Start());
+                if(!thick.IsDone() || !BRepCheck_Analyzer(thick.Shape()).IsValid()) return nullptr;
+                builder.Add(tools,thick.Shape());
+            }
+            cursor+=count;
+            if(rust_progress_cancelled(progress)) return nullptr;
+        }
+        if(cursor!=wires.size()) return nullptr;
+        TopoDS_Shape result;
+        if(depth==0) {
+            Handle(RustProgressIndicator) split_progress = new RustProgressIndicator(progress);
+            split.Perform(split_progress->Start()); if(split.HasErrors()) return nullptr;
+            result=split.Shape();
+            append_builder_topology_history(split,solid,0,HistoryMaps(result),history);
+        } else {
+            BRepAlgoAPI_BooleanOperation operation;
+            NCollection_List<TopoDS_Shape> args, operands; args.Append(solid); operands.Append(tools);
+            operation.SetArguments(args); operation.SetTools(operands);
+            operation.SetOperation(depth>0 ? BOPAlgo_FUSE : BOPAlgo_CUT);
+            operation.SetNonDestructive(true);
+            Handle(RustProgressIndicator) indicator = new RustProgressIndicator(progress);
+            operation.Build(indicator->Start());
+            if(!operation.IsDone()) return nullptr;
+            result=operation.Shape();
+            append_builder_topology_history(operation,solid,0,HistoryMaps(result),history);
+        }
+        if(rust_progress_cancelled(progress) || !BRepCheck_Analyzer(result).IsValid()) return nullptr;
+        TopExp_Explorer solids(result,TopAbs_SOLID);
+        if(!solids.More()) return nullptr;
+        TopoDS_Shape single=solids.Current(); solids.Next();
+        if(solids.More()) { record_input_failure(__func__, "Emboss must remain connected to one solid"); return nullptr; }
+        finish_topology_history(HistoryMaps(single),history);
+        return std::make_unique<TopoDS_Shape>(single);
+    } catch(const Standard_Failure& failure) {
+        record_standard_failure(__func__,"wrap",7,failure); return nullptr;
+    }
+}
 
 } // namespace cadrum
 

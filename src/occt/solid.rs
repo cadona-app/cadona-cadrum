@@ -650,6 +650,36 @@ impl Solid {
 		.with_topology_history(topology_history))
 	}
 
+	/// Wrap planar XY profile loops onto a cylinder or cone, then offset along its normal.
+	#[allow(clippy::too_many_arguments)]
+	pub fn wrap_emboss_cancelable(&self, face: &Face, regions: &[Vec<Vec<Edge>>], depth: f64, rotation: f64, center: [f64; 2], progress: &ffi::CancellationToken) -> Result<Self, Error> {
+		let mut edges = ffi::edge_vec_new();
+		let mut wire_sizes = Vec::new();
+		let mut region_sizes = Vec::new();
+		for region in regions {
+			region_sizes.push(region.len() as u32);
+			for wire in region {
+				wire_sizes.push(wire.len() as u32);
+				for edge in wire {
+					ffi::edge_vec_push(edges.pin_mut(), &edge.inner);
+				}
+			}
+		}
+		let mut history = empty_ffi_history();
+		ffi::begin_operation();
+		let shape = ffi::builder_wrap_emboss(&self.inner, &face.inner, &edges, &wire_sizes, &region_sizes, depth, rotation, center[0], center[1], progress, &mut history);
+		if shape.is_null() {
+			return Err(if progress.is_cancelled() { Error::Cancelled } else { ffi::operation_error(Error::InvalidInput("Cannot wrap these profiles on this face".into()), "wrap emboss", "occt_build") });
+		}
+		Ok(Solid::new(
+			shape,
+			#[cfg(feature = "color")]
+			self.colormap.clone(),
+			Vec::new(),
+		)
+		.with_topology_history(decode_topology_history(history)?))
+	}
+
 	pub fn shell_cancelable<'a>(&self, thickness: f64, open_faces: impl IntoIterator<Item = &'a Face>, progress: &ffi::CancellationToken) -> Result<Self, Error> {
 		if !thickness.is_finite() || thickness == 0.0 {
 			return Err(Error::InvalidInput("shell thickness must be finite and nonzero".into()));
