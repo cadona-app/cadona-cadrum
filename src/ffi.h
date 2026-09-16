@@ -87,6 +87,7 @@ TopologyDistanceData topology_distance(
     const TopoDS_Shape& second, uint32_t second_kind, uint32_t second_index);
 TopologyDistanceData shape_boundary_distance(
     const TopoDS_Shape& first, const TopoDS_Shape& second);
+rust::Vec<double> topology_bounds(const TopoDS_Shape& shape, uint32_t kind, uint32_t index);
 
 // ==================== Builders (solid → solid with history) ====================
 //

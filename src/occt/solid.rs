@@ -907,6 +907,21 @@ impl Solid {
 		topology_snapshot_from_shape_with_options(&self.inner, options)
 	}
 
+	/// Bounds of one exact subshape, independent of display triangulation.
+	pub fn topology_bounds(&self, target: ResultTopology) -> Result<[DVec3; 2], Error> {
+		let kind = match target.kind {
+			TopologyKind::Face => 0,
+			TopologyKind::Edge => 1,
+			TopologyKind::Vertex => 2,
+		};
+		ffi::begin_operation();
+		let values = ffi::topology_bounds(&self.inner, kind, target.index);
+		let [xmin, ymin, zmin, xmax, ymax, zmax] = values.as_slice() else {
+			return Err(ffi::operation_error(Error::TopologyQueryFailed, "topology bounds", "native"));
+		};
+		Ok([DVec3::new(*xmin, *ymin, *zmin), DVec3::new(*xmax, *ymax, *zmax)])
+	}
+
 	/// Return the exact closest points between two artifact-local entities.
 	pub fn topology_distance(&self, first: ResultTopology, other: &Self, second: ResultTopology) -> Result<TopologyDistance, Error> {
 		let kind = |value| match value {

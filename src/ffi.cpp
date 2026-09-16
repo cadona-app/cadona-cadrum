@@ -494,6 +494,27 @@ static bool indexed_subshape(
     return true;
 }
 
+rust::Vec<double> topology_bounds(const TopoDS_Shape& shape, uint32_t kind, uint32_t index) {
+    rust::Vec<double> result;
+    try {
+        TopoDS_Shape entity;
+        if (!indexed_subshape(shape, kind, index, entity)) return result;
+        Bnd_Box box;
+        // Camera bounds must not depend on cached display triangulation.
+        BRepBndLib::AddOptimal(entity, box, false, false);
+        if (box.IsVoid() || box.IsOpen()) return result;
+        double xmin, ymin, zmin, xmax, ymax, zmax;
+        box.Get(xmin, ymin, zmin, xmax, ymax, zmax);
+        for (double value : {xmin, ymin, zmin, xmax, ymax, zmax}) {
+            if (!std::isfinite(value)) return {};
+            result.push_back(value);
+        }
+    } catch (const Standard_Failure& failure) {
+        record_standard_failure(__func__, "native", 7, failure);
+    }
+    return result;
+}
+
 TopologyDistanceData topology_distance(
     const TopoDS_Shape& first,
     uint32_t first_kind,
