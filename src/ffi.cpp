@@ -5382,6 +5382,40 @@ void shape_vec_push(std::vector<TopoDS_Shape>& v, const TopoDS_Shape& s) {
     v.push_back(s);
 }
 
+std::unique_ptr<TopoDS_Shape> make_thickened_face_region(
+    const std::vector<TopoDS_Face>& faces, double distance,
+    const CancellationToken& progress)
+{
+    try {
+        if (faces.empty() || !std::isfinite(distance) || distance <= Precision::Confusion()) {
+            record_input_failure(__func__, "a face region needs positive extrusion distance");
+            return nullptr;
+        }
+        if (rust_progress_cancelled(progress)) return nullptr;
+        BRep_Builder shell_builder;
+        TopoDS_Shell shell;
+        shell_builder.MakeShell(shell);
+        for (const auto& face : faces) shell_builder.Add(shell, face);
+        // Offset builders can change tolerances; keep the source artifact immutable.
+        BRepBuilderAPI_Copy copy(shell, true, false);
+        BRepOffset_MakeOffset builder;
+        builder.Initialize(copy.Shape(), distance, 1.0e-7, BRepOffset_Skin,
+            false, false, GeomAbs_Intersection, true);
+        Handle(RustProgressIndicator) indicator = new RustProgressIndicator(progress);
+        builder.MakeOffsetShape(indicator->Start());
+        if (rust_progress_cancelled(progress)) return nullptr;
+        if (!builder.IsDone() || builder.Shape().IsNull()
+            || !BRepCheck_Analyzer(builder.Shape()).IsValid()) {
+            record_input_failure(__func__, "these faces cannot be extruded together at this distance; reduce the distance or turn off Unify adjacent faces");
+            return nullptr;
+        }
+        return std::make_unique<TopoDS_Shape>(builder.Shape());
+    } catch (const Standard_Failure& failure) {
+        record_standard_failure(__func__, "native", 7, failure);
+        return nullptr;
+    }
+}
+
 std::unique_ptr<TopoDS_Shape> builder_thick_solid(
     const TopoDS_Shape& solid,
     const std::vector<TopoDS_Face>& open_faces,

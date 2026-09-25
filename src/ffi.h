@@ -139,6 +139,10 @@ std::unique_ptr<TopoDS_Shape> builder_thick_solid(
 	rust::Vec<uint64_t>& out_history,
 	HistoryData& out_topology_history);
 
+std::unique_ptr<TopoDS_Shape> make_thickened_face_region(
+    const std::vector<TopoDS_Face>& faces, double distance,
+    const CancellationToken& progress);
+
 std::unique_ptr<std::vector<TopoDS_Shape>> builder_split_body(
     const TopoDS_Shape& solid, rust::Slice<const double> planes,
     const std::vector<TopoDS_Face>& faces, const std::vector<TopoDS_Edge>& edges,

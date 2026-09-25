@@ -718,6 +718,27 @@ impl Solid {
 		.with_topology_history(decode_topology_history(history)?))
 	}
 
+	/// Builds the exact volume between an edge-connected face region and its mitered offset.
+	pub fn extrude_face_region_cancelable(&self, face_indices: &[u32], distance: f64, progress: &ffi::CancellationToken) -> Result<Self, Error> {
+		let faces = self.iter_face().collect::<Vec<_>>();
+		let mut face_vec = ffi::face_vec_new();
+		for &index in face_indices {
+			let face = faces.get(index as usize).ok_or_else(|| Error::InvalidInput("face region index is outside the source topology".into()))?;
+			ffi::face_vec_push(face_vec.pin_mut(), &face.inner);
+		}
+		ffi::begin_operation();
+		let shape = ffi::make_thickened_face_region(&face_vec, distance, progress);
+		if shape.is_null() {
+			return Err(if progress.is_cancelled() { Error::Cancelled } else { ffi::operation_error(Error::ShellFailed, "extrude face region", "occt_build") });
+		}
+		Ok(Solid::new(
+			shape,
+			#[cfg(feature = "color")]
+			self.colormap.clone(),
+			Vec::new(),
+		))
+	}
+
 	pub fn shell_cancelable<'a>(&self, thickness: f64, open_faces: impl IntoIterator<Item = &'a Face>, progress: &ffi::CancellationToken) -> Result<Self, Error> {
 		if !thickness.is_finite() || thickness == 0.0 {
 			return Err(Error::InvalidInput("shell thickness must be finite and nonzero".into()));
