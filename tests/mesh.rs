@@ -108,31 +108,39 @@ mod svg {
 		write("svg_has_hidden_lines", &svg);
 	}
 
-	/// 球を+Xから描画したSVGと、Z軸180°回転後に+Xから描画したSVGで
-	/// polygon(面)の数が10%以上変わらないことを検証する。
-	/// 対称な球なので見え方はほぼ同じはず。
 	#[test]
-	fn rotated_sphere_face_count_stable() {
-		fn count_polygons(svg: &str) -> usize {
-			svg.matches("<polygon ").count()
+	fn rotated_sphere_preserves_projected_coverage() {
+		fn coverage(svg: &str) -> f64 {
+			svg.split("<polygon points=\"")
+				.skip(1)
+				.map(|part| {
+					let points = part
+						.split('"')
+						.next()
+						.unwrap()
+						.split_whitespace()
+						.map(|point| {
+							let (x, y) = point.split_once(',').unwrap();
+							(x.parse::<f64>().unwrap(), y.parse::<f64>().unwrap())
+						})
+						.collect::<Vec<_>>();
+					assert!(points.len() >= 3);
+					points.iter().zip(points.iter().cycle().skip(1)).take(points.len()).map(|(a, b)| a.0 * b.1 - a.1 * b.0).sum::<f64>().abs() * 0.5
+				})
+				.sum()
 		}
-
 		let shape = [Solid::sphere(5.0)];
-		let svg_a = svg_string(&shape, DVec3::X, 0.1);
-		let count_a = count_polygons(&svg_a);
-
-		let rotated = shape.map(|s| s.rotate_y(std::f64::consts::PI));
-		let svg_b = svg_string(&rotated, DVec3::X, 0.1);
-		let count_b = count_polygons(&svg_b);
-
-		assert!(count_a > 0, "元のSVGにpolygonがない");
-		assert!(count_b > 0, "回転後のSVGにpolygonがない");
-
-		write("svg_rotated_sphere_face_count_stable", &svg_a);
-		write("svg_rotated_sphere_face_count_stable_rotated", &svg_b);
-
-		let ratio = count_a as f64 / count_b as f64;
-		assert!((0.9..=1.1).contains(&ratio), "+X描画のpolygon数が回転前後で10%以上変化: {} → {} (ratio={:.3})", count_a, count_b, ratio);
+		let original = svg_string(&shape, DVec3::X, 0.1);
+		let rotated = svg_string(&shape.map(|s| s.rotate_y(std::f64::consts::PI)), DVec3::X, 0.1);
+		let expected = std::f64::consts::PI * 25.0;
+		let areas = [coverage(&original), coverage(&rotated)];
+		for area in areas {
+			assert!((area - expected).abs() / expected < 0.01, "sphere projection must cover its disk: {area}");
+		}
+		// Occlusion clipping may split equivalent projections into different polygon counts.
+		assert!((areas[0] - areas[1]).abs() / expected < 0.001);
+		write("svg_rotated_sphere_coverage", &original);
+		write("svg_rotated_sphere_coverage_rotated", &rotated);
 	}
 }
 

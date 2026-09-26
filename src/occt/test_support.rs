@@ -54,11 +54,9 @@ pub fn tessellation_rejects_invalid_boundary_direction(solid: &Solid, options: T
 	Ok(tessellation::decode_boundary_run_provenance(source).is_err())
 }
 
-/// Confirm that a vertex shared by more boundary occurrences than the fixed
-/// metadata representation can encode fails explicitly instead of dropping
-/// provenance.
-pub fn tessellation_rejects_boundary_metadata_overflow() -> bool {
-	tessellation::boundary_occurrence_metadata_overflow_is_rejected()
+/// Confirm that coincident trim junctions preserve every distinct boundary occurrence.
+pub fn tessellation_retains_boundary_junction_occurrences() -> bool {
+	tessellation::boundary_junction_occurrences_are_retained()
 }
 
 /// Exercise the exact per-face trim limits without allocating trim payloads.

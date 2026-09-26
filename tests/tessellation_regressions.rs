@@ -204,3 +204,19 @@ fn serial_and_parallel_tessellations_are_byte_identical() {
 
 	assert_eq!(parallel, serial, "parallel face scheduling must not affect mesh bytes or ordering");
 }
+
+#[test]
+fn periodic_planar_annulus_keeps_both_sides_of_its_seam() {
+	let profile = Edge::polygon(&[DVec3::new(2.0, -1.0, 0.0), DVec3::new(4.0, -1.0, 0.0), DVec3::new(4.0, 1.0, 0.0), DVec3::new(2.0, 1.0, 0.0)]).expect("annular section");
+	let spine = Edge::circle(1.0, DVec3::Y).expect("full revolution");
+	let solid = Solid::sweep(&profile, [&spine], ProfileOrient::Up(DVec3::Y)).expect("annular solid");
+	assert!((solid.volume() - 24.0 * std::f64::consts::PI).abs() < 1.0e-6);
+	let serial = Solid::mesh_chunks([&solid], presentation_options(false)).expect("serial annulus mesh");
+	assert_closed_well_shaped("periodic planar annulus", &serial, 30.0);
+	let parallel = Solid::mesh_chunks([&solid], presentation_options(true)).expect("parallel annulus mesh");
+	assert_eq!(serial.faces.len(), parallel.faces.len());
+	for (left, right) in serial.faces.iter().zip(&parallel.faces) {
+		assert_eq!(left.vertices, right.vertices);
+		assert_eq!(left.indices, right.indices);
+	}
+}

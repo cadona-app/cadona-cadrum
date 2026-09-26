@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use cadrum::{
-	occt::test_support::{tessellation_boundary_runs, tessellation_rejects_boundary_metadata_overflow, tessellation_rejects_corrupted_source_contracts, tessellation_rejects_invalid_boundary_direction, BoundaryDirection, BoundaryRun},
+	occt::test_support::{tessellation_boundary_runs, tessellation_rejects_corrupted_source_contracts, tessellation_rejects_invalid_boundary_direction, tessellation_retains_boundary_junction_occurrences, BoundaryDirection, BoundaryRun},
 	DVec3, Edge, ProfileOrient, Solid, Tessellation, TopologyQueryOptions,
 };
 
@@ -29,8 +29,8 @@ fn decoder_rejects_invalid_occurrence_direction_metadata() {
 }
 
 #[test]
-fn boundary_occurrence_metadata_overflow_is_rejected_explicitly() {
-	assert!(tessellation_rejects_boundary_metadata_overflow());
+fn boundary_junctions_retain_every_distinct_occurrence() {
+	assert!(tessellation_retains_boundary_junction_occurrences());
 }
 
 #[test]

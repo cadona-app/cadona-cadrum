@@ -602,6 +602,15 @@ fn solve_planar_jacobian(du: DVec2, dv: DVec2, residual: DVec2) -> Option<DVec2>
 	solution.is_finite().then_some(solution)
 }
 
+// A world-plane chart identifies the two UV sides of a periodic seam.
+// Keep those occurrences separate until the completed mesh is welded.
+fn has_periodic_trim_seam(face: &TrimmedFace) -> bool {
+	face.loops.iter().any(|boundary| {
+		let runs = boundary_edge_runs(boundary);
+		runs.iter().enumerate().any(|(index, run)| runs[..index].iter().any(|other| run.first().zip(other.first()).is_some_and(|(a, b)| a.edge_index == b.edge_index && a.edge_occurrence_index != b.edge_occurrence_index)))
+	})
+}
+
 #[derive(Clone, Copy, Debug)]
 enum FaceChart {
 	Curved(MetricMap),
@@ -610,7 +619,7 @@ enum FaceChart {
 
 impl FaceChart {
 	fn from_face(face: &TrimmedFace) -> Option<Self> {
-		if face.surface.is_planar() {
+		if face.surface.is_planar() && !has_periodic_trim_seam(face) {
 			PlanarChart::from_face(face).map(Self::Planar)
 		} else {
 			Some(Self::Curved(MetricMap::from_face(face)))
@@ -641,12 +650,12 @@ impl FaceChart {
 	}
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct ParametricVertex {
 	uv: DVec2,
 	metric: Point2<f64>,
 	boundary_position: Option<DVec3>,
-	boundary_occurrences: [Option<BoundaryOccurrence>; 2],
+	boundary_occurrences: Vec<BoundaryOccurrence>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -657,15 +666,11 @@ struct BoundaryOccurrence {
 }
 
 impl ParametricVertex {
-	fn add_boundary_occurrence(&mut self, occurrence: BoundaryOccurrence) -> Result<(), Error> {
-		if self.boundary_occurrences.contains(&Some(occurrence)) {
-			return Ok(());
-		}
-		if let Some(slot) = self.boundary_occurrences.iter_mut().find(|slot| slot.is_none()) {
-			*slot = Some(occurrence);
-			Ok(())
-		} else {
-			Err(Error::TriangulationFailed)
+	fn add_boundary_occurrence(&mut self, occurrence: BoundaryOccurrence) {
+		// Periodic seams and coincident trim junctions can contribute more than two runs.
+		// The face trim-vertex quota bounds the total number of these records.
+		if !self.boundary_occurrences.contains(&occurrence) {
+			self.boundary_occurrences.push(occurrence);
 		}
 	}
 }
@@ -1232,7 +1237,7 @@ fn mesh_face(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::Canc
 	// no longer reliable; route only that numerical corner through the tensor
 	// mesher. Keeping the exception narrow preserves ordinary rigid-placement
 	// equivalence for planar sweeps.
-	if !planar || face.surface.needs_world_stable_planar_route() {
+	if !planar || face.surface.needs_world_stable_planar_route() || has_periodic_trim_seam(face) {
 		let structured_mesh = match mesh_structured_patch(face, linear, angular, progress) {
 			Ok(mesh) => mesh,
 			// A rejected structured candidate must still reach the boundary-preserving CDT.
@@ -1272,15 +1277,11 @@ fn mesh_face(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::Canc
 			let handle = if let Some(existing) = triangulation.locate_vertex(metric_position) {
 				let existing = existing.fix();
 				for occurrence in boundary_occurrences.into_iter().flatten() {
-					triangulation.vertex_data_mut(existing).add_boundary_occurrence(occurrence).inspect_err(|_| {
-						if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
-							eprintln!("custom tessellation face {} boundary vertex {index} of loop {loop_index} exceeded occurrence capacity at metric position {metric_position:?}", face.index);
-						}
-					})?;
+					triangulation.vertex_data_mut(existing).add_boundary_occurrence(occurrence);
 				}
 				existing
 			} else {
-				triangulation.insert(ParametricVertex { uv: boundary.uv, metric: metric_position, boundary_position: Some(boundary.position), boundary_occurrences }).map_err(|error| {
+				triangulation.insert(ParametricVertex { uv: boundary.uv, metric: metric_position, boundary_position: Some(boundary.position), boundary_occurrences: boundary_occurrences.into_iter().flatten().collect() }).map_err(|error| {
 					if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
 						eprintln!("custom tessellation face {} could not insert boundary vertex {index} of loop {loop_index} at metric position {metric_position:?}: {error:?}", face.index);
 					}
@@ -1327,8 +1328,8 @@ fn mesh_face(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::Canc
 		Error::TriangulationFailed
 	})?;
 
-	if planar {
-		triangulation = seed_best_planar_lattice(face, chart, linear, &insertion_domain, triangulation, progress)?;
+	if matches!(chart, FaceChart::Planar(_)) {
+		triangulation = seed_best_planar_lattice(face, chart, linear, angular, &insertion_domain, triangulation, progress)?;
 	} else {
 		seed_structured_patch(face, chart, &insertion_domain, &mut triangulation)?;
 		seed_boundary_collar(face, chart, &insertion_domain, &mut triangulation)?;
@@ -1346,93 +1347,102 @@ fn mesh_face(face: &TrimmedFace, linear: f64, angular: f64, progress: &ffi::Canc
 			if triangulation.num_vertices() >= MAXIMUM_CDT_FACE_VERTICES {
 				return Err(resource_limit("tessellation face exceeded the CDT vertex limit"));
 			}
-			insert_interior_vertex(face, &mut triangulation, center, chart, &insertion_domain);
+			insert_interior_vertex(face, &mut triangulation, center, chart, &insertion_domain, insertion_domain.minimum_site_spacing);
 		}
 	}
 
 	let usable_linear = (linear - face.surface.approximation_error).max(linear * 0.20).max(1.0e-10);
-	let mut required_passes = 0;
-	let mut quality_passes = 0;
-	let mut required_insertions = 0;
-	let mut quality_insertions = 0;
-	loop {
-		if progress.is_cancelled() {
-			return Err(Error::Cancelled);
+	// Preserve accepted coarse meshes; only failed audits need finer mandatory probes.
+	for fine_refinement in [false, true] {
+		let mut required_passes = 0;
+		let mut quality_passes = 0;
+		let mut required_insertions = 0;
+		let mut quality_insertions = 0;
+		loop {
+			if progress.is_cancelled() {
+				return Err(Error::Cancelled);
+			}
+			let mut candidates = refinement_candidates(face, &triangulation, usable_linear, angular.max(1.0e-3), fine_refinement, progress).map_err(|error| {
+				if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+					eprintln!("custom tessellation face {} could not evaluate trimmed CDT refinement candidates: {error:?}", face.index);
+				}
+				error
+			})?;
+			if planar {
+				candidates.retain(|candidate| candidate.required);
+			}
+			if candidates.is_empty() {
+				if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+					eprintln!("custom tessellation face {} refinement stopped: no candidates", face.index);
+				}
+				break;
+			}
+			if triangulation.num_vertices() >= MAXIMUM_CDT_FACE_VERTICES {
+				return Err(resource_limit("tessellation face exceeded the CDT vertex limit"));
+			}
+			let refining_required_error = candidates.iter().any(|candidate| candidate.required);
+			candidates.retain(|candidate| candidate.required == refining_required_error);
+			candidates.sort_by(|first, second| second.required.cmp(&first.required).then_with(|| second.linear_required.cmp(&first.linear_required)).then_with(|| second.score.total_cmp(&first.score)).then_with(|| first.uv.x.total_cmp(&second.uv.x)).then_with(|| first.uv.y.total_cmp(&second.uv.y)));
+			let (passes, insertion_count, maximum_passes, maximum_total, maximum_per_pass) = if refining_required_error { (&mut required_passes, &mut required_insertions, MAXIMUM_REQUIRED_REFINEMENT_PASSES, MAXIMUM_REQUIRED_INSERTIONS, MAXIMUM_REQUIRED_INSERTIONS_PER_PASS) } else { (&mut quality_passes, &mut quality_insertions, MAXIMUM_QUALITY_REFINEMENT_PASSES, MAXIMUM_QUALITY_INSERTIONS, MAXIMUM_QUALITY_INSERTIONS_PER_PASS) };
+			if *passes >= maximum_passes || *insertion_count >= maximum_total {
+				if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+					eprintln!("custom tessellation face {} refinement stopped: pass/insertion limit with {} candidates", face.index, candidates.len());
+				}
+				break;
+			}
+			*passes += 1;
+			let before = triangulation.num_vertices();
+			let room = MAXIMUM_CDT_FACE_VERTICES - before;
+			let maximum_insertions = maximum_per_pass.min(maximum_total - *insertion_count);
+			let mut seen_candidates = BTreeSet::new();
+			for (index, candidate) in candidates.into_iter().filter(|candidate| seen_candidates.insert((candidate.uv.x.to_bits(), candidate.uv.y.to_bits()))).take(maximum_insertions.min(room)).enumerate() {
+				if index.is_multiple_of(CANCELLATION_CHECK_INTERVAL) {
+					check_cancelled(progress)?;
+				}
+				// Seed spacing must not veto refinement required by the final quality audit.
+				let spacing = if fine_refinement && (candidate.linear_required || !candidate.required) { insertion_domain.numeric_boundary_clearance() } else { insertion_domain.minimum_site_spacing };
+				insert_interior_vertex(face, &mut triangulation, candidate.uv, chart, &insertion_domain, spacing);
+			}
+			let inserted = triangulation.num_vertices() - before;
+			*insertion_count += inserted;
+			if inserted == 0 {
+				if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+					eprintln!("custom tessellation face {} refinement stopped: all selected candidates were blocked by insertion spacing", face.index);
+				}
+				break;
+			}
 		}
-		let mut candidates = refinement_candidates(face, &triangulation, usable_linear, angular.max(1.0e-3), progress).map_err(|error| {
+		if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
+			eprintln!("custom tessellation face {} refinement totals: required {required_passes} passes/{required_insertions} insertions, quality {quality_passes} passes/{quality_insertions} insertions, {} vertices", face.index, triangulation.num_vertices());
+		}
+		let mesh = build_face_mesh(face, &triangulation, progress).map_err(|error| {
 			if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
-				eprintln!("custom tessellation face {} could not evaluate trimmed CDT refinement candidates: {error:?}", face.index);
+				eprintln!("custom tessellation face {} could not build its trimmed CDT mesh: {error:?}", face.index);
 			}
 			error
 		})?;
-		if planar {
-			candidates.retain(|candidate| candidate.required);
-		}
-		if candidates.is_empty() {
+		let satisfies_tolerances = mesh_satisfies_tolerances(face, &mesh, linear, angular, progress).map_err(|error| {
 			if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
-				eprintln!("custom tessellation face {} refinement stopped: no candidates", face.index);
+				eprintln!("custom tessellation face {} could not validate its trimmed CDT mesh tolerances: {error:?}", face.index);
 			}
-			break;
-		}
-		if triangulation.num_vertices() >= MAXIMUM_CDT_FACE_VERTICES {
-			return Err(resource_limit("tessellation face exceeded the CDT vertex limit"));
-		}
-		let refining_required_error = candidates.iter().any(|candidate| candidate.required);
-		candidates.retain(|candidate| candidate.required == refining_required_error);
-		candidates.sort_by(|first, second| second.required.cmp(&first.required).then_with(|| second.linear_required.cmp(&first.linear_required)).then_with(|| second.score.total_cmp(&first.score)).then_with(|| first.uv.x.total_cmp(&second.uv.x)).then_with(|| first.uv.y.total_cmp(&second.uv.y)));
-		let (passes, insertion_count, maximum_passes, maximum_total, maximum_per_pass) = if refining_required_error { (&mut required_passes, &mut required_insertions, MAXIMUM_REQUIRED_REFINEMENT_PASSES, MAXIMUM_REQUIRED_INSERTIONS, MAXIMUM_REQUIRED_INSERTIONS_PER_PASS) } else { (&mut quality_passes, &mut quality_insertions, MAXIMUM_QUALITY_REFINEMENT_PASSES, MAXIMUM_QUALITY_INSERTIONS, MAXIMUM_QUALITY_INSERTIONS_PER_PASS) };
-		if *passes >= maximum_passes || *insertion_count >= maximum_total {
+			error
+		})?;
+		if !satisfies_tolerances {
+			if !fine_refinement {
+				continue;
+			}
 			if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
-				eprintln!("custom tessellation face {} refinement stopped: pass/insertion limit with {} candidates", face.index, candidates.len());
+				eprintln!("custom tessellation face {} rejected its trimmed CDT mesh because it exceeds tessellation tolerances", face.index);
 			}
-			break;
+			return Err(Error::TriangulationFailed);
 		}
-		*passes += 1;
-		let before = triangulation.num_vertices();
-		let room = MAXIMUM_CDT_FACE_VERTICES - before;
-		let maximum_insertions = maximum_per_pass.min(maximum_total - *insertion_count);
-		let mut seen_candidates = BTreeSet::new();
-		for (index, candidate) in candidates.into_iter().filter(|candidate| seen_candidates.insert((candidate.uv.x.to_bits(), candidate.uv.y.to_bits()))).take(maximum_insertions.min(room)).enumerate() {
-			if index.is_multiple_of(CANCELLATION_CHECK_INTERVAL) {
-				check_cancelled(progress)?;
-			}
-			insert_interior_vertex(face, &mut triangulation, candidate.uv, chart, &insertion_domain);
-		}
-		let inserted = triangulation.num_vertices() - before;
-		*insertion_count += inserted;
-		if inserted == 0 {
-			if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
-				eprintln!("custom tessellation face {} refinement stopped: all selected candidates were numerical duplicates", face.index);
-			}
-			break;
-		}
-	}
-	if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
-		eprintln!("custom tessellation face {} refinement totals: required {required_passes} passes/{required_insertions} insertions, quality {quality_passes} passes/{quality_insertions} insertions, {} vertices", face.index, triangulation.num_vertices());
-	}
-	let mesh = build_face_mesh(face, &triangulation, progress).map_err(|error| {
 		if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
-			eprintln!("custom tessellation face {} could not build its trimmed CDT mesh: {error:?}", face.index);
+			eprintln!("custom tessellation face {} trimmed CDT result: {} vertices, {} triangles", face.index, mesh.vertices.len(), mesh.indices.len() / 3);
+			diagnose_meshed_face(&mesh);
 		}
-		error
-	})?;
-	let satisfies_tolerances = mesh_satisfies_tolerances(face, &mesh, linear, angular, progress).map_err(|error| {
-		if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
-			eprintln!("custom tessellation face {} could not validate its trimmed CDT mesh tolerances: {error:?}", face.index);
-		}
-		error
-	})?;
-	if !satisfies_tolerances {
-		if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
-			eprintln!("custom tessellation face {} rejected its trimmed CDT mesh because it exceeds tessellation tolerances", face.index);
-		}
-		return Err(Error::TriangulationFailed);
+		return Ok(mesh);
 	}
-	if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
-		eprintln!("custom tessellation face {} trimmed CDT result: {} vertices, {} triangles", face.index, mesh.vertices.len(), mesh.indices.len() / 3);
-		diagnose_meshed_face(&mesh);
-	}
-	Ok(mesh)
+	Err(Error::TriangulationFailed)
 }
 
 fn boundary_vertex_occurrences(loop_index: u32, trim_loop: &TrimLoop, index: usize) -> [Option<BoundaryOccurrence>; 2] {
@@ -3767,7 +3777,7 @@ fn seed_structured_patch(face: &TrimmedFace, chart: FaceChart, insertion_domain:
 			v_intervals = (v_intervals / 2).max(1);
 		}
 	}
-	let mut budget = SeedInsertionBudget::new(MAXIMUM_STRUCTURED_SEED_INSERTIONS, "structured seed");
+	let mut budget = SeedInsertionBudget::new(MAXIMUM_STRUCTURED_SEED_INSERTIONS, "structured seed", insertion_domain.minimum_site_spacing);
 	for v_index in 1..v_intervals {
 		let v = v_min + v_range * v_index as f64 / v_intervals as f64;
 		for u_index in 1..u_intervals {
@@ -3793,7 +3803,7 @@ fn seed_structured_patch(face: &TrimmedFace, chart: FaceChart, insertion_domain:
 /// while their spacing supplies the boundary-size field that a patch-aware
 /// mesher needs.
 fn seed_boundary_collar(face: &TrimmedFace, chart: FaceChart, insertion_domain: &InsertionDomain, triangulation: &mut FaceTriangulation) -> Result<(), Error> {
-	let mut budget = SeedInsertionBudget::new(MAXIMUM_BOUNDARY_COLLAR_INSERTIONS, "boundary collar");
+	let mut budget = SeedInsertionBudget::new(MAXIMUM_BOUNDARY_COLLAR_INSERTIONS, "boundary collar", insertion_domain.minimum_site_spacing);
 	for trim_loop in &face.loops {
 		if trim_loop.vertices.len() < 3 {
 			continue;
@@ -3890,10 +3900,7 @@ impl InsertionDomain {
 		let representative_boundary_length = boundary_lengths[(boundary_lengths.len() * 3 / 5).min(boundary_lengths.len() - 1)];
 		let (minimum, maximum) = loops.iter().flatten().fold((Point2::new(f64::INFINITY, f64::INFINITY), Point2::new(f64::NEG_INFINITY, f64::NEG_INFINITY)), |(minimum, maximum), point| (Point2::new(minimum.x.min(point.x), minimum.y.min(point.y)), Point2::new(maximum.x.max(point.x), maximum.y.max(point.y))));
 		let extent = (maximum.x - minimum.x).abs().max((maximum.y - minimum.y).abs());
-		// Once two adaptive sites are many orders of magnitude closer than the
-		// requested chord tolerance, separating them cannot measurably improve the
-		// approximation. Treat them as one site to prevent an ill-conditioned
-		// surface probe from generating an asymptotic cloud of near duplicates.
+		// Keep optional probes apart; mandatory chord refinement uses numerical duplicate protection.
 		let minimum_site_spacing = (extent.max(1.0) * 1.0e-12).max(linear * 3.0);
 		(extent.is_finite() && extent > 1.0e-12 && minimum_site_spacing.is_finite()).then_some(Self { loops, minimum, maximum, extent, representative_boundary_length, minimum_site_spacing })
 	}
@@ -3909,10 +3916,6 @@ impl InsertionDomain {
 
 	fn numeric_boundary_clearance(&self) -> f64 {
 		self.extent.max(1.0) * 1.0e-10
-	}
-
-	fn duplicate_tolerance(&self) -> f64 {
-		self.minimum_site_spacing
 	}
 }
 
@@ -3982,7 +3985,7 @@ fn triangle_minimum_angle_degrees(points: [DVec3; 3]) -> Option<f64> {
 /// small, fixed pattern set is built independently and ranked by physical
 /// worst-case, p95, and mean aspect. The exact constrained boundary is cloned
 /// unchanged into every trial; only unconstrained interior points differ.
-fn seed_best_planar_lattice(face: &TrimmedFace, chart: FaceChart, linear: f64, insertion_domain: &InsertionDomain, base: FaceTriangulation, progress: &ffi::CancellationToken) -> Result<FaceTriangulation, Error> {
+fn seed_best_planar_lattice(face: &TrimmedFace, chart: FaceChart, linear: f64, angular: f64, insertion_domain: &InsertionDomain, base: FaceTriangulation, progress: &ffi::CancellationToken) -> Result<FaceTriangulation, Error> {
 	const PATTERNS: [LatticePattern; 8] = [
 		LatticePattern { angle: 0.0, x_phase: 0.0, y_phase: 0.0 },
 		LatticePattern { angle: 0.0, x_phase: 0.5, y_phase: 0.5 },
@@ -3994,11 +3997,11 @@ fn seed_best_planar_lattice(face: &TrimmedFace, chart: FaceChart, linear: f64, i
 		LatticePattern { angle: std::f64::consts::PI / 4.0, x_phase: 0.75, y_phase: 0.25 },
 	];
 
-	let mut best = None::<(PlanarMeshQuality, FaceTriangulation)>;
-	for (pattern_index, pattern) in PATTERNS.into_iter().enumerate() {
+	let mut best = None::<(bool, PlanarMeshQuality, FaceTriangulation)>;
+	for (pattern_index, (dense, pattern)) in [false, true].into_iter().flat_map(|dense| PATTERNS.into_iter().map(move |pattern| (dense, pattern))).enumerate() {
 		cancellation_checkpoint(progress, pattern_index)?;
 		let mut trial = base.clone();
-		seed_metric_lattice_pattern(face, chart, linear, insertion_domain, pattern, &mut trial)?;
+		seed_metric_lattice_pattern(face, chart, linear, insertion_domain, pattern, dense, &mut trial)?;
 		let Ok(mesh) = build_face_mesh(face, &trial, progress) else {
 			continue;
 		};
@@ -4008,14 +4011,16 @@ fn seed_best_planar_lattice(face: &TrimmedFace, chart: FaceChart, linear: f64, i
 		if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
 			eprintln!("custom tessellation face {} planar lattice pattern {pattern_index} {pattern:?}: {quality:?}", face.index);
 		}
-		if quality.meets_quality_target() {
+		let valid = mesh_satisfies_tolerances(face, &mesh, linear, angular, progress)?;
+		if valid && quality.meets_quality_target() {
 			return Ok(trial);
 		}
-		if best.as_ref().is_none_or(|(current, _)| quality.improves(*current)) {
-			best = Some((quality, trial));
+		// A soft distribution target must not outrank the mandatory mesh audit.
+		if best.as_ref().is_none_or(|(current_valid, current, _)| valid && !current_valid || valid == *current_valid && quality.improves(*current)) {
+			best = Some((valid, quality, trial));
 		}
 	}
-	let Some((_, triangulation)) = best else {
+	let Some((_, _, triangulation)) = best else {
 		if std::env::var_os("PLEX_TESSELLATION_DIAGNOSTICS").is_some() {
 			eprintln!("custom tessellation face {} found no valid seeded planar lattice; retaining its constrained boundary triangulation", face.index);
 		}
@@ -4034,10 +4039,10 @@ fn seed_best_planar_lattice(face: &TrimmedFace, chart: FaceChart, linear: f64, i
 /// exact boundary by a fraction of one cell, leaving a single graded collar
 /// for the constrained triangulation to fill.
 fn seed_metric_lattice(face: &TrimmedFace, chart: FaceChart, linear: f64, insertion_domain: &InsertionDomain, triangulation: &mut FaceTriangulation) -> Result<(), Error> {
-	seed_metric_lattice_pattern(face, chart, linear, insertion_domain, LatticePattern { angle: 0.0, x_phase: 0.0, y_phase: 0.0 }, triangulation)
+	seed_metric_lattice_pattern(face, chart, linear, insertion_domain, LatticePattern { angle: 0.0, x_phase: 0.0, y_phase: 0.0 }, false, triangulation)
 }
 
-fn seed_metric_lattice_pattern(face: &TrimmedFace, chart: FaceChart, linear: f64, insertion_domain: &InsertionDomain, pattern: LatticePattern, triangulation: &mut FaceTriangulation) -> Result<(), Error> {
+fn seed_metric_lattice_pattern(face: &TrimmedFace, chart: FaceChart, linear: f64, insertion_domain: &InsertionDomain, pattern: LatticePattern, dense: bool, triangulation: &mut FaceTriangulation) -> Result<(), Error> {
 	let Some(spacing) = insertion_domain.lattice_spacing(linear) else {
 		return Ok(());
 	};
@@ -4059,7 +4064,9 @@ fn seed_metric_lattice_pattern(face: &TrimmedFace, chart: FaceChart, linear: f64
 	if columns.saturating_mul(rows) > MAXIMUM_LATTICE_INSERTIONS {
 		return Err(resource_limit("tessellation metric lattice exceeded its seed insertion limit"));
 	}
-	let mut budget = SeedInsertionBudget::new(MAXIMUM_LATTICE_INSERTIONS, "metric lattice");
+	// A duplicate radius larger than the lattice pitch erases the planned interior size field.
+	let site_spacing = if dense { insertion_domain.minimum_site_spacing.min(linear * 0.5).min(spacing * 0.5) } else { insertion_domain.minimum_site_spacing };
+	let mut budget = SeedInsertionBudget::new(MAXIMUM_LATTICE_INSERTIONS, "metric lattice", site_spacing);
 	let boundary_clearance = spacing * 0.28;
 	for row in 0..rows {
 		let y = minimum.y + (row as f64 - 1.0 + pattern.y_phase) * row_step;
@@ -4095,13 +4102,14 @@ fn metric_point_segment_distance(point: Point2<f64>, first: Point2<f64>, second:
 }
 
 struct SeedInsertionBudget {
+	minimum_site_spacing: f64,
 	remaining: usize,
 	label: &'static str,
 }
 
 impl SeedInsertionBudget {
-	fn new(limit: usize, label: &'static str) -> Self {
-		Self { remaining: limit, label }
+	fn new(limit: usize, label: &'static str, minimum_site_spacing: f64) -> Self {
+		Self { remaining: limit, label, minimum_site_spacing }
 	}
 
 	fn insert(&mut self, face: &TrimmedFace, triangulation: &mut FaceTriangulation, uv: DVec2, chart: FaceChart, insertion_domain: &InsertionDomain) -> Result<(), Error> {
@@ -4121,12 +4129,12 @@ impl SeedInsertionBudget {
 		if triangulation.num_vertices() >= MAXIMUM_CDT_FACE_VERTICES {
 			return Err(resource_limit("tessellation face exceeded the CDT vertex limit"));
 		}
-		insert_interior_vertex(face, triangulation, uv, chart, insertion_domain);
+		insert_interior_vertex(face, triangulation, uv, chart, insertion_domain, self.minimum_site_spacing);
 		Ok(())
 	}
 }
 
-fn insert_interior_vertex(face: &TrimmedFace, triangulation: &mut FaceTriangulation, uv: DVec2, chart: FaceChart, insertion_domain: &InsertionDomain) {
+fn insert_interior_vertex(face: &TrimmedFace, triangulation: &mut FaceTriangulation, uv: DVec2, chart: FaceChart, insertion_domain: &InsertionDomain, duplicate_tolerance: f64) {
 	let Some(metric_position) = chart.map_uv(face, uv) else {
 		return;
 	};
@@ -4142,14 +4150,9 @@ fn insert_interior_vertex(face: &TrimmedFace, triangulation: &mut FaceTriangulat
 	if distance_to_boundary <= boundary_clearance {
 		return;
 	}
-	// Independent structured, lattice, and adaptive probes can describe the
-	// same interior point with adjacent floating-point values.  Spade correctly
-	// treats those as distinct coordinates, but their two zero-width cells are
-	// later removed and leave a real incidence-one cavity.  Reject only a
-	// scale-relative numerical duplicate of an existing vertex; this is orders
-	// of magnitude below any supported geometric refinement spacing.
+	// Preserve numerical duplicate protection even for mandatory surface-error probes.
+	// Near-coincident cells can leave cavities when degenerate triangles are removed.
 	let location = triangulation.locate(metric_position);
-	let duplicate_tolerance = insertion_domain.duplicate_tolerance();
 	let near_duplicate = match location {
 		PositionInTriangulation::OnVertex(_) => true,
 		PositionInTriangulation::OnEdge(edge) | PositionInTriangulation::OutsideOfConvexHull(edge) => triangulation.directed_edge(edge).vertices().into_iter().any(|vertex| metric_distance(vertex.position(), metric_position) <= duplicate_tolerance),
@@ -4163,7 +4166,7 @@ fn insert_interior_vertex(face: &TrimmedFace, triangulation: &mut FaceTriangulat
 		PositionInTriangulation::OnVertex(_) => {}
 		PositionInTriangulation::OnEdge(edge) if triangulation.directed_edge(edge).is_constraint_edge() => {}
 		_ => {
-			let _ = triangulation.insert(ParametricVertex { uv, metric: metric_position, boundary_position: None, boundary_occurrences: [None, None] });
+			let _ = triangulation.insert(ParametricVertex { uv, metric: metric_position, boundary_position: None, boundary_occurrences: Vec::new() });
 		}
 	}
 }
@@ -4199,7 +4202,7 @@ struct RefinementCandidate {
 	uv: DVec2,
 }
 
-fn refinement_candidates(face: &TrimmedFace, triangulation: &FaceTriangulation, linear: f64, angular: f64, progress: &ffi::CancellationToken) -> Result<Vec<RefinementCandidate>, Error> {
+fn refinement_candidates(face: &TrimmedFace, triangulation: &FaceTriangulation, linear: f64, angular: f64, fine_refinement: bool, progress: &ffi::CancellationToken) -> Result<Vec<RefinementCandidate>, Error> {
 	const RETAINED_CANDIDATE_MULTIPLIER: usize = 4;
 	let required_capacity = MAXIMUM_REQUIRED_INSERTIONS_PER_PASS * RETAINED_CANDIDATE_MULTIPLIER;
 	let quality_capacity = MAXIMUM_QUALITY_INSERTIONS_PER_PASS * RETAINED_CANDIDATE_MULTIPLIER;
@@ -4212,7 +4215,10 @@ fn refinement_candidates(face: &TrimmedFace, triangulation: &FaceTriangulation, 
 		}
 		let vertices = triangle.vertices();
 		let handles = vertices.map(|vertex| vertex.fix());
-		let parametric = vertices.map(|vertex| *vertex.data());
+		let parametric = vertices.each_ref().map(|vertex| vertex.data());
+		if fine_refinement && phantom_boundary_triangle(parametric) {
+			continue;
+		}
 		let uv = parametric.map(|vertex| vertex.uv);
 		let center = (uv[0] + uv[1] + uv[2]) / 3.0;
 		if !point_in_trim(center, &face.loops) {
@@ -4236,7 +4242,8 @@ fn refinement_candidates(face: &TrimmedFace, triangulation: &FaceTriangulation, 
 				geometric_normal = -geometric_normal;
 			}
 		}
-		let angular_singular = face.surface.triangle_crosses_nonsmooth_knot(uv) || subdeflection_cusp(face, uv, positions, linear);
+		// Match the final audit's boundary and singular-cell angular exemptions.
+		let angular_singular = face.surface.triangle_crosses_nonsmooth_knot(uv) || subdeflection_cusp(face, uv, positions, linear) || fine_refinement && (parametric.iter().any(|vertex| vertex.boundary_position.is_some()) || uv.iter().any(|uv| collapsed_parameter_axis(face, *uv).is_some()) || uv.iter().filter(|uv| near_parametric_boundary(face, **uv)).count() >= 2);
 
 		// Retain the worst mandatory probe per triangle. Refining every center
 		// and midpoint from a single cell in one pass creates redundant sites;
@@ -4405,28 +4412,20 @@ fn build_face_mesh(face: &TrimmedFace, triangulation: &FaceTriangulation, progre
 	for (triangle_index, triangle) in triangulation.inner_faces().enumerate() {
 		cancellation_checkpoint(progress, triangle_index)?;
 		let handles = triangle.vertices().map(|vertex| vertex.fix().index());
-		let parametric = handles.map(|index| *triangulation.vertex(spade::handles::FixedVertexHandle::from_index(index)).data());
+		let vertices = handles.map(|index| triangulation.vertex(spade::handles::FixedVertexHandle::from_index(index)));
+		let parametric = vertices.each_ref().map(|vertex| vertex.data());
 		let uv = parametric.map(|vertex| vertex.uv);
 		let center = (uv[0] + uv[1] + uv[2]) / 3.0;
 		if !point_in_trim(center, &face.loops) {
 			continue;
 		}
-		let metric = parametric.map(|vertex| vertex.metric);
-		let metric_area = ((metric[1].x - metric[0].x) * (metric[2].y - metric[0].y) - (metric[1].y - metric[0].y) * (metric[2].x - metric[0].x)).abs();
-		let metric_edge_scale_squared = [(metric[1], metric[0]), (metric[2], metric[1]), (metric[0], metric[2])].into_iter().map(|(first, second)| (second.x - first.x).powi(2) + (second.y - first.y).powi(2)).fold(0.0, f64::max);
-		if triangle_shares_boundary_occurrence(parametric) && metric_area <= metric_edge_scale_squared * 1.0e-12 {
-			// A CDT can expose a face between three samples of one curved trim
-			// occurrence. The samples are collinear in the face chart but not in
-			// 3D, so a geometric area test mistakes the boundary's osculating
-			// plane for a surface cell. Typed occurrence provenance distinguishes
-			// this phantom from a legitimate curved cap ear and from the opposite
-			// occurrence of a periodic self-seam.
+		if phantom_boundary_triangle(parametric) {
 			continue;
 		}
 		let mut positions = [DVec3::ZERO; 3];
 		for corner in 0..3 {
 			let handle = triangulation.vertex(spade::handles::FixedVertexHandle::from_index(handles[corner]));
-			let vertex = *handle.data();
+			let vertex = handle.data();
 			positions[corner] = vertex.boundary_position.unwrap_or(face.surface.evaluate_position(vertex.uv).ok_or(Error::TriangulationFailed)?);
 		}
 		let geometric = (positions[1] - positions[0]).cross(positions[2] - positions[0]);
@@ -4481,7 +4480,7 @@ fn build_face_mesh(face: &TrimmedFace, triangulation: &FaceTriangulation, progre
 	for (vertex_index, old_index) in used.into_iter().enumerate() {
 		cancellation_checkpoint(progress, vertex_index)?;
 		let handle = triangulation.vertex(spade::handles::FixedVertexHandle::from_index(old_index));
-		let vertex = *handle.data();
+		let vertex = handle.data();
 		let sample = face.surface.evaluate(vertex.uv).ok_or(Error::TriangulationFailed)?;
 		let position = vertex.boundary_position.unwrap_or(sample.position);
 		let normal = oriented_surface_normal_from_sample(face, vertex.uv, sample).unwrap_or(DVec3::ZERO);
@@ -4509,8 +4508,19 @@ fn build_face_mesh(face: &TrimmedFace, triangulation: &FaceTriangulation, progre
 	})
 }
 
-fn triangle_shares_boundary_occurrence(vertices: [ParametricVertex; 3]) -> bool {
-	vertices[0].boundary_occurrences.into_iter().flatten().any(|occurrence| vertices[1].boundary_occurrences.contains(&Some(occurrence)) && vertices[2].boundary_occurrences.contains(&Some(occurrence)))
+// Three collinear chart samples of one curved trim form no surface cell, despite their 3D area.
+fn phantom_boundary_triangle(vertices: [&ParametricVertex; 3]) -> bool {
+	if !triangle_shares_boundary_occurrence(vertices) {
+		return false;
+	}
+	let metric = vertices.map(|vertex| vertex.metric);
+	let area = ((metric[1].x - metric[0].x) * (metric[2].y - metric[0].y) - (metric[1].y - metric[0].y) * (metric[2].x - metric[0].x)).abs();
+	let edge_scale_squared = [(metric[1], metric[0]), (metric[2], metric[1]), (metric[0], metric[2])].into_iter().map(|(first, second)| (second.x - first.x).powi(2) + (second.y - first.y).powi(2)).fold(0.0, f64::max);
+	area <= edge_scale_squared * 1.0e-12
+}
+
+fn triangle_shares_boundary_occurrence(vertices: [&ParametricVertex; 3]) -> bool {
+	vertices[0].boundary_occurrences.iter().any(|occurrence| vertices[1].boundary_occurrences.contains(occurrence) && vertices[2].boundary_occurrences.contains(occurrence))
 }
 
 fn point_in_trim(point: DVec2, loops: &[TrimLoop]) -> bool {
@@ -4935,10 +4945,13 @@ pub(super) struct BoundaryRunProvenance {
 }
 
 #[cfg(feature = "test-support")]
-pub(super) fn boundary_occurrence_metadata_overflow_is_rejected() -> bool {
-	let mut vertex = ParametricVertex { uv: DVec2::ZERO, metric: Point2::new(0.0, 0.0), boundary_position: None, boundary_occurrences: [None, None] };
+pub(super) fn boundary_junction_occurrences_are_retained() -> bool {
+	let mut vertex = ParametricVertex { uv: DVec2::ZERO, metric: Point2::new(0.0, 0.0), boundary_position: None, boundary_occurrences: Vec::new() };
 	let occurrence = |loop_index| BoundaryOccurrence { loop_index, edge_index: 7, occurrence_index: loop_index };
-	vertex.add_boundary_occurrence(occurrence(0)).is_ok() && vertex.add_boundary_occurrence(occurrence(0)).is_ok() && vertex.add_boundary_occurrence(occurrence(1)).is_ok() && vertex.add_boundary_occurrence(occurrence(2)).is_err()
+	for index in [0, 0, 1, 2, 3] {
+		vertex.add_boundary_occurrence(occurrence(index));
+	}
+	vertex.boundary_occurrences == (0..4).map(occurrence).collect::<Vec<_>>()
 }
 
 #[cfg(feature = "test-support")]

@@ -246,7 +246,7 @@ void shape_face_boundary_projection(const TopoDS_Shape& shape,
     double deflection,
     PlaneSectionData& out_section);
 
-void shape_bounding_box(const TopoDS_Shape& shape,
+void shape_bounding_box(const TopoDS_Shape& shape, bool precise,
     double& xmin, double& ymin, double& zmin,
     double& xmax, double& ymax, double& zmax);
 

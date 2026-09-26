@@ -21,7 +21,12 @@ fn relative_tessellation_is_scale_covariant_below_unit_size() {
 
 	let reference = mesh_signature(1.0);
 	for scale in [0.01, 0.1, 10.0, 100.0] {
-		assert_eq!(mesh_signature(scale), reference, "relative tessellation density changed at scale {scale}");
+		let actual = mesh_signature(scale);
+		// Adaptive triangulation may choose different diagonals at floating-point ties.
+		// A unit-size deflection floor instead causes orders-of-magnitude density changes.
+		for (actual, reference) in [(actual.0, reference.0), (actual.1, reference.1)] {
+			assert!(actual.abs_diff(reference) <= reference / 100, "relative tessellation density changed at scale {scale}: {actual} versus {reference}");
+		}
 	}
 }
 

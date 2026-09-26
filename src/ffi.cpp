@@ -1733,14 +1733,14 @@ bool shape_contains_point(const TopoDS_Shape& shape, double x, double y, double 
     return classifier.State() == TopAbs_IN;
 }
 
-void shape_bounding_box(const TopoDS_Shape& shape,
+void shape_bounding_box(const TopoDS_Shape& shape, bool precise,
     double& xmin, double& ymin, double& zmin,
     double& xmax, double& ymax, double& zmax)
 {
     Bnd_Box box;
-    // Bounds are exact topology facts, not presentation-cache facts. Imported
-    // B-reps may carry a stale Poly_Triangulation, so explicitly ignore it.
-    BRepBndLib::Add(shape, box, false);
+    // Validation needs surface extrema; presentation retains its conservative bounds convention.
+    if (precise) BRepBndLib::AddOptimal(shape, box, false, false);
+    else BRepBndLib::Add(shape, box, false);
     box.Get(xmin, ymin, zmin, xmax, ymax, zmax);
 }
 

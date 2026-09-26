@@ -928,6 +928,14 @@ impl Solid {
 		topology_snapshot_from_shape_with_options(&self.inner, options)
 	}
 
+	/// Tight surface bounds for geometry validation, independent of cached meshes and spline poles.
+	pub fn precise_bounding_box(&self) -> [DVec3; 2] {
+		let (mut xmin, mut ymin, mut zmin) = (0.0_f64, 0.0_f64, 0.0_f64);
+		let (mut xmax, mut ymax, mut zmax) = (0.0_f64, 0.0_f64, 0.0_f64);
+		ffi::shape_bounding_box(&self.inner, true, &mut xmin, &mut ymin, &mut zmin, &mut xmax, &mut ymax, &mut zmax);
+		[DVec3::new(xmin, ymin, zmin), DVec3::new(xmax, ymax, zmax)]
+	}
+
 	/// Bounds of one exact subshape, independent of display triangulation.
 	pub fn topology_bounds(&self, target: ResultTopology) -> Result<[DVec3; 2], Error> {
 		let kind = match target.kind {
@@ -1907,7 +1915,7 @@ impl SolidStruct for Solid {
 	fn bounding_box(&self) -> [DVec3; 2] {
 		let (mut xmin, mut ymin, mut zmin) = (0.0_f64, 0.0_f64, 0.0_f64);
 		let (mut xmax, mut ymax, mut zmax) = (0.0_f64, 0.0_f64, 0.0_f64);
-		ffi::shape_bounding_box(&self.inner, &mut xmin, &mut ymin, &mut zmin, &mut xmax, &mut ymax, &mut zmax);
+		ffi::shape_bounding_box(&self.inner, false, &mut xmin, &mut ymin, &mut zmin, &mut xmax, &mut ymax, &mut zmax);
 		[DVec3::new(xmin, ymin, zmin), DVec3::new(xmax, ymax, zmax)]
 	}
 
