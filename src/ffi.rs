@@ -378,6 +378,7 @@ mod ffi_bridge {
 		fn make_extrude(profile_edges: &CxxVector<TopoDS_Edge>, dx: f64, dy: f64, dz: f64, progress: &CancellationToken, out_topology_history: &mut HistoryData) -> UniquePtr<TopoDS_Shape>;
 		fn arrange_planar_edges(edges: &CxxVector<TopoDS_Edge>, tolerance: f64, max_fragments: u32, progress: &CancellationToken) -> ProfileArrangementData;
 		fn trim_profile_edge(edge: &TopoDS_Edge, first: f64, last: f64, reversed: bool, tolerance: f64) -> UniquePtr<TopoDS_Edge>;
+		fn classify_planar_profile(edges: &CxxVector<TopoDS_Edge>, points: &[f64], tolerance: f64, progress: &CancellationToken, locations: &mut Vec<u8>) -> bool;
 		fn make_pipe_shell(all_edges: &CxxVector<TopoDS_Edge>, spine_edges: &CxxVector<TopoDS_Edge>, orient: u32, ux: f64, uy: f64, uz: f64, aux_spine_edges: &CxxVector<TopoDS_Edge>, progress: &CancellationToken, out_topology_history: &mut HistoryData) -> UniquePtr<TopoDS_Shape>;
 		fn make_loft(all_edges: &CxxVector<TopoDS_Edge>, ruled: bool, closed: bool, progress: &CancellationToken, out_topology_history: &mut HistoryData) -> UniquePtr<TopoDS_Shape>;
 		fn builder_sew_without_faces(shape: &TopoDS_Shape, removed_face_indices: &[u32], tolerance: f64, out_history: &mut Vec<u64>, out_topology_history: &mut HistoryData) -> UniquePtr<TopoDS_Shape>;

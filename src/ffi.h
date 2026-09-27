@@ -38,6 +38,9 @@ ProfileArrangementData arrange_planar_edges(const std::vector<TopoDS_Edge>& edge
     double tolerance, uint32_t max_fragments, const CancellationToken& progress);
 std::unique_ptr<TopoDS_Edge> trim_profile_edge(const TopoDS_Edge& edge,
     double first, double last, bool reversed, double tolerance);
+bool classify_planar_profile(const std::vector<TopoDS_Edge>& edges,
+    rust::Slice<const double> points, double tolerance, const CancellationToken& progress,
+    rust::Vec<uint8_t>& locations);
 
 void clear_operation_diagnostic();
 OperationDiagnosticData take_operation_diagnostic();

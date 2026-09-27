@@ -72,6 +72,7 @@
 #include <BRepBuilderAPI_Transform.hxx>
 #include <BRepCheck_Analyzer.hxx>
 #include <BRepClass3d_SolidClassifier.hxx>
+#include <BRepClass_FaceClassifier.hxx>
 #include <BRepExtrema_DistShapeShape.hxx>
 #include <BRepExtrema_ExtPF.hxx>
 #include <BRepFeat_SplitShape.hxx>
@@ -5931,6 +5932,68 @@ std::unique_ptr<TopoDS_Edge> trim_profile_edge(const TopoDS_Edge& source,
     } catch (const Standard_Failure& failure) {
         record_standard_failure(__func__, "trim_source", 7, failure);
         return nullptr;
+    }
+}
+
+bool classify_planar_profile(const std::vector<TopoDS_Edge>& edges,
+    rust::Slice<const double> points, double tolerance, const CancellationToken& progress,
+    rust::Vec<uint8_t>& locations) {
+    try {
+        if (edges.empty() || points.size()%2 || rust_progress_cancelled(progress)) return false;
+        BRepBuilderAPI_MakeFace face_maker{gp_Pln(gp::XOY())};
+        BRepBuilderAPI_MakeWire wire_maker;
+        bool has_edges = false;
+        auto flush_wire = [&]() -> bool {
+            if (!has_edges || !wire_maker.IsDone() || !wire_maker.Wire().Closed()) return false;
+            face_maker.Add(wire_maker.Wire());
+            wire_maker = BRepBuilderAPI_MakeWire();
+            has_edges = false;
+            return true;
+        };
+        for (const auto& edge : edges) {
+            if (rust_progress_cancelled(progress)) return false;
+            if (edge.IsNull()) {
+                if (!flush_wire()) return false;
+            } else {
+                wire_maker.Add(TopoDS::Edge(BRepBuilderAPI_Copy(edge,false,false).Shape()));
+                has_edges = true;
+            }
+        }
+        if (!flush_wire() || !face_maker.IsDone()) return false;
+        const auto face = face_maker.Face();
+        if (!BRepCheck_Analyzer(face).IsValid()) return false;
+        BRepTopAdaptor_FClass2d bounded(face,tolerance);
+        if (bounded.PerformInfinitePoint() != TopAbs_OUT) return false;
+        TopoDS_Compound boundary;
+        BRep_Builder boundary_builder;
+        boundary_builder.MakeCompound(boundary);
+        for (TopExp_Explorer wire(face,TopAbs_WIRE); wire.More(); wire.Next()) {
+            boundary_builder.Add(boundary,wire.Current());
+        }
+        Handle(RustProgressIndicator) indicator = new RustProgressIndicator(progress);
+        Message_ProgressScope scope(indicator->Start(), "Classify profile points", points.size()/2);
+        BRepClass_FaceClassifier classifier;
+        for (size_t i=0; i<points.size(); i+=2) {
+            if (rust_progress_cancelled(progress)) return false;
+            // Ray classification can miss ON at periodic seams and small radii.
+            // Resolve the tolerance band with trimmed-curve distance first.
+            BRepExtrema_DistShapeShape distance;
+            distance.LoadS1(BRepBuilderAPI_MakeVertex(gp_Pnt(points[i],points[i+1],0)).Vertex());
+            distance.LoadS2(boundary);
+            distance.Perform(scope.Next());
+            if (!distance.IsDone() || !std::isfinite(distance.Value())) return false;
+            if (distance.Value() <= tolerance) { locations.push_back(2); continue; }
+            classifier.Perform(face,gp_Pnt2d(points[i],points[i+1]),tolerance,false,tolerance);
+            switch (classifier.State()) {
+                case TopAbs_OUT: locations.push_back(0); break;
+                case TopAbs_IN: locations.push_back(1); break;
+                default: return false;
+            }
+        }
+        return !rust_progress_cancelled(progress);
+    } catch (const Standard_Failure& failure) {
+        record_standard_failure(__func__, "classify", 7, failure);
+        return false;
     }
 }
 

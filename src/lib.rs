@@ -13,7 +13,7 @@ pub mod occt;
 pub use occt::{
 	edge::Edge,
 	face::Face,
-	profile::{PlanarProfileArrangement, PlanarProfileRegion, ProfileCurveSpan},
+	profile::{PlanarProfileArrangement, PlanarProfileRegion, ProfileCurveSpan, ProfilePointLocation},
 	solid::{CurveGeometryKind, EdgeBlendKind, EdgeBlendSession, EdgeTopologyFacts, ExtrusionSession, FaceEditSession, FaceTopologyFacts, InputTopology, ResultTopology, ShellSession, Solid, SurfaceGeometryKind, SweepSession, TopologyDistance, TopologyHistory, TopologyKind, TopologyOccurrenceToken, TopologyQueryOptions, TopologyRelation, TopologyRelationKind, TopologySnapshot, ValidationReport, VertexTopologyFacts},
 	CancellationToken,
 };
