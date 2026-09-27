@@ -56,6 +56,21 @@ jobs:
           cmake --build "$RUNNER_TEMP/planarity" --config Release
           ctest --test-dir "$RUNNER_TEMP/planarity" -C Release --output-on-failure
 
+      - name: Verify packaged WebAssembly extrusion planarity
+        if: matrix.target == 'wasm32-unknown-unknown'
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/occt-wasm"
+          tar -xzf out/${{ matrix.target }}/occt-*.tar.gz -C "$RUNNER_TEMP/occt-wasm"
+          occt_root=("$RUNNER_TEMP"/occt-wasm/occt-*)
+          package_name=$(basename "${occt_root[0]}")
+          docker run --rm --entrypoint /bin/bash \
+            -v "$PWD/tests/occt-planarity:/probe:ro" \
+            -v "$RUNNER_TEMP/occt-wasm:/qualification" \
+            cross-wasm32-unknown-unknown \
+            /probe/build-wasm.sh "/qualification/$package_name" /qualification/planarity.wasm
+          node tests/occt-planarity/run-wasi.mjs "$RUNNER_TEMP/occt-wasm/planarity.wasm"
+
       - uses: actions/upload-artifact@v4
         with:
           name: occt-${{ matrix.target }}
