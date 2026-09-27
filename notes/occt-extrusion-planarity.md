@@ -58,9 +58,18 @@ including exact topology/provenance, Undo/Redo and browser-storage save/reopen.
 Merge `31ac9e4` retains current production geometry changes through `4b0fef1`, including
 planar seed clearance and exact curve arrangement/classification. Its fresh seven-target
 [run 36316397652](https://github.com/cadona-app/cadona-cadrum/actions/runs/36316397652)
-is still in progress. Focused native checks pass: 402 direct planarity checks and 25
-Cadrum source-patch, arrangement, classification and tessellation cases; strict Clippy passes.
-Complete client and rendered-workflow qualification is still being recorded.
+passes all seven builds, packaged WASM and Windows GNU execution, and draft creation.
+Focused native checks pass: 402 direct planarity checks and 25 Cadrum source-patch,
+arrangement, classification and tessellation cases; strict Clippy passes.
+
+The combined client also passes 1,334 native tests (15 existing ignored) and its original
+browser sliver lifecycle test, including save/reopen. The complete serial Linux workspace
+run has 2,010 passed, one failed and 251 ignored; the sole failure was missing archive-conversion
+catalog entries, now repaired and verified by all five coverage/parity checks on both platforms.
+The Linux rendered sliver workflow passes explicit confirmation, save and reload with one new
+chamfer, exact validity, volume and semantic-reference checks. Its five captures were inspected.
+These checks use isolated corrected native/Linux roots and the downloaded WASM candidate;
+public package adoption and complete application/platform qualification remain open.
 
 ## Release provenance
 
