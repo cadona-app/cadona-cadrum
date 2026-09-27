@@ -22,9 +22,21 @@ pub struct OperationFailure {
 	pub status: Option<i32>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProfileIssue {
+	NonPlanar,
+	CoincidentCurves,
+	AmbiguousJunction,
+	ResourceLimit,
+}
+
 /// Errors that can occur during CAD operations.
 #[derive(Debug)]
 pub enum Error {
+	InvalidProfile {
+		issue: ProfileIssue,
+		sources: Vec<u32>,
+	},
 	/// OCCT threw a caught native exception with structured diagnostics.
 	OperationFailed(OperationFailure),
 
@@ -144,6 +156,7 @@ pub enum Error {
 impl std::fmt::Display for Error {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
+			Error::InvalidProfile { issue, sources } => write!(f, "invalid planar profile ({issue:?}) at sources {sources:?}"),
 			Error::OperationFailed(failure) => {
 				write!(f, "{} failed during {}", failure.operation, failure.stage)?;
 				if let Some(exception_type) = &failure.exception_type {
@@ -192,6 +205,8 @@ impl Error {
 	pub fn category(&self) -> FailureCategory {
 		match self {
 			Self::OperationFailed(failure) => failure.category,
+			Self::InvalidProfile { issue: ProfileIssue::ResourceLimit, .. } => FailureCategory::ResourceLimit,
+			Self::InvalidProfile { .. } => FailureCategory::InvalidInput,
 			Self::Cancelled => FailureCategory::Cancelled,
 			Self::InvalidInput(_) | Self::InvalidEdge(_) | Self::InvalidColor(_) => FailureCategory::InvalidInput,
 			Self::ProjectionFailed(_) => FailureCategory::NoSolution,

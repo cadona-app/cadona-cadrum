@@ -13,6 +13,7 @@ pub mod occt;
 pub use occt::{
 	edge::Edge,
 	face::Face,
+	profile::{PlanarProfileArrangement, PlanarProfileRegion, ProfileCurveSpan, ProfilePointLocation},
 	solid::{CurveGeometryKind, EdgeBlendKind, EdgeBlendSession, EdgeTopologyFacts, ExtrusionSession, FaceEditSession, FaceTopologyFacts, InputTopology, ResultTopology, ShellSession, Solid, SurfaceGeometryKind, SweepSession, TopologyDistance, TopologyHistory, TopologyKind, TopologyOccurrenceToken, TopologyQueryOptions, TopologyRelation, TopologyRelationKind, TopologySnapshot, ValidationReport, VertexTopologyFacts},
 	CancellationToken,
 };
@@ -36,7 +37,7 @@ pub use traits::{BSplineEnd, ProfileOrient, Tessellation};
 pub use common::color::Color;
 pub use common::{
 	boolean::Boolean,
-	error::{Error, FailureCategory, OperationFailure},
+	error::{Error, FailureCategory, OperationFailure, ProfileIssue},
 	mesh::{EdgePolylineChunk, FaceMeshChunk, Mesh, MeshChunks, Scene2D, SceneOption},
 };
 // Re-export glam types used in cadrum's public API. Users should reach glam

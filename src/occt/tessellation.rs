@@ -3926,6 +3926,7 @@ struct LatticePattern {
 	angle: f64,
 	x_phase: f64,
 	y_phase: f64,
+	boundary_scale: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3989,18 +3990,23 @@ fn triangle_minimum_angle_degrees(points: [DVec3; 3]) -> Option<f64> {
 /// unchanged into every trial; only unconstrained interior points differ.
 fn seed_best_planar_lattice(face: &TrimmedFace, chart: FaceChart, linear: f64, angular: f64, insertion_domain: &InsertionDomain, base: FaceTriangulation, progress: &ffi::CancellationToken) -> Result<FaceTriangulation, Error> {
 	const PATTERNS: [LatticePattern; 8] = [
-		LatticePattern { angle: 0.0, x_phase: 0.0, y_phase: 0.0 },
-		LatticePattern { angle: 0.0, x_phase: 0.5, y_phase: 0.5 },
-		LatticePattern { angle: std::f64::consts::PI / 12.0, x_phase: 0.0, y_phase: 0.5 },
-		LatticePattern { angle: std::f64::consts::PI / 12.0, x_phase: 0.5, y_phase: 0.0 },
-		LatticePattern { angle: std::f64::consts::PI / 6.0, x_phase: 0.25, y_phase: 0.25 },
-		LatticePattern { angle: std::f64::consts::PI / 6.0, x_phase: 0.75, y_phase: 0.75 },
-		LatticePattern { angle: std::f64::consts::PI / 4.0, x_phase: 0.25, y_phase: 0.75 },
-		LatticePattern { angle: std::f64::consts::PI / 4.0, x_phase: 0.75, y_phase: 0.25 },
+		LatticePattern { angle: 0.0, x_phase: 0.0, y_phase: 0.0, boundary_scale: 0.0 },
+		LatticePattern { angle: 0.0, x_phase: 0.5, y_phase: 0.5, boundary_scale: 0.0 },
+		LatticePattern { angle: std::f64::consts::PI / 12.0, x_phase: 0.0, y_phase: 0.5, boundary_scale: 0.0 },
+		LatticePattern { angle: std::f64::consts::PI / 12.0, x_phase: 0.5, y_phase: 0.0, boundary_scale: 0.0 },
+		LatticePattern { angle: std::f64::consts::PI / 6.0, x_phase: 0.25, y_phase: 0.25, boundary_scale: 0.0 },
+		LatticePattern { angle: std::f64::consts::PI / 6.0, x_phase: 0.75, y_phase: 0.75, boundary_scale: 0.0 },
+		LatticePattern { angle: std::f64::consts::PI / 4.0, x_phase: 0.25, y_phase: 0.75, boundary_scale: 0.0 },
+		LatticePattern { angle: std::f64::consts::PI / 4.0, x_phase: 0.75, y_phase: 0.25, boundary_scale: 0.0 },
 	];
 
 	let mut best = None::<(bool, PlanarMeshQuality, FaceTriangulation)>;
-	for (pattern_index, (dense, pattern)) in [false, true].into_iter().flat_map(|dense| PATTERNS.into_iter().map(move |pattern| (dense, pattern))).enumerate() {
+	for (pattern_index, (boundary_scale, dense, pattern)) in [0.0, 0.28].into_iter().flat_map(|scale| [false, true].into_iter().flat_map(move |dense| PATTERNS.into_iter().map(move |pattern| (scale, dense, pattern)))).enumerate() {
+		// Preserve accepted meshes; only rejected lattices need clearance graded to sparse trim segments.
+		if boundary_scale > 0.0 && best.as_ref().is_some_and(|(valid, _, _)| *valid) {
+			break;
+		}
+		let pattern = LatticePattern { boundary_scale, ..pattern };
 		cancellation_checkpoint(progress, pattern_index)?;
 		let mut trial = base.clone();
 		seed_metric_lattice_pattern(face, chart, linear, insertion_domain, pattern, dense, &mut trial)?;
@@ -4041,7 +4047,7 @@ fn seed_best_planar_lattice(face: &TrimmedFace, chart: FaceChart, linear: f64, a
 /// exact boundary by a fraction of one cell, leaving a single graded collar
 /// for the constrained triangulation to fill.
 fn seed_metric_lattice(face: &TrimmedFace, chart: FaceChart, linear: f64, insertion_domain: &InsertionDomain, triangulation: &mut FaceTriangulation) -> Result<(), Error> {
-	seed_metric_lattice_pattern(face, chart, linear, insertion_domain, LatticePattern { angle: 0.0, x_phase: 0.0, y_phase: 0.0 }, false, triangulation)
+	seed_metric_lattice_pattern(face, chart, linear, insertion_domain, LatticePattern { angle: 0.0, x_phase: 0.0, y_phase: 0.0, boundary_scale: 0.0 }, false, triangulation)
 }
 
 fn seed_metric_lattice_pattern(face: &TrimmedFace, chart: FaceChart, linear: f64, insertion_domain: &InsertionDomain, pattern: LatticePattern, dense: bool, triangulation: &mut FaceTriangulation) -> Result<(), Error> {
@@ -4079,6 +4085,16 @@ fn seed_metric_lattice_pattern(face: &TrimmedFace, chart: FaceChart, linear: f64
 				continue;
 			};
 			if !point_in_trim(uv, &face.loops) || insertion_domain.distance_to_boundary(point) < boundary_clearance {
+				continue;
+			}
+			if pattern.boundary_scale > 0.0
+				&& insertion_domain.loops.iter().any(|trim_loop| {
+					(0..trim_loop.len()).any(|index| {
+						let first = trim_loop[index];
+						let second = trim_loop[(index + 1) % trim_loop.len()];
+						metric_point_segment_distance(point, first, second) < metric_distance(first, second) * pattern.boundary_scale
+					})
+				}) {
 				continue;
 			}
 			budget.insert(face, triangulation, uv, chart, insertion_domain)?;
