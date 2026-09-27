@@ -7,6 +7,7 @@ pub mod face;
 mod ffi;
 pub use ffi::CancellationToken;
 pub mod io;
+pub mod profile;
 pub mod solid;
 mod tessellation;
 #[cfg(feature = "test-support")]

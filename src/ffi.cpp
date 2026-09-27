@@ -84,6 +84,8 @@
 #include <BRepPrimAPI_MakeSphere.hxx>
 #include <BRepProj_Projection.hxx>
 #include <BOPAlgo_Splitter.hxx>
+#include <BOPAlgo_BuilderFace.hxx>
+#include <BRepTopAdaptor_FClass2d.hxx>
 #include <gp_Elips.hxx>
 #include <BRepAlgo_NormalProjection.hxx>
 #include <BRepPrimAPI_MakePrism.hxx>
@@ -5742,6 +5744,192 @@ std::unique_ptr<TopoDS_Shape> builder_chamfer(
         return output;
     } catch (const Standard_Failure& failure) {
         record_standard_failure(__func__, "native", 7, failure);
+        return nullptr;
+    }
+}
+
+ProfileArrangementData arrange_planar_edges(const std::vector<TopoDS_Edge>& input,
+    double tolerance, uint32_t max_fragments, const CancellationToken& progress) {
+    ProfileArrangementData output;
+    output.success = false;
+    output.error_code = 0;
+    const char* stage = "validate_input";
+    ScopedFailureDiagnostic diagnostic(__func__, stage, output.success, progress);
+    try {
+        if (rust_progress_cancelled(progress)) return output;
+        if (input.empty()) { output.success = true; return output; }
+        if (input.size() > max_fragments) { output.error_code = 4; return output; }
+        std::vector<TopoDS_Edge> sources;
+        NCollection_List<TopoDS_Shape> arguments;
+        for (size_t i = 0; i < input.size(); ++i) {
+            if (rust_progress_cancelled(progress)) return output;
+            Bnd_Box bounds;
+            BRepBndLib::AddOptimal(input[i], bounds, false, false);
+            double x0,y0,z0,x1,y1,z1;
+            if (bounds.IsVoid() || bounds.IsWhole()) return output;
+            bounds.Get(x0,y0,z0,x1,y1,z1);
+            if (!std::isfinite(z0) || !std::isfinite(z1) || std::abs(z0)>tolerance || std::abs(z1)>tolerance) {
+                output.error_code = 1; output.error_sources.push_back(i); return output;
+            }
+            sources.push_back(TopoDS::Edge(BRepBuilderAPI_Copy(input[i], false, false).Shape()));
+            arguments.Append(sources.back());
+        }
+        stage = "split_intersections";
+        Handle(RustProgressIndicator) indicator = new RustProgressIndicator(progress);
+        Message_ProgressScope scope(indicator->Start(), "Planar profile arrangement", 2);
+        BOPAlgo_Builder splitter;
+        TopoDS_Shape split_shape = sources.front();
+        if (sources.size() > 1) {
+            splitter.SetArguments(arguments);
+            splitter.SetNonDestructive(true);
+            splitter.SetRunParallel(false);
+            splitter.SetFuzzyValue(tolerance);
+            splitter.Perform(scope.Next());
+            if (splitter.HasErrors() || rust_progress_cancelled(progress)) return output;
+            split_shape = splitter.Shape();
+        } else { scope.Next(); }
+        NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> fragments;
+        TopExp::MapShapes(split_shape, TopAbs_EDGE, fragments);
+        if (static_cast<uint64_t>(fragments.Extent()) > max_fragments) { output.error_code = 4; return output; }
+        std::vector<std::vector<uint32_t>> origins(fragments.Extent()+1);
+        for (size_t source = 0; source < sources.size(); ++source) {
+            auto assign = [&](const TopoDS_Shape& shape) {
+                int index = fragments.FindIndex(shape);
+                if (index) origins[index].push_back(source);
+            };
+            if (sources.size() == 1 || splitter.Modified(sources[source]).IsEmpty()) assign(sources[source]);
+            else for (const auto& image : splitter.Modified(sources[source])) assign(image);
+        }
+        stage = "verify_source_correspondence";
+        NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> junctions;
+        std::vector<std::vector<std::pair<uint32_t,gp_Pnt>>> junction_points;
+        for (int i = 1; i <= fragments.Extent(); ++i) {
+            if (origins[i].empty()) return output;
+            if (origins[i].size() != 1) {
+                output.error_code = 2;
+                for (auto source : origins[i]) output.error_sources.push_back(source);
+                return output;
+            }
+            const auto source = origins[i].front();
+            double first,last,source_first,source_last;
+            auto curve = BRep_Tool::Curve(sources[source], source_first, source_last);
+            auto edge = TopoDS::Edge(fragments(i).Oriented(TopAbs_FORWARD));
+            BRep_Tool::Range(edge, first, last);
+            if (curve.IsNull() || !std::isfinite(first) || !std::isfinite(last)) return output;
+            TopoDS_Vertex start,end;
+            TopExp::Vertices(edge,start,end);
+            for (const auto& endpoint : {std::make_pair(start,first),std::make_pair(end,last)}) {
+                if (endpoint.first.IsNull()) return output;
+                int index = junctions.Add(endpoint.first);
+                if (junction_points.size() < static_cast<size_t>(index)) junction_points.resize(index);
+                auto point = curve->Value(endpoint.second);
+                for (const auto& previous : junction_points[index-1]) {
+                    if (previous.second.Distance(point) > tolerance) {
+                        output.error_code = 3;
+                        output.error_sources.push_back(previous.first);
+                        if (previous.first != source) output.error_sources.push_back(source);
+                        return output;
+                    }
+                }
+                junction_points[index-1].emplace_back(source,point);
+            }
+        }
+        stage = "build_bounded_cells";
+        const auto plane = BRepBuilderAPI_MakeFace(gp_Pln(gp::XOY())).Face();
+        NCollection_List<TopoDS_Shape> directed;
+        for (int i = 1; i <= fragments.Extent(); ++i) {
+            auto edge = TopoDS::Edge(fragments(i).Oriented(TopAbs_FORWARD));
+            BRepLib::BuildPCurveForEdgeOnPlane(edge,plane);
+            directed.Append(edge); directed.Append(edge.Reversed());
+        }
+        BOPAlgo_BuilderFace builder;
+        builder.SetFace(plane);
+        builder.SetShapes(directed);
+        builder.SetAvoidInternalShapes(true);
+        builder.Perform(scope.Next());
+        if (builder.HasErrors() || rust_progress_cancelled(progress)) return output;
+        std::vector<bool> used(sources.size(), false);
+        uint64_t exported_spans = 0;
+        stage = "export_boundaries";
+        for (const auto& shape : builder.Areas()) {
+            if (rust_progress_cancelled(progress)) return output;
+            auto face = TopoDS::Face(shape);
+            BRepTopAdaptor_FClass2d classifier(face,tolerance);
+            if (classifier.PerformInfinitePoint() != TopAbs_OUT) continue;
+            if (!BRepCheck_Analyzer(face).IsValid()) return output;
+            GProp_GProps properties;
+            BRepGProp::SurfaceProperties(face,properties);
+            ProfileRegionData region;
+            region.area = properties.Mass();
+            NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> boundary_vertices;
+            std::vector<uint32_t> boundary_vertex_sources;
+            const auto outer = BRepTools::OuterWire(face);
+            if (outer.IsNull()) return output;
+            std::vector<TopoDS_Wire> wires{outer};
+            for (TopExp_Explorer wire(face,TopAbs_WIRE); wire.More(); wire.Next()) {
+                if (!wire.Current().IsSame(outer)) wires.push_back(TopoDS::Wire(wire.Current()));
+            }
+            region.wire_offsets.push_back(0);
+            for (const auto& wire : wires) {
+                for (BRepTools_WireExplorer edge(wire,face); edge.More(); edge.Next()) {
+                    if (++exported_spans > uint64_t(max_fragments)*2) { output.error_code = 4; return output; }
+                    const int index = fragments.FindIndex(edge.Current());
+                    if (!index || origins[index].size()!=1) return output;
+                    const auto source = origins[index].front();
+                    const auto& vertex = edge.CurrentVertex();
+                    const int previous = boundary_vertices.FindIndex(vertex);
+                    if (previous) {
+                        output.error_code = 3;
+                        output.error_sources.push_back(boundary_vertex_sources[previous-1]);
+                        if (boundary_vertex_sources[previous-1] != source) output.error_sources.push_back(source);
+                        return output;
+                    }
+                    boundary_vertices.Add(vertex);
+                    boundary_vertex_sources.push_back(source);
+                    double first,last,a,b;
+                    BRep_Tool::Range(edge.Current(),first,last);
+                    BRep_Tool::Range(sources[source],a,b);
+                    if (!(b>a)) return output;
+                    double t0=(first-a)/(b-a),t1=(last-a)/(b-a);
+                    const double roundoff = 64*std::numeric_limits<double>::epsilon();
+                    if (t0 < -roundoff || t1 > 1+roundoff || !(t1>t0)) return output;
+                    auto source_curve = BRep_Tool::Curve(sources[source],a,b);
+                    if (source_curve.IsNull()
+                        || source_curve->Value(first).Distance(source_curve->Value(a+(b-a)*std::clamp(t0,0.0,1.0))) > tolerance
+                        || source_curve->Value(last).Distance(source_curve->Value(a+(b-a)*std::clamp(t1,0.0,1.0))) > tolerance) return output;
+                    region.spans.push_back(ProfileSpanData{source,std::clamp(t0,0.0,1.0),std::clamp(t1,0.0,1.0),edge.Current().Orientation()==TopAbs_REVERSED});
+                    used[source] = true;
+                }
+                region.wire_offsets.push_back(region.spans.size());
+            }
+            output.regions.push_back(std::move(region));
+        }
+        for (size_t i = 0; i < sources.size(); ++i) if (!used[i]) output.unused_sources.push_back(i);
+        output.success = true;
+        return output;
+    } catch (const Standard_Failure& failure) {
+        record_standard_failure(__func__, stage, 7, failure);
+        return output;
+    }
+}
+
+std::unique_ptr<TopoDS_Edge> trim_profile_edge(const TopoDS_Edge& source,
+    double first, double last, bool reversed, double tolerance) {
+    try {
+        double start,end;
+        auto curve = BRep_Tool::Curve(source,start,end);
+        if (curve.IsNull()) return nullptr;
+        BRepBuilderAPI_MakeEdge maker(curve,start+(end-start)*first,start+(end-start)*last);
+        if (!maker.IsDone()) return nullptr;
+        auto edge = maker.Edge();
+        BRep_Builder builder;
+        for (TopExp_Explorer vertex(edge,TopAbs_VERTEX); vertex.More(); vertex.Next()) {
+            builder.UpdateVertex(TopoDS::Vertex(vertex.Current()),tolerance);
+        }
+        if (reversed) edge.Reverse();
+        return std::make_unique<TopoDS_Edge>(edge);
+    } catch (const Standard_Failure& failure) {
+        record_standard_failure(__func__, "trim_source", 7, failure);
         return nullptr;
     }
 }

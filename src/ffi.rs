@@ -11,6 +11,26 @@ use crate::common::error::{Error, FailureCategory, OperationFailure};
 #[allow(clippy::too_many_arguments)]
 #[cxx::bridge(namespace = "cadrum")]
 mod ffi_bridge {
+	struct ProfileSpanData {
+		source: u32,
+		first: f64,
+		last: f64,
+		reversed: bool,
+	}
+
+	struct ProfileRegionData {
+		area: f64,
+		wire_offsets: Vec<u32>,
+		spans: Vec<ProfileSpanData>,
+	}
+
+	struct ProfileArrangementData {
+		regions: Vec<ProfileRegionData>,
+		unused_sources: Vec<u32>,
+		error_sources: Vec<u32>,
+		error_code: u8,
+		success: bool,
+	}
 	// Shared struct for mesh data returned from C++
 	struct MeshData {
 		vertices: Vec<f64>, // flat xyz
@@ -356,6 +376,8 @@ mod ffi_bridge {
 		fn mirror_edge(edge: &TopoDS_Edge, ox: f64, oy: f64, oz: f64, nx: f64, ny: f64, nz: f64) -> UniquePtr<TopoDS_Edge>;
 
 		fn make_extrude(profile_edges: &CxxVector<TopoDS_Edge>, dx: f64, dy: f64, dz: f64, progress: &CancellationToken, out_topology_history: &mut HistoryData) -> UniquePtr<TopoDS_Shape>;
+		fn arrange_planar_edges(edges: &CxxVector<TopoDS_Edge>, tolerance: f64, max_fragments: u32, progress: &CancellationToken) -> ProfileArrangementData;
+		fn trim_profile_edge(edge: &TopoDS_Edge, first: f64, last: f64, reversed: bool, tolerance: f64) -> UniquePtr<TopoDS_Edge>;
 		fn make_pipe_shell(all_edges: &CxxVector<TopoDS_Edge>, spine_edges: &CxxVector<TopoDS_Edge>, orient: u32, ux: f64, uy: f64, uz: f64, aux_spine_edges: &CxxVector<TopoDS_Edge>, progress: &CancellationToken, out_topology_history: &mut HistoryData) -> UniquePtr<TopoDS_Shape>;
 		fn make_loft(all_edges: &CxxVector<TopoDS_Edge>, ruled: bool, closed: bool, progress: &CancellationToken, out_topology_history: &mut HistoryData) -> UniquePtr<TopoDS_Shape>;
 		fn builder_sew_without_faces(shape: &TopoDS_Shape, removed_face_indices: &[u32], tolerance: f64, out_history: &mut Vec<u64>, out_topology_history: &mut HistoryData) -> UniquePtr<TopoDS_Shape>;

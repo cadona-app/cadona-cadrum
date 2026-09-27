@@ -32,6 +32,12 @@ struct ValidationData;
 struct HistoryData;
 struct TopologyDistanceData;
 struct PlaneSectionData;
+struct ProfileArrangementData;
+
+ProfileArrangementData arrange_planar_edges(const std::vector<TopoDS_Edge>& edges,
+    double tolerance, uint32_t max_fragments, const CancellationToken& progress);
+std::unique_ptr<TopoDS_Edge> trim_profile_edge(const TopoDS_Edge& edge,
+    double first, double last, bool reversed, double tolerance);
 
 void clear_operation_diagnostic();
 OperationDiagnosticData take_operation_diagnostic();
