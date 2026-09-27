@@ -1,22 +1,26 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "source")]
+#[path = "build_support/occt_planarity.rs"]
+mod occt_planarity;
+
 /// OCCT release used by cadrum. Update this tag when bumping OCCT versions.
 /// `release_name()` derives the GitHub Release tag, the prebuilt tarball, and the
 /// cache directory name from this.
 const OCCT_VERSION: &str = "V8_0_0";
 
 /// Build revision for prebuilt tarballs. Update this when making non-OCCT-breaking changes that require cache invalidation (e.g. patch updates, build script changes, EH encoding changes, etc).
-const BUILD_REVISION: &str = "rev5";
+const BUILD_REVISION: &str = "cadona1";
 
 /// Release tag / tarball / cache-dir name (#203). Fields are separated by `-` and
 /// characters within a field by `_`, so the name parses by splitting on `-` (the
 /// target's hyphens are underscored too). `has_version` appends the cadrum crate
 /// version for the per-crate FFI artifact.
 ///
-/// - `release_name(None, false)`    → `occt-8_0_0_rev4`                              (GitHub Release タグ)
-/// - `release_name(Some(t), false)` → `occt-8_0_0_rev4-wasm32_unknown_unknown`       (OCCT tarball / cache dir)
-/// - `release_name(Some(t), true)`  → `occt-8_0_0_rev4-wasm32_unknown_unknown-cadrum-0_8_13` (FFI tarball)
+/// - `release_name(None, false)`    → `occt-8_0_0_cadona1` (GitHub Release tag)
+/// - `release_name(Some(t), false)` → `occt-8_0_0_cadona1-wasm32_unknown_unknown` (OCCT tarball / cache dir)
+/// - `release_name(Some(t), true)`  → `occt-8_0_0_cadona1-wasm32_unknown_unknown-cadrum-0_8_16` (FFI tarball)
 fn release_name(target: Option<&str>, has_version: bool) -> String {
 	let occt = OCCT_VERSION.trim_start_matches(['V', 'v']);
 	let mut name = format!("occt-{}_{}", occt, BUILD_REVISION);
@@ -32,6 +36,7 @@ fn release_name(target: Option<&str>, has_version: bool) -> String {
 }
 
 fn main() {
+	println!("cargo:rerun-if-changed=build_support/occt_planarity.rs");
 	println!("cargo:rerun-if-env-changed=OCCT_ROOT");
 	println!("cargo:rerun-if-env-changed=CADRUM_PREBUILT_URL");
 	println!("cargo:rerun-if-env-changed=CADRUM_BUNDLE_RUNTIME");
@@ -285,7 +290,7 @@ fn link_macos_sanitizer_runtimes(target: &str, sanitizers: &str) {
 fn occt_from_prebuilt(effective_root: &Path, target: &str) -> Option<[PathBuf; 2]> {
 	let top_name = release_name(Some(target), false);
 	let tarball_name = format!("{}.tar.gz", top_name);
-	let url = env::var("CADRUM_PREBUILT_URL").unwrap_or_else(|_| format!("https://github.com/lzpel/cadrum/releases/download/{}/{}", release_name(None, false), tarball_name));
+	let url = env::var("CADRUM_PREBUILT_URL").unwrap_or_else(|_| format!("https://github.com/cadona-app/cadona-cadrum/releases/download/{}/{}", release_name(None, false), tarball_name));
 
 	eprintln!("cargo:warning=Downloading prebuilt OCCT from {}", url);
 
@@ -560,6 +565,10 @@ mod source {
 		let name = path.file_name()?.to_str()?;
 
 		match name {
+			"GeomLib_IsPlanarSurface.cxx" => {
+				let source = std::fs::read_to_string(path).expect("Failed to read OCCT planarity source");
+				Some(super::occt_planarity::patch_extrusion_planarity(&source).expect("Failed to patch OCCT extrusion planarity"))
+			}
 			"XCAFDoc_VisMaterial.cxx" => Some(stub_content(path, true)),
 			"XCAFPrs_Texture.cxx" => Some(stub_content(path, false)),
 
@@ -787,7 +796,7 @@ mod source {
 			let mut stripped = false;
 			for kw in ["const", "volatile", "noexcept", "override", "final", "mutable", "&&", "&"] {
 				if let Some(after) = s.strip_prefix(kw) {
-					let boundary = after.chars().next().map_or(true, |c| !(c.is_ascii_alphanumeric() || c == '_'));
+					let boundary = after.chars().next().is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'));
 					if boundary {
 						s = after.trim_start();
 						stripped = true;
@@ -924,7 +933,7 @@ mod source {
 				b'{' if depth == 0 => {
 					let brace_pos = i;
 					let prefix_norm = &normalized[last_end..brace_pos];
-					let sig = prefix_norm.rfind(|c| c == ';' || c == '}').map(|p| &prefix_norm[p + 1..]).unwrap_or(prefix_norm);
+					let sig = prefix_norm.rfind([';', '}']).map(|p| &prefix_norm[p + 1..]).unwrap_or(prefix_norm);
 
 					let trimmed = sig.trim_end();
 					let last_line = trimmed.rsplit('\n').next().unwrap_or(trimmed).trim();
@@ -968,11 +977,7 @@ mod source {
 					continue;
 				}
 				b'{' => depth += 1,
-				b'}' => {
-					if depth > 0 {
-						depth -= 1;
-					}
-				}
+				b'}' => depth = depth.saturating_sub(1),
 				_ => {}
 			}
 			i += 1;

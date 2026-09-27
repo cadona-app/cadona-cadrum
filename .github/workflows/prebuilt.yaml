@@ -2,10 +2,20 @@ name: prebuilt
 
 on:
   push:
-    branches: [prebuilt]
+    branches: [prebuilt, codex/occt-planarity]
   workflow_dispatch:
 
 jobs:
+  patch-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Validate source patch
+        run: |
+          rustc --edition=2021 --test tests/occt_source_patch.rs -o /tmp/occt-source-patch-tests
+          /tmp/occt-source-patch-tests
+
   # The following prebuilt OCCT tarballs are cross-built via Docker (make cross-<target> GOAL=occt):
   #   - x86_64-unknown-linux-gnu
   #   - aarch64-unknown-linux-gnu
@@ -33,6 +43,18 @@ jobs:
 
       - name: build
         run: make cross-${{ matrix.target }} GOAL=occt
+
+      - name: Verify Linux extrusion planarity
+        if: contains(matrix.target, 'linux')
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/occt"
+          tar -xzf out/${{ matrix.target }}/occt-*.tar.gz -C "$RUNNER_TEMP/occt"
+          occt_root=("$RUNNER_TEMP"/occt/occt-*)
+          cmake -S tests/occt-planarity -B "$RUNNER_TEMP/planarity" \
+            -DOCCT_ROOT="${occt_root[0]}" -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$RUNNER_TEMP/planarity" --config Release
+          ctest --test-dir "$RUNNER_TEMP/planarity" -C Release --output-on-failure
 
       - uses: actions/upload-artifact@v4
         with:
@@ -73,6 +95,14 @@ jobs:
         env:
           CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
         run: make occt
+
+      - name: Verify Windows extrusion planarity
+        shell: bash
+        run: |
+          occt_root=("$PWD"/target/occt-*)
+          cmake -S tests/occt-planarity -B out/planarity -DOCCT_ROOT="${occt_root[0]}"
+          cmake --build out/planarity --config Release
+          ctest --test-dir out/planarity -C Release --output-on-failure
 
       - uses: actions/upload-artifact@v4
         with:
@@ -115,13 +145,22 @@ jobs:
           CARGO_BUILD_TARGET: ${{ matrix.target }}
         run: make occt
 
+      - name: Verify macOS extrusion planarity
+        shell: bash
+        run: |
+          occt_root=("$PWD"/target/occt-*)
+          cmake -S tests/occt-planarity -B out/planarity \
+            -DOCCT_ROOT="${occt_root[0]}" -DCMAKE_BUILD_TYPE=Release
+          cmake --build out/planarity --config Release
+          ctest --test-dir out/planarity -C Release --output-on-failure
+
       - uses: actions/upload-artifact@v4
         with:
           name: occt-${{ matrix.target }}
           path: out/occt-*.tar.gz
 
   release:
-    needs: [build, build-windows-msvc, build-macos]
+    needs: [patch-contract, build, build-windows-msvc, build-macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -136,6 +175,8 @@ jobs:
       # lockstep with OCCT_VERSION / BUILD_REVISION in build.rs.
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: occt-8_0_0_rev5
-          name: OCCT prebuilt v8.0.0 (rev5)
+          tag_name: occt-8_0_0_cadona1
+          name: OCCT prebuilt v8.0.0 (Cadona 1)
+          draft: true
+          target_commitish: ${{ github.sha }}
           files: dist/*.tar.gz
