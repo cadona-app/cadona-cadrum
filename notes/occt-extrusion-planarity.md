@@ -47,5 +47,30 @@ isolated corrected libraries pass all 402 checks on both, and Cadona's original
 pass unchanged on both. This is initial evidence, not full package qualification.
 
 The prebuilt workflow builds all seven existing targets and runs the native regression
-on Linux x86_64/arm64, macOS x86_64/arm64, and Windows MSVC. Windows GNU and WebAssembly
-still require execution qualification before the client dependency can be adopted.
+on Linux x86_64/arm64, macOS x86_64/arm64, and Windows MSVC. It also links the Windows GNU
+probe against its packaged libraries and executes it on Windows. The WebAssembly probe
+links the packaged libraries and bundled C++ runtimes, then runs under Node/WASI.
+All seven targets and both packaged runtime checks passed in
+[run 36303493934](https://github.com/cadona-app/cadona-cadrum/actions/runs/36303493934)
+for `216a7b9`. Cadona's original sliver application-core test also passes in a real browser,
+including exact topology/provenance, Undo/Redo and browser-storage save/reopen.
+
+Merge `31ac9e4` retains current production geometry changes through `4b0fef1`, including
+planar seed clearance and exact curve arrangement/classification. Its fresh seven-target
+[run 36316397652](https://github.com/cadona-app/cadona-cadrum/actions/runs/36316397652)
+is still in progress. Focused native checks pass: 402 direct planarity checks and 25
+Cadrum source-patch, arrangement, classification and tessellation cases; strict Clippy passes.
+Complete client and rendered-workflow qualification is still being recorded.
+
+## Release provenance
+
+After every platform gate succeeds, `scripts/prebuilt_manifest.py` requires exactly the
+seven expected nonempty archives and derives the release tag from `build.rs`. The draft
+also contains `BUILD_INFO.json` with the full source commit, target, size and SHA-256 of
+each archive, plus a standard `SHA256SUMS` file. Downloaded files can be checked with
+`sha256sum -c SHA256SUMS` (or `shasum -a 256 -c SHA256SUMS` on macOS).
+
+The workflow serializes package releases and refuses to replace an already-public revision;
+a subsequent package change requires a new `BUILD_REVISION`. Drafts can be updated during
+qualification. Neither the manifest nor a successful draft upload establishes public
+availability or the complete Cadona platform lifecycle.
