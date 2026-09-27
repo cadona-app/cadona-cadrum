@@ -1129,9 +1129,11 @@ fn mesh_faces(faces: &[TrimmedFace], linear: f64, angular: f64, parallel: bool, 
 
 const FACE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
+type FaceMeshCacheEntry = (u64, usize, Option<Arc<MeshedFace>>);
+
 #[derive(Default)]
 struct FaceMeshCache {
-	entries: HashMap<Vec<u64>, (u64, usize, Option<Arc<MeshedFace>>)>,
+	entries: HashMap<Vec<u64>, FaceMeshCacheEntry>,
 	bytes: usize,
 	clock: u64,
 	hits: usize,
@@ -4208,6 +4210,7 @@ fn refinement_candidates(face: &TrimmedFace, triangulation: &FaceTriangulation, 
 	let quality_capacity = MAXIMUM_QUALITY_INSERTIONS_PER_PASS * RETAINED_CANDIDATE_MULTIPLIER;
 	let mut required_candidates = Vec::with_capacity(required_capacity);
 	let mut quality_candidates = Vec::with_capacity(quality_capacity);
+	let resource_bounded = resource_bounded_structured_aspect(face).is_some_and(|aspect| aspect > 0.0);
 
 	for (triangle_index, triangle) in triangulation.inner_faces().enumerate() {
 		if triangle_index.is_multiple_of(256) && progress.is_cancelled() {
@@ -4269,6 +4272,10 @@ fn refinement_candidates(face: &TrimmedFace, triangulation: &FaceTriangulation, 
 		}
 
 		let aspect = triangle_aspect(positions);
+		// Keep exempt anisotropic boundary collars from consuming the interior quality budget.
+		if resource_bounded && parametric.iter().any(|vertex| vertex.boundary_position.is_some()) {
+			continue;
+		}
 		if aspect <= MAXIMUM_PHYSICAL_ASPECT * (1.0 + 1.0e-9) {
 			continue;
 		}

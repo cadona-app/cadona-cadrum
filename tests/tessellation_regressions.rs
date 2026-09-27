@@ -40,6 +40,13 @@ fn mesh(solid: &Solid) -> MeshChunks {
 }
 
 fn assert_closed_well_shaped(name: &str, chunks: &MeshChunks, maximum_p95_aspect: f64) {
+	let mut aspects = assert_closed_mesh(name, chunks);
+	aspects.sort_by(f64::total_cmp);
+	let p95_aspect = aspects[(aspects.len() - 1) * 95 / 100];
+	assert!(p95_aspect <= maximum_p95_aspect, "{name} has widespread sliver triangles: p95 aspect {p95_aspect}, limit {maximum_p95_aspect}");
+}
+
+fn assert_closed_mesh(name: &str, chunks: &MeshChunks) -> Vec<f64> {
 	assert!(!chunks.faces.is_empty(), "{name} has no tessellated faces");
 	let mut face_indices = BTreeSet::new();
 	let mut edge_uses = BTreeMap::<EdgeKey, (usize, i32)>::new();
@@ -93,9 +100,7 @@ fn assert_closed_well_shaped(name: &str, chunks: &MeshChunks, maximum_p95_aspect
 		}
 	}
 
-	aspects.sort_by(f64::total_cmp);
-	let p95_aspect = aspects[(aspects.len() - 1) * 95 / 100];
-	assert!(p95_aspect <= maximum_p95_aspect, "{name} has widespread sliver triangles: p95 aspect {p95_aspect}, limit {maximum_p95_aspect}");
+	aspects
 }
 
 fn multiply_trimmed_prism() -> Solid {
@@ -116,6 +121,40 @@ fn top_cylinder_ring(cylinder: &Solid) -> &Edge {
 			points.len() >= 2 && points.iter().all(|point| (point.z - 20.0).abs() < 1.0e-8)
 		})
 		.expect("top cylinder ring")
+}
+
+#[test]
+fn thin_airfoil_rib_preserves_closed_boundaries_and_regular_interior_quality() {
+	let archive = include_bytes!("fixtures/wing_section_rib.brep");
+	let solids = Solid::read_brep(&mut archive.as_slice()).expect("read exact airfoil rib");
+	assert_eq!(solids.len(), 1);
+	for (name, deflection_linear, deflection_angular, relative_linear) in [("preview rib", 0.05, 0.5, false), ("standard rib", 0.004, 0.25, true)] {
+		let options = Tessellation { deflection_linear, deflection_angular, relative_linear, include_edges: true, parallel: false };
+		let chunks = Solid::mesh_chunks([&solids[0]], options).expect("thin rib tessellates within the unchanged audits");
+		assert_eq!(chunks.faces.len(), 4);
+		assert_closed_mesh(name, &chunks);
+		// Exact shared edges can force thin transition cells on a narrow rib.
+		// Apply the ordinary aspect limits to the regular interior; audit every triangle's topology.
+		let boundary = chunks.edges.iter().flat_map(|edge| edge.points.iter().copied().map(PositionKey::new)).collect::<BTreeSet<_>>();
+		let mut interior_aspects = Vec::new();
+		for face in &chunks.faces {
+			for triangle in face.indices.chunks_exact(3) {
+				let points = [triangle[0], triangle[1], triangle[2]].map(|index| face.vertices[index as usize]);
+				if points.iter().any(|point| boundary.contains(&PositionKey::new(*point))) {
+					continue;
+				}
+				let edges = [points[1] - points[0], points[2] - points[1], points[0] - points[2]];
+				let longest_squared = edges.iter().map(|edge| edge.length_squared()).fold(0.0, f64::max);
+				interior_aspects.push(longest_squared / edges[0].cross(edges[1]).length());
+			}
+		}
+		assert!(interior_aspects.len() >= 100, "{name} must exercise a regular interior");
+		interior_aspects.sort_by(f64::total_cmp);
+		let p95 = interior_aspects[(interior_aspects.len() - 1) * 95 / 100];
+		assert!(p95 <= 30.0, "{name} has poor regular interior quality: p95 aspect {p95}");
+		let worst = interior_aspects.last().copied().unwrap();
+		assert!(worst <= 60.0, "{name} retains an interior needle: aspect {worst}");
+	}
 }
 
 #[test]
