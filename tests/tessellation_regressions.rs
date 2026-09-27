@@ -259,3 +259,24 @@ fn periodic_planar_annulus_keeps_both_sides_of_its_seam() {
 		assert_eq!(left.indices, right.indices);
 	}
 }
+
+#[test]
+fn sparse_straight_slot_boundaries_survive_boolean_and_planar_meshing() {
+	let at = |center: f64, angle: f64| DVec3::new(center + 5.0 * angle.cos(), 5.0 * angle.sin(), 0.0);
+	let pi = std::f64::consts::PI;
+	let profile = [Edge::line(DVec3::new(0.0, -5.0, 0.0), DVec3::new(20.0, -5.0, 0.0)).unwrap(), Edge::arc_3pts(at(20.0, -pi / 2.0), at(20.0, 0.0), at(20.0, pi / 2.0)).unwrap(), Edge::line(DVec3::new(20.0, 5.0, 0.0), DVec3::new(0.0, 5.0, 0.0)).unwrap(), Edge::arc_3pts(at(0.0, pi / 2.0), at(0.0, pi), at(0.0, 1.5 * pi)).unwrap()];
+	let cancellation = CancellationToken::new();
+	let slot = Solid::extrude_cancelable(&profile, DVec3::Z * 3.0, &cancellation).unwrap();
+	let cutter = Solid::cylinder(1.0, DVec3::Z * 3.0).translate(DVec3::X * 10.0);
+	let solids = Solid::boolean_build_regularized_cancelable(&(&slot - &cutter), &cancellation).unwrap();
+	assert_eq!(solids.len(), 1);
+	let solid = &solids[0];
+	assert!((solid.volume() - (200.0 + 24.0 * pi) * 3.0).abs() < 1.0e-7);
+	assert_eq!(solid.iter_face().count(), 7);
+	let options = Tessellation::default();
+	let serial = Solid::mesh_chunks([solid], options).expect("slot mesh with sparse straight boundaries");
+	assert_closed_well_shaped("slot with drilled hole", &serial, 20.0);
+	assert!(assert_closed_mesh("slot with drilled hole", &serial).into_iter().all(|aspect| aspect <= 56.0));
+	let parallel = Solid::mesh_chunks([solid], Tessellation { parallel: true, ..options }).unwrap();
+	assert_eq!(serial, parallel);
+}
