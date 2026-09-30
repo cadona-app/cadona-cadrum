@@ -1683,11 +1683,24 @@ void shape_face_boundary_projection(const TopoDS_Shape& shape,
     }
 }
 
-// Adaptive integration resolves small curved details on much larger parent solids.
+// Gauss-Kronrod fixes elliptical-period aliasing but is expensive at spherical poles.
+static double volume_properties(const TopoDS_Shape& shape, GProp_GProps& props,
+    bool center = false, bool inertia = false)
+{
+    for (TopExp_Explorer explorer(shape, TopAbs_EDGE); explorer.More(); explorer.Next()) {
+        const TopoDS_Edge edge = TopoDS::Edge(explorer.Current());
+        if (!BRep_Tool::Degenerated(edge) && BRep_Tool::IsGeometric(edge)
+            && BRepAdaptor_Curve(edge).GetType() == GeomAbs_Ellipse) {
+            return BRepGProp::VolumePropertiesGK(shape, props, 1.0e-9, false, true, center, inertia);
+        }
+    }
+    return BRepGProp::VolumeProperties(shape, props, 1.0e-9);
+}
+
 double shape_volume(const TopoDS_Shape& shape) {
     GProp_GProps props;
-    BRepGProp::VolumeProperties(shape, props, 1.0e-9);
-    return props.Mass();
+    const double error = volume_properties(shape, props);
+    return error >= 0.0 ? props.Mass() : std::numeric_limits<double>::quiet_NaN();
 }
 
 double shape_surface_area(const TopoDS_Shape& shape) {
@@ -1700,7 +1713,11 @@ void shape_center_of_mass(const TopoDS_Shape& shape,
     double& x, double& y, double& z)
 {
     GProp_GProps props;
-    BRepGProp::VolumeProperties(shape, props, 1.0e-9);
+    const double error = volume_properties(shape, props, true);
+    if (!(error >= 0.0)) {
+        x = y = z = std::numeric_limits<double>::quiet_NaN();
+        return;
+    }
     gp_Pnt com = props.CentreOfMass();
     x = com.X(); y = com.Y(); z = com.Z();
 }
@@ -1716,7 +1733,12 @@ void shape_inertia_tensor(const TopoDS_Shape& shape,
     // folded in). Shift here with I_world = I_com + m·(|d|² I - d⊗d),
     // where d = COM vector from world origin, m = volume (uniform density).
     GProp_GProps props;
-    BRepGProp::VolumeProperties(shape, props, 1.0e-9);
+    const double error = volume_properties(shape, props, true, true);
+    if (!(error >= 0.0)) {
+        m00 = m01 = m02 = m10 = m11 = m12 = m20 = m21 = m22
+            = std::numeric_limits<double>::quiet_NaN();
+        return;
+    }
     gp_Mat ic = props.MatrixOfInertia();
     gp_Pnt com = props.CentreOfMass();
     double mass = props.Mass();

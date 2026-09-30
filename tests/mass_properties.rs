@@ -3,10 +3,43 @@
 //! OCCT computes properties with uniform density ρ = 1; the inertia tensor is
 //! returned about the world origin (not the center of mass).
 
-use cadrum::Solid;
+use cadrum::{CancellationToken, Edge, Solid};
 use glam::DVec3;
 
 const EPS: f64 = 1e-6;
+
+#[test]
+fn complete_elliptical_prisms_and_rings_have_analytic_mass_properties() {
+	let height = 6.;
+	for offset in [DVec3::ZERO, DVec3::new(12., -8., 0.)] {
+		for hole in [false, true] {
+			let edges = [(10., 4.), (5., 2.)].into_iter().take(if hole { 2 } else { 1 }).map(|(a, b)| Edge::ellipse(a, b, DVec3::X, DVec3::Z).unwrap().translate(offset)).collect::<Vec<_>>();
+			let progress = CancellationToken::new();
+			let arrangement = Edge::planar_regions(&edges, 1.0e-7, 4096, &progress).unwrap();
+			let region = arrangement.regions.iter().find(|region| region.wires.len() == if hole { 2 } else { 1 }).unwrap();
+			let wires = region.wires.iter().map(|wire| wire.iter().map(|span| edges[span.source as usize].profile_span(span.first, span.last, span.reversed, 1.0e-7).unwrap()).collect::<Vec<_>>()).collect::<Vec<_>>();
+			let solid = Solid::extrude_wires_cancelable(wires.iter().map(|wire| wire.iter()), DVec3::Z * height, &progress).unwrap();
+			assert!(solid.validate().unwrap().valid);
+			let properties = |a: f64, b: f64| {
+				let mass = std::f64::consts::PI * a * b * height;
+				(mass, DVec3::new(mass * (b * b / 4. + height * height / 12.), mass * (a * a / 4. + height * height / 12.), mass * (a * a + b * b) / 4.))
+			};
+			let (outer_mass, outer_inertia) = properties(10., 4.);
+			let (inner_mass, inner_inertia) = if hole { properties(5., 2.) } else { (0., DVec3::ZERO) };
+			let mass = outer_mass - inner_mass;
+			let center = offset + DVec3::Z * height / 2.;
+			let centered = outer_inertia - inner_inertia;
+			let expected = centered + mass * (DVec3::splat(center.length_squared()) - center * center);
+			assert!((solid.volume() - mass).abs() < 1.0e-7, "{} != {mass}", solid.volume());
+			assert!((solid.center() - center).length() < 1.0e-8);
+			let inertia = solid.inertia();
+			assert!((DVec3::new(inertia.x_axis.x, inertia.y_axis.y, inertia.z_axis.z) - expected).abs().max_element() < 1.0e-5);
+			assert!((inertia.y_axis.x + mass * center.x * center.y).abs() < 1.0e-5);
+			assert!((inertia.z_axis.x + mass * center.x * center.z).abs() < 1.0e-5);
+			assert!((inertia.z_axis.y + mass * center.y * center.z).abs() < 1.0e-5);
+		}
+	}
+}
 
 /// Cube of side `a` with corner at the world origin, ρ = 1.
 /// Analytical values referenced throughout:

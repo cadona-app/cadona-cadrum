@@ -130,6 +130,13 @@ C++17 compiler (GCC, Clang, or MSVC) and CMake.
 | **Mesh** | `Solid::mesh` → `Mesh`, `Mesh::write_stl`, `Mesh::write_gltf_binary`, `Mesh::scene` → `Scene2D`, `Scene2D::write_svg`, `Scene2D::write_png` *(png)*, `Solid::write_multiview_png` *(png)* |
 | **Color** *(feature `color`)* | per-face and per-solid color preserved across STEP / BRep / STL / glTF / SVG round-trips |
 
+Volume, center and inertia use OCCT's adaptive integration on exact geometry. Shapes with
+elliptical edges use Gauss–Kronrod integration: the ordinary rule can falsely converge over a
+complete ellipse. Other shapes retain the existing rule to avoid expensive integration at
+spherical poles. The mass-property regressions cover full elliptical prisms and rings at the
+origin and after translation. A failed integration returns non-finite properties; callers must
+reject those results rather than treating partial measurements as valid.
+
 ## Features
 
 - **`color`** *(default)*: Enables `Solid::color` and colormap propagation
