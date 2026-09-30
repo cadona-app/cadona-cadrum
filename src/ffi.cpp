@@ -90,6 +90,7 @@
 #include <gp_Elips.hxx>
 #include <BRepAlgo_NormalProjection.hxx>
 #include <BRepPrimAPI_MakePrism.hxx>
+#include <BRepPrimAPI_MakeRevol.hxx>
 #include <BRepPrimAPI_MakeTorus.hxx>
 
 // --- Boolean operations & shape cleanup ---
@@ -6141,6 +6142,74 @@ std::unique_ptr<TopoDS_Shape> make_extrude(
         return result;
     } catch (const Standard_Failure& failure) {
         record_standard_failure(__func__, "native", 7, failure);
+        return nullptr;
+    }
+}
+
+std::unique_ptr<TopoDS_Shape> make_revolve(
+    const std::vector<TopoDS_Edge>& profile_edges,
+    double ox, double oy, double oz, double dx, double dy, double dz, double angle,
+    const CancellationToken& progress, HistoryData& out_topology_history)
+{
+    try {
+        if (profile_edges.empty() || rust_progress_cancelled(progress)) return nullptr;
+        std::vector<TopoDS_Wire> wires;
+        BRepBuilderAPI_MakeWire wire_maker;
+        bool has_edges = false;
+        auto flush_wire = [&]() -> bool {
+            if (!has_edges || !wire_maker.IsDone() || !wire_maker.Wire().Closed()) return false;
+            wires.push_back(wire_maker.Wire());
+            wire_maker = BRepBuilderAPI_MakeWire();
+            has_edges = false;
+            return true;
+        };
+        for (const auto& edge : profile_edges) {
+            if (rust_progress_cancelled(progress)) return nullptr;
+            if (edge.IsNull()) {
+                if (!flush_wire()) return nullptr;
+            } else {
+                wire_maker.Add(TopoDS::Edge(BRepBuilderAPI_Copy(edge,false,false).Shape()));
+                has_edges = true;
+            }
+        }
+        if (!flush_wire()) return nullptr;
+        BRepBuilderAPI_MakeFace face_maker(wires.front(),true);
+        for (size_t i=1; i<wires.size(); ++i) face_maker.Add(wires[i]);
+        if (!face_maker.IsDone() || !BRepCheck_Analyzer(face_maker.Face()).IsValid()) return nullptr;
+        BRepTopAdaptor_FClass2d bounded(face_maker.Face(),Precision::Confusion());
+        if (bounded.PerformInfinitePoint() != TopAbs_OUT) return nullptr;
+        // OCCT takes a positive sweep; reversing the axis preserves signed travel.
+        const double sign = angle < 0 ? -1 : 1;
+        gp_Ax1 axis(gp_Pnt(ox,oy,oz),gp_Dir(dx*sign,dy*sign,dz*sign));
+        BRepPrimAPI_MakeRevol revol(face_maker.Face(),axis,std::abs(angle),true);
+        Handle(RustProgressIndicator) indicator = new RustProgressIndicator(progress);
+        revol.Build(indicator->Start());
+        if (rust_progress_cancelled(progress) || !revol.IsDone()) return nullptr;
+        auto result = std::make_unique<TopoDS_Shape>(revol.Shape());
+        if (!BRepCheck_Analyzer(*result).IsValid()) return nullptr;
+        const HistoryMaps result_maps(*result);
+        const auto profile = face_maker.Face();
+        append_builder_topology_history(revol,profile,0,result_maps,out_topology_history);
+        const HistoryMaps profile_maps(profile);
+        for (int i=1; i<=profile_maps.edges.Extent(); ++i) {
+            append_history_relation(out_topology_history,result_maps,revol.FirstShape(),
+                HistoryRelation::Generated,0,HistoryKind::Edge,i-1);
+            append_history_relation(out_topology_history,result_maps,revol.LastShape(),
+                HistoryRelation::Generated,0,HistoryKind::Edge,i-1);
+        }
+        for (HistoryKind kind : {HistoryKind::Edge, HistoryKind::Vertex}) {
+            const auto& sources = profile_maps.map(kind);
+            for (int i=1; i<=sources.Extent(); ++i) {
+                append_history_relation(out_topology_history,result_maps,
+                    revol.FirstShape(sources(i)),HistoryRelation::Generated,0,kind,i-1);
+                append_history_relation(out_topology_history,result_maps,
+                    revol.LastShape(sources(i)),HistoryRelation::Generated,0,kind,i-1);
+            }
+        }
+        finish_topology_history(result_maps,out_topology_history);
+        return result;
+    } catch (const Standard_Failure& failure) {
+        record_standard_failure(__func__,"revolve",7,failure);
         return nullptr;
     }
 }

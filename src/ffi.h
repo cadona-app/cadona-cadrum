@@ -472,6 +472,12 @@ std::unique_ptr<TopoDS_Shape> make_extrude(
 	const CancellationToken& progress,
     HistoryData& out_topology_history);
 
+// Revolve a planar face with separate outer/hole wires about an in-plane axis.
+std::unique_ptr<TopoDS_Shape> make_revolve(
+    const std::vector<TopoDS_Edge>& profile_edges,
+    double ox, double oy, double oz, double dx, double dy, double dz, double angle,
+    const CancellationToken& progress, HistoryData& out_topology_history);
+
 // Sweep a closed profile wire (built from `profile_edges`) along a spine
 // wire (built from `spine_edges`) using BRepOffsetAPI_MakePipeShell. The
 // profile is wrapped in a face before sweeping so the result is a Solid.

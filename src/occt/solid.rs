@@ -833,6 +833,48 @@ impl Solid {
 		.with_topology_history(topology_history))
 	}
 
+	/// Revolves closed planar outer/hole wires by a signed angle of at most one turn.
+	pub fn revolve_wires_cancelable<'a, W>(profile_wires: impl IntoIterator<Item = W>, origin: DVec3, direction: DVec3, angle: f64, progress: &ffi::CancellationToken) -> Result<Self, Error>
+	where
+		W: IntoIterator<Item = &'a Edge>,
+		Edge: 'a,
+	{
+		if !origin.is_finite() || !direction.is_finite() || !direction.length().is_finite() || direction.length() <= f64::EPSILON || !angle.is_finite() || angle.abs() <= f64::EPSILON || angle.abs() > std::f64::consts::TAU {
+			return Err(Error::InvalidInput("revolution needs a finite axis and a nonzero angle of at most one turn".into()));
+		}
+		let mut edges = ffi::edge_vec_new();
+		let mut count = 0usize;
+		for wire in profile_wires {
+			let wire = wire.into_iter().collect::<Vec<_>>();
+			if wire.is_empty() {
+				return Err(Error::InvalidEdge("a revolution profile wire cannot be empty".into()));
+			}
+			if count > 0 {
+				ffi::edge_vec_push_null(edges.pin_mut());
+			}
+			for edge in wire {
+				ffi::edge_vec_push(edges.pin_mut(), &edge.inner);
+			}
+			count += 1;
+		}
+		if count == 0 {
+			return Err(Error::InvalidEdge("a revolution needs at least one profile wire".into()));
+		}
+		let mut history = empty_ffi_history();
+		ffi::begin_operation();
+		let shape = ffi::make_revolve(&edges, origin.x, origin.y, origin.z, direction.x, direction.y, direction.z, angle, progress, &mut history);
+		if shape.is_null() {
+			return Err(if progress.is_cancelled() { Error::Cancelled } else { ffi::operation_error(Error::InvalidInput("profile cannot be revolved about this axis".into()), "revolve", "occt_build") });
+		}
+		Ok(Solid::new(
+			shape,
+			#[cfg(feature = "color")]
+			Default::default(),
+			Default::default(),
+		)
+		.with_topology_history(decode_topology_history(history)?))
+	}
+
 	pub fn sweep_cancelable<'a, 'b, 'c>(profile: impl IntoIterator<Item = &'a Edge>, spine: impl IntoIterator<Item = &'b Edge>, orient: ProfileOrient<'c>, progress: &ffi::CancellationToken) -> Result<Self, Error> {
 		match orient {
 			ProfileOrient::Up(up) if !up.is_finite() || up == DVec3::ZERO => {
