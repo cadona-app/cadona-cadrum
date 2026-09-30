@@ -9,6 +9,29 @@ pub struct Edge {
 }
 
 impl Edge {
+	/// Constructs an exact non-rational B-spline from poles and expanded knots, without fitting.
+	pub fn from_bspline_poles(poles: &[DVec3], degree: u32, knots: &[f64]) -> Result<Self, Error> {
+		let p = degree as usize;
+		let invalid = || Error::InvalidEdge("invalid B-spline poles, degree or expanded knots".into());
+		if !(1..=25).contains(&degree) || poles.len() <= p || poles.len() > i32::MAX as usize || knots.len() > i32::MAX as usize || knots.len() != poles.len() + p + 1 || poles.iter().any(|point| !point.is_finite()) || knots.iter().any(|value| !value.is_finite()) || knots.windows(2).any(|pair| pair[0] > pair[1]) || !(knots[knots.len() - 1] - knots[0]).is_finite() || knots[p] >= knots[poles.len()] {
+			return Err(invalid());
+		}
+		let mut start = 0;
+		while start < knots.len() {
+			let mut end = start + 1;
+			while end < knots.len() && knots[start] == knots[end] {
+				end += 1;
+			}
+			if end - start > p + usize::from(start == 0 || end == knots.len()) {
+				return Err(invalid());
+			}
+			start = end;
+		}
+		let coords = poles.iter().flat_map(|point| point.to_array()).collect::<Vec<_>>();
+		ffi::begin_operation();
+		Self::try_from_ffi(ffi::make_bspline_poles_edge(&coords, degree, knots), "B-spline edge construction failed".into()).map_err(|fallback| ffi::operation_error(fallback, "build exact bspline", "occt_build"))
+	}
+
 	/// Wrap a FFI-returned `TopoDS_Edge` into `Result<Edge, Error>`, checking
 	/// for null. This is the **only** constructor for `Edge` from FFI: all
 	/// call sites must go through this function so that no null `TopoDS_Edge`

@@ -424,6 +424,9 @@ std::unique_ptr<TopoDS_Edge> make_bspline_edge(
     double sx, double sy, double sz,
     double ex, double ey, double ez);
 
+std::unique_ptr<TopoDS_Edge> make_bspline_poles_edge(
+    rust::Slice<const double> coords, uint32_t degree, rust::Slice<const double> knots);
+
 // Edge query helpers.
 void edge_endpoints(const TopoDS_Edge& edge,
     double& sx, double& sy, double& sz,

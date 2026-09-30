@@ -1683,15 +1683,17 @@ void shape_face_boundary_projection(const TopoDS_Shape& shape,
     }
 }
 
-// Gauss-Kronrod fixes elliptical-period aliasing but is expensive at spherical poles.
+// Gauss-Kronrod resolves closed conic/spline trims but is expensive at spherical poles.
 static double volume_properties(const TopoDS_Shape& shape, GProp_GProps& props,
     bool center = false, bool inertia = false)
 {
     for (TopExp_Explorer explorer(shape, TopAbs_EDGE); explorer.More(); explorer.Next()) {
         const TopoDS_Edge edge = TopoDS::Edge(explorer.Current());
-        if (!BRep_Tool::Degenerated(edge) && BRep_Tool::IsGeometric(edge)
-            && BRepAdaptor_Curve(edge).GetType() == GeomAbs_Ellipse) {
-            return BRepGProp::VolumePropertiesGK(shape, props, 1.0e-9, false, true, center, inertia);
+        if (!BRep_Tool::Degenerated(edge) && BRep_Tool::IsGeometric(edge)) {
+            const auto kind = BRepAdaptor_Curve(edge).GetType();
+            if (kind == GeomAbs_Ellipse || kind == GeomAbs_BSplineCurve || kind == GeomAbs_BezierCurve) {
+                return BRepGProp::VolumePropertiesGK(shape, props, 1.0e-9, false, true, center, inertia);
+            }
         }
     }
     return BRepGProp::VolumeProperties(shape, props, 1.0e-9);
@@ -5181,6 +5183,46 @@ std::unique_ptr<TopoDS_Edge> make_bspline_edge(
     }
 }
 
+std::unique_ptr<TopoDS_Edge> make_bspline_poles_edge(
+    rust::Slice<const double> coords, uint32_t degree, rust::Slice<const double> knots)
+{
+    if (degree < 1 || degree > 25 || coords.size() % 3 != 0
+        || coords.size() / 3 <= degree || coords.size() / 3 > std::numeric_limits<int>::max()
+        || knots.size() > std::numeric_limits<int>::max()
+        || knots.size() != coords.size() / 3 + degree + 1) return nullptr;
+    try {
+        NCollection_Array1<gp_Pnt> poles(1, static_cast<int>(coords.size() / 3));
+        for (int i = 1; i <= poles.Length(); ++i) {
+            const size_t offset = static_cast<size_t>(i-1) * 3;
+            poles.SetValue(i, gp_Pnt(coords[offset], coords[offset+1], coords[offset+2]));
+        }
+        std::vector<double> values;
+        std::vector<int> multiplicities;
+        for (double knot : knots) {
+            if (!std::isfinite(knot) || (!values.empty() && knot < values.back())) return nullptr;
+            if (values.empty() || knot != values.back()) {
+                values.push_back(knot);
+                multiplicities.push_back(1);
+            } else {
+                ++multiplicities.back();
+            }
+        }
+        NCollection_Array1<double> native_knots(1, static_cast<int>(values.size()));
+        NCollection_Array1<int> native_mults(1, static_cast<int>(values.size()));
+        for (int i = 1; i <= native_knots.Length(); ++i) {
+            native_knots.SetValue(i, values[i-1]);
+            native_mults.SetValue(i, multiplicities[i-1]);
+        }
+        Handle(Geom_BSplineCurve) curve = new Geom_BSplineCurve(poles, native_knots, native_mults, degree, false);
+        BRepBuilderAPI_MakeEdge builder(curve);
+        if (!builder.IsDone()) return nullptr;
+        return std::make_unique<TopoDS_Edge>(builder.Edge());
+    } catch (const Standard_Failure& failure) {
+        record_standard_failure(__func__, "native", 7, failure);
+        return nullptr;
+    }
+}
+
 void edge_endpoints(const TopoDS_Edge& edge,
     double& sx, double& sy, double& sz,
     double& ex, double& ey, double& ez)
@@ -5881,7 +5923,7 @@ ProfileArrangementData arrange_planar_edges(const std::vector<TopoDS_Edge>& inpu
             if (classifier.PerformInfinitePoint() != TopAbs_OUT) continue;
             if (!BRepCheck_Analyzer(face).IsValid()) return output;
             GProp_GProps properties;
-            BRepGProp::SurfaceProperties(face,properties);
+            BRepGProp::SurfaceProperties(face,properties,1.0e-9);
             ProfileRegionData region;
             region.area = properties.Mass();
             NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> boundary_vertices;
