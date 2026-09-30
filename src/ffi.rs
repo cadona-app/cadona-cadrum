@@ -1,12 +1,13 @@
-use std::{
-	io::{Read, Write},
-	sync::{
-		atomic::{AtomicBool, AtomicU64, Ordering},
-		Arc,
-	},
+use std::sync::{
+	atomic::{AtomicBool, AtomicU64, Ordering},
+	Arc,
 };
 
 use crate::common::error::{Error, FailureCategory, OperationFailure};
+
+#[path = "ffi/streams.rs"]
+mod streams;
+pub(crate) use streams::{rust_reader_read, rust_writer_write, stream_io, with_reader, with_writer, RustReader, RustWriter};
 
 #[allow(clippy::too_many_arguments)]
 #[cxx::bridge(namespace = "cadrum")]
@@ -195,12 +196,12 @@ mod ffi_bridge {
 
 	// Expose Rust stream types to C++ for streambuf callbacks
 	extern "Rust" {
-		type RustReader;
-		type RustWriter;
+		type RustReader<'a>;
+		type RustWriter<'a>;
 		type CancellationToken;
 
-		fn rust_reader_read(reader: &mut RustReader, buf: &mut [u8]) -> usize;
-		fn rust_writer_write(writer: &mut RustWriter, buf: &[u8]) -> usize;
+		fn rust_reader_read(reader: &mut RustReader<'_>, buf: &mut [u8]) -> usize;
+		fn rust_writer_write(writer: &mut RustWriter<'_>, buf: &[u8]) -> usize;
 		fn rust_progress_cancelled(progress: &CancellationToken) -> bool;
 		fn rust_progress_set(progress: &CancellationToken, completed: f64);
 	}
@@ -221,13 +222,13 @@ mod ffi_bridge {
 		// Plain STEP I/O — used only without `color` feature.
 		// With color, STEP goes through XCAF (`read_step_color_stream` etc.).
 		#[cfg(not(feature = "color"))]
-		fn read_step_stream(reader: &mut RustReader) -> UniquePtr<TopoDS_Shape>;
+		fn read_step_stream(reader: &mut RustReader<'_>) -> UniquePtr<TopoDS_Shape>;
 		#[cfg(not(feature = "color"))]
-		fn write_step_stream(shape: &TopoDS_Shape, writer: &mut RustWriter) -> bool;
+		fn write_step_stream(shape: &TopoDS_Shape, writer: &mut RustWriter<'_>) -> bool;
 		// `out_consumed` = payload length, where the color trailer begins. Written only
 		// when the returned pointer is non-null.
 		fn read_brep_stream(data: &[u8], out_consumed: &mut usize) -> UniquePtr<TopoDS_Shape>;
-		fn write_brep_stream(shape: &TopoDS_Shape, writer: &mut RustWriter) -> bool;
+		fn write_brep_stream(shape: &TopoDS_Shape, writer: &mut RustWriter<'_>) -> bool;
 
 		// ==================== Shape Constructors ====================
 
@@ -250,10 +251,10 @@ mod ffi_bridge {
 		// ==================== Colored STEP I/O (color feature only) ====================
 
 		#[cfg(feature = "color")]
-		fn read_step_color_stream(reader: &mut RustReader, out_ids: &mut Vec<u64>, out_rgb: &mut Vec<f32>) -> UniquePtr<TopoDS_Shape>;
+		fn read_step_color_stream(reader: &mut RustReader<'_>, out_ids: &mut Vec<u64>, out_rgb: &mut Vec<f32>) -> UniquePtr<TopoDS_Shape>;
 
 		#[cfg(feature = "color")]
-		fn write_step_color_stream(shape: &TopoDS_Shape, ids: &[u64], rgb: &[f32], writer: &mut RustWriter) -> bool;
+		fn write_step_color_stream(shape: &TopoDS_Shape, ids: &[u64], rgb: &[f32], writer: &mut RustWriter<'_>) -> bool;
 
 		// ==================== Builders (solid → solid with history) ====================
 
@@ -472,58 +473,6 @@ pub fn rust_progress_cancelled(progress: &CancellationToken) -> bool {
 
 pub fn rust_progress_set(progress: &CancellationToken, completed: f64) {
 	progress.progress_bits.store(completed.clamp(0.0, 1.0).to_bits(), Ordering::Release);
-}
-
-// ==================== Stream wrappers ====================
-pub struct RustReader {
-	inner: *mut dyn Read,
-}
-
-impl RustReader {
-	/// Create a new RustReader wrapping the given reader.
-	///
-	/// # Safety
-	/// The caller must ensure that the resulting `RustReader` is not used
-	/// after `reader` is dropped. In practice, this is guaranteed because
-	/// the C++ FFI call is synchronous.
-	pub fn from_ref<'a>(reader: &'a mut (dyn Read + 'a)) -> Self {
-		// SAFETY: Caller must ensure `reader` outlives this RustReader.
-		// The `'static` bound is required by the raw pointer type, so we
-		// use transmute to erase the lifetime (lifetimes are compile-time only).
-		RustReader { inner: unsafe { std::mem::transmute::<*mut (dyn Read + 'a), *mut (dyn Read + 'static)>(reader as *mut (dyn Read + 'a)) } }
-	}
-}
-
-/// Wrapper around `dyn Write` passed to C++ as an opaque extern Rust type.
-///
-/// C++ calls `rust_writer_write()` to push bytes into the Rust writer,
-/// receiving them from a `std::streambuf` subclass that OCC writes to.
-pub struct RustWriter {
-	inner: *mut dyn Write,
-}
-
-impl RustWriter {
-	/// Create a new RustWriter wrapping the given writer.
-	///
-	/// # Safety
-	/// Same as `RustReader::from_ref`.
-	pub fn from_ref<'a>(writer: &'a mut (dyn Write + 'a)) -> Self {
-		// SAFETY: Caller must ensure `writer` outlives this RustWriter.
-		// See RustReader::from_ref for the same rationale.
-		RustWriter { inner: unsafe { std::mem::transmute::<*mut (dyn Write + 'a), *mut (dyn Write + 'static)>(writer as *mut (dyn Write + 'a)) } }
-	}
-}
-
-/// FFI callback: read up to `buf.len()` bytes from the RustReader.
-/// Returns the number of bytes actually read (0 = EOF).
-pub fn rust_reader_read(reader: &mut RustReader, buf: &mut [u8]) -> usize {
-	unsafe { (*reader.inner).read(buf).unwrap_or(0) }
-}
-
-/// FFI callback: write bytes into the RustWriter.
-/// Returns the number of bytes actually written.
-pub fn rust_writer_write(writer: &mut RustWriter, buf: &[u8]) -> usize {
-	unsafe { (*writer.inner).write(buf).unwrap_or(0) }
 }
 
 // CXX opaque OCCT handles deliberately retain their default `!Send + !Sync`

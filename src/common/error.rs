@@ -33,6 +33,11 @@ pub enum ProfileIssue {
 /// Errors that can occur during CAD operations.
 #[derive(Debug)]
 pub enum Error {
+	StreamIo {
+		operation: &'static str,
+		stage: &'static str,
+		source: std::io::Error,
+	},
 	InvalidProfile {
 		issue: ProfileIssue,
 		sources: Vec<u32>,
@@ -156,6 +161,7 @@ pub enum Error {
 impl std::fmt::Display for Error {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
+			Error::StreamIo { operation, stage, source } => write!(f, "{operation} failed during {stage}: {source}"),
 			Error::InvalidProfile { issue, sources } => write!(f, "invalid planar profile ({issue:?}) at sources {sources:?}"),
 			Error::OperationFailed(failure) => {
 				write!(f, "{} failed during {}", failure.operation, failure.stage)?;
@@ -204,6 +210,7 @@ impl Error {
 	/// Return a stable category suitable for adapter policy and UI recovery.
 	pub fn category(&self) -> FailureCategory {
 		match self {
+			Self::StreamIo { .. } => FailureCategory::Io,
 			Self::OperationFailed(failure) => failure.category,
 			Self::InvalidProfile { issue: ProfileIssue::ResourceLimit, .. } => FailureCategory::ResourceLimit,
 			Self::InvalidProfile { .. } => FailureCategory::InvalidInput,
@@ -220,6 +227,7 @@ impl Error {
 	/// Return the stable native/adapter stage associated with this failure.
 	pub fn stage(&self) -> &str {
 		match self {
+			Self::StreamIo { stage, .. } => stage,
 			Self::OperationFailed(failure) => &failure.stage,
 			Self::Cancelled => "cancelled",
 			Self::ProjectionFailed(_) => "project",
@@ -240,4 +248,11 @@ impl Error {
 	}
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+		match self {
+			Self::StreamIo { source, .. } => Some(source),
+			_ => None,
+		}
+	}
+}

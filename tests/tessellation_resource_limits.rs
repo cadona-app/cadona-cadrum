@@ -1,4 +1,4 @@
-#![cfg(not(target_arch = "wasm32"))]
+#![cfg(all(feature = "test-support", not(target_arch = "wasm32")))]
 
 use cadrum::{
 	occt::test_support::{tessellation_synthetic_aggregate_resource_limit_error, tessellation_synthetic_payload_resource_limit_error, tessellation_synthetic_resource_accounting_totals, tessellation_synthetic_transition_ring_resource_limit_error, tessellation_synthetic_trim_resource_limit_errors},

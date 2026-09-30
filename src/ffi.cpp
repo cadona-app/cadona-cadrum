@@ -6810,22 +6810,20 @@ class RustWriteStreambuf : public std::streambuf {
 public:
     explicit RustWriteStreambuf(RustWriter& writer) : writer_(writer) {}
 
-    ~RustWriteStreambuf() override {
-        sync();
-    }
-
 protected:
     int_type overflow(int_type ch) override {
+        if (failed_) return traits_type::eof();
         if (ch != traits_type::eof()) {
             buf_[pos_++] = static_cast<char>(ch);
             if (pos_ >= sizeof(buf_)) {
                 if (!flush_buf()) return traits_type::eof();
             }
         }
-        return ch;
+        return traits_type::not_eof(ch);
     }
 
     std::streamsize xsputn(const char* s, std::streamsize count) override {
+        if (failed_) return 0;
         std::streamsize written = 0;
         while (written < count) {
             std::streamsize space = sizeof(buf_) - pos_;
@@ -6834,7 +6832,7 @@ protected:
             pos_ += static_cast<size_t>(chunk);
             written += chunk;
             if (pos_ >= sizeof(buf_)) {
-                if (!flush_buf()) return written;
+                if (!flush_buf()) return written - chunk;
             }
         }
         return written;
@@ -6851,18 +6849,20 @@ protected:
 
 private:
     bool flush_buf() {
+        if (failed_) return false;
         if (pos_ == 0) return true;
         rust::Slice<const uint8_t> slice(
             reinterpret_cast<const uint8_t*>(buf_), pos_);
         size_t n = rust_writer_write(writer_, slice);
-        if (n < pos_) return false;
+        failed_ = n != pos_;
         pos_ = 0;
-        return true;
+        return !failed_;
     }
 
     RustWriter& writer_;
     char buf_[8192];
     size_t pos_ = 0;
+    bool failed_ = false;
 };
 
 
@@ -6897,6 +6897,7 @@ bool write_brep_stream(const TopoDS_Shape& shape, RustWriter& writer) {
     std::ostream os(&sbuf);
     try {
         BinTools::Write(shape, os);
+        os.flush();
     } catch (const Standard_Failure& failure) {
         record_standard_failure(__func__, "native", 7, failure);
         return false;
@@ -6907,29 +6908,41 @@ bool write_brep_stream(const TopoDS_Shape& shape, RustWriter& writer) {
 #ifndef FEATURE_COLOR
 // Plain STEP I/O — used only when FEATURE_COLOR is not defined.
 std::unique_ptr<TopoDS_Shape> read_step_stream(RustReader& reader) {
-    RustReadStreambuf sbuf(reader);
-    std::istream is(&sbuf);
+    try {
+        RustReadStreambuf sbuf(reader);
+        std::istream is(&sbuf);
 
-    STEPControl_Reader step_reader;
-    IFSelect_ReturnStatus status = step_reader.ReadStream("stream", is);
+        STEPControl_Reader step_reader;
+        IFSelect_ReturnStatus status = step_reader.ReadStream("stream", is);
 
-    if (status != IFSelect_RetDone) {
+        if (status != IFSelect_RetDone) {
+            return nullptr;
+        }
+
+        step_reader.TransferRoots(Message_ProgressRange());
+        return std::make_unique<TopoDS_Shape>(
+            try_sew_orphan_faces(step_reader.OneShape(), nullptr));
+    } catch (const Standard_Failure& failure) {
+        record_standard_failure(__func__, "native", 7, failure);
         return nullptr;
     }
-
-    step_reader.TransferRoots(Message_ProgressRange());
-    return std::make_unique<TopoDS_Shape>(
-        try_sew_orphan_faces(step_reader.OneShape(), nullptr));
 }
 
 bool write_step_stream(const TopoDS_Shape& shape, RustWriter& writer) {
-    RustWriteStreambuf sbuf(writer);
-    std::ostream os(&sbuf);
-    STEPControl_Writer step_writer;
-    if (step_writer.Transfer(shape, STEPControl_AsIs) != IFSelect_RetDone) {
+    try {
+        RustWriteStreambuf sbuf(writer);
+        std::ostream os(&sbuf);
+        STEPControl_Writer step_writer;
+        if (step_writer.Transfer(shape, STEPControl_AsIs) != IFSelect_RetDone) {
+            return false;
+        }
+        const auto status = step_writer.WriteStream(os);
+        os.flush();
+        return status == IFSelect_RetDone && os.good();
+    } catch (const Standard_Failure& failure) {
+        record_standard_failure(__func__, "native", 7, failure);
         return false;
     }
-    return step_writer.WriteStream(os) == IFSelect_RetDone;
 }
 #endif // !FEATURE_COLOR
 
@@ -7415,7 +7428,9 @@ bool write_step_color_stream(
 
         RustWriteStreambuf sbuf(writer);
         std::ostream os(&sbuf);
-        return cafwriter.ChangeWriter().WriteStream(os) == IFSelect_RetDone;
+        const auto status = cafwriter.ChangeWriter().WriteStream(os);
+        os.flush();
+        return status == IFSelect_RetDone && os.good();
     } catch (const Standard_Failure& failure) {
         record_standard_failure(__func__, "native", 7, failure);
         return false;

@@ -130,6 +130,13 @@ C++17 compiler (GCC, Clang, or MSVC) and CMake.
 | **Mesh** | `Solid::mesh` → `Mesh`, `Mesh::write_stl`, `Mesh::write_gltf_binary`, `Mesh::scene` → `Scene2D`, `Scene2D::write_svg`, `Scene2D::write_png` *(png)*, `Solid::write_multiview_png` *(png)* |
 | **Color** *(feature `color`)* | per-face and per-solid color preserved across STEP / BRep / STL / glTF / SVG round-trips |
 
+STEP and BRep stream imports/exports preserve Rust I/O failures as `Error::StreamIo`, with the
+original `std::io::Error` available through `std::error::Error::source`. Exports flush both the
+native stream buffer and the caller's writer before reporting success, including BRep color
+trailers. Short and interrupted I/O is supported; zero-progress writes fail. Borrowed callback
+state is scoped to the synchronous foreign call. Unwinding reader/writer panics become errors;
+builds configured with `panic=abort` still abort.
+
 Volume, center and inertia use OCCT's adaptive integration on exact geometry. Shapes with
 elliptical edges use Gauss–Kronrod integration: the ordinary rule can falsely converge over a
 complete ellipse. Other shapes retain the existing rule to avoid expensive integration at

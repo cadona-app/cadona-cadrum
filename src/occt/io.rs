@@ -3,7 +3,6 @@
 
 use super::compound::CompoundShape;
 use super::ffi;
-use super::ffi::{RustReader, RustWriter};
 use super::solid::Solid;
 use super::tessellation;
 use crate::common::error::Error;
@@ -76,7 +75,7 @@ fn write_color_trailer<W: Write>(compound: &CompoundShape, writer: &mut W) -> Re
 		out.extend_from_slice(&g.to_le_bytes());
 		out.extend_from_slice(&b.to_le_bytes());
 	}
-	writer.write_all(&out).map_err(|_| Error::BrepWriteFailed)
+	ffi::stream_io(|| writer.write_all(&out)).map_err(|source| Error::StreamIo { operation: "write B-rep", stage: "color trailer", source })
 }
 
 // ==================== Reader / writer / mesh helpers ====================
@@ -88,11 +87,10 @@ fn write_color_trailer<W: Write>(compound: &CompoundShape, writer: &mut W) -> Re
 pub(super) fn read_step<R: Read>(reader: &mut R) -> Result<Vec<Solid>, Error> {
 	#[cfg(feature = "color")]
 	{
-		let mut rust_reader = RustReader::from_ref(reader);
 		let mut ids: Vec<u64> = Default::default();
 		let mut rgb: Vec<f32> = Default::default();
 		ffi::begin_operation();
-		let inner = ffi::read_step_color_stream(&mut rust_reader, &mut ids, &mut rgb);
+		let inner = ffi::with_reader(reader, |stream| ffi::read_step_color_stream(stream, &mut ids, &mut rgb)).map_err(|source| Error::StreamIo { operation: "read STEP", stage: "read", source })?;
 		if inner.is_null() {
 			return Err(ffi::operation_error(Error::StepReadFailed, "read STEP", "read"));
 		}
@@ -101,9 +99,8 @@ pub(super) fn read_step<R: Read>(reader: &mut R) -> Result<Vec<Solid>, Error> {
 	}
 	#[cfg(not(feature = "color"))]
 	{
-		let mut rust_reader = RustReader::from_ref(reader);
 		ffi::begin_operation();
-		let inner = ffi::read_step_stream(&mut rust_reader);
+		let inner = ffi::with_reader(reader, ffi::read_step_stream).map_err(|source| Error::StreamIo { operation: "read STEP", stage: "read", source })?;
 		if inner.is_null() {
 			return Err(ffi::operation_error(Error::StepReadFailed, "read STEP", "read"));
 		}
@@ -115,7 +112,7 @@ pub(super) fn read_brep<R: Read>(reader: &mut R) -> Result<Vec<Solid>, Error> {
 	// Buffered whole: `BinTools::Read` seeks backwards to resolve shared sub-shape
 	// references, so it cannot run off a sequential stream.
 	let mut buf = Vec::new();
-	reader.read_to_end(&mut buf).map_err(|_| Error::BrepReadFailed)?;
+	ffi::stream_io(|| reader.read_to_end(&mut buf)).map_err(|source| Error::StreamIo { operation: "read B-rep", stage: "read", source })?;
 
 	// Payload length — where a trailer would begin. Unwritten, and unread, on null.
 	let mut consumed = 0usize;
@@ -152,39 +149,33 @@ pub(super) fn write_step<'a, W: Write>(solids: impl IntoIterator<Item = &'a Soli
 			ids.push(id);
 			rgb.extend_from_slice(&[c.r, c.g, c.b]);
 		}
-		let mut rust_writer = RustWriter::from_ref(writer);
 		ffi::begin_operation();
-		if ffi::write_step_color_stream(compound.inner(), &ids, &rgb, &mut rust_writer) {
-			Ok(())
-		} else {
-			Err(ffi::operation_error(Error::StepWriteFailed, "write STEP", "write"))
+		let written = ffi::with_writer(writer, |stream| ffi::write_step_color_stream(compound.inner(), &ids, &rgb, stream)).map_err(|source| Error::StreamIo { operation: "write STEP", stage: "write", source })?;
+		if !written {
+			return Err(ffi::operation_error(Error::StepWriteFailed, "write STEP", "write"));
 		}
 	}
 	#[cfg(not(feature = "color"))]
 	{
-		let mut rust_writer = RustWriter::from_ref(writer);
 		ffi::begin_operation();
-		if ffi::write_step_stream(compound.inner(), &mut rust_writer) {
-			Ok(())
-		} else {
-			Err(ffi::operation_error(Error::StepWriteFailed, "write STEP", "write"))
+		let written = ffi::with_writer(writer, |stream| ffi::write_step_stream(compound.inner(), stream)).map_err(|source| Error::StreamIo { operation: "write STEP", stage: "write", source })?;
+		if !written {
+			return Err(ffi::operation_error(Error::StepWriteFailed, "write STEP", "write"));
 		}
 	}
+	ffi::stream_io(|| writer.flush()).map_err(|source| Error::StreamIo { operation: "write STEP", stage: "flush", source })
 }
 
 pub(super) fn write_brep<'a, W: Write>(solids: impl IntoIterator<Item = &'a Solid>, writer: &mut W) -> Result<(), Error> {
 	let compound = CompoundShape::new(solids);
-	{
-		// Scoped: the streambuf flushes on drop, so the payload lands before the trailer.
-		let mut rust_writer = RustWriter::from_ref(writer);
-		ffi::begin_operation();
-		if !ffi::write_brep_stream(compound.inner(), &mut rust_writer) {
-			return Err(ffi::operation_error(Error::BrepWriteFailed, "write B-rep", "write"));
-		}
+	ffi::begin_operation();
+	let written = ffi::with_writer(writer, |stream| ffi::write_brep_stream(compound.inner(), stream)).map_err(|source| Error::StreamIo { operation: "write B-rep", stage: "write", source })?;
+	if !written {
+		return Err(ffi::operation_error(Error::BrepWriteFailed, "write B-rep", "write"));
 	}
 	#[cfg(feature = "color")]
 	write_color_trailer(&compound, writer)?;
-	Ok(())
+	ffi::stream_io(|| writer.flush()).map_err(|source| Error::StreamIo { operation: "write B-rep", stage: "flush", source })
 }
 
 pub(super) fn mesh<'a>(solids: impl IntoIterator<Item = &'a Solid>, options: crate::traits::Tessellation) -> Result<crate::common::mesh::Mesh, Error> {
